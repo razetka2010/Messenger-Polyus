@@ -1,0 +1,1343 @@
+const assert = require("node:assert/strict");
+const fs = require("node:fs/promises");
+const os = require("node:os");
+const path = require("node:path");
+const test = require("node:test");
+const {
+  createEmptyStore,
+  createPushPayload,
+  createStoreWriter,
+  createMessengerServer,
+  getLanAddresses,
+  PRIVACY_VERSION,
+  loadStore,
+  sendPushToUser,
+  writeStoreAtomically
+} = require("../server");
+
+async function withServer(options, run) {
+  const server = createMessengerServer(options);
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+  try {
+    await run(`http://127.0.0.1:${port}`);
+  } finally {
+    await new Promise((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+  }
+}
+
+async function register(baseUrl, username, fullName = username) {
+  const response = await fetch(`${baseUrl}/api/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      username,
+      fullName,
+      password: "a-secure-test-password",
+      confirmPassword: "a-secure-test-password",
+      acceptPrivacy: true,
+      privacyVersion: PRIVACY_VERSION
+    })
+  });
+  const cookie = response.headers.get("set-cookie")?.split(";")[0];
+  return { response, cookie, body: await response.json() };
+}
+
+function authenticatedRequest(cookie, options = {}) {
+  return {
+    ...options,
+    headers: { ...(options.headers || {}), Cookie: cookie }
+  };
+}
+
+function assertApiErrorBody(body, code) {
+  assert.deepEqual(Object.keys(body), ["error"]);
+  assert.deepEqual(Object.keys(body.error).sort(), ["code", "message"]);
+  assert.equal(body.error.code, code);
+  assert.equal(typeof body.error.message, "string");
+  assert.ok(body.error.message.length > 0);
+}
+
+async function assertApiError(response, status, code) {
+  assert.equal(response.status, status);
+  assertApiErrorBody(await response.json(), code);
+}
+
+test("lists usable LAN IPv4 addresses for the startup URL", () => {
+  const addresses = getLanAddresses({
+    ethernet: [
+      { address: "192.168.1.25", family: "IPv4", internal: false },
+      { address: "169.254.2.10", family: "IPv4", internal: false },
+      { address: "127.0.0.1", family: "IPv4", internal: true }
+    ],
+    wifi: [{ address: "10.0.0.8", family: 4, internal: false }],
+    virtual: [{ address: "192.168.1.25", family: "IPv4", internal: false }]
+  });
+  assert.deepEqual(addresses, ["10.0.0.8", "192.168.1.25"]);
+});
+
+test("retries transient Windows rename errors and keeps a previous store backup", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "polus-atomic-store-"));
+  const filePath = path.join(directory, "polus-store.json");
+  try {
+    await fs.writeFile(filePath, '{"revision":1}', "utf8");
+    let attempts = 0;
+    await writeStoreAtomically(filePath, '{"revision":2}', {
+      renameFile: async (source, destination) => {
+        if (destination === filePath && attempts < 2) {
+          attempts += 1;
+          const error = new Error("File is temporarily locked.");
+          error.code = "EPERM";
+          throw error;
+        }
+        return fs.rename(source, destination);
+      },
+      retryDelay: async () => {}
+    });
+
+    assert.equal(attempts, 2);
+    assert.equal(await fs.readFile(filePath, "utf8"), '{"revision":2}');
+    assert.equal(await fs.readFile(`${filePath}.bak`, "utf8"), '{"revision":1}');
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("does not replace the store when Windows keeps the destination locked", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "polus-locked-store-"));
+  const filePath = path.join(directory, "polus-store.json");
+  try {
+    await fs.writeFile(filePath, '{"revision":1}', "utf8");
+    await assert.rejects(writeStoreAtomically(filePath, '{"revision":2}', {
+      renameFile: async (source, destination) => {
+        if (destination === filePath) {
+          const error = new Error("File remains locked.");
+          error.code = "EPERM";
+          throw error;
+        }
+        return fs.rename(source, destination);
+      },
+      retryDelay: async () => {}
+    }), { code: "EPERM" });
+    assert.equal(await fs.readFile(filePath, "utf8"), '{"revision":1}');
+    assert.deepEqual((await fs.readdir(directory)).sort(), ["polus-store.json", "polus-store.json.bak"]);
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("serializes concurrent store writes and leaves a backup of the preceding revision", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "polus-store-queue-"));
+  const filePath = path.join(directory, "store.json");
+  let activeRenames = 0;
+  let maximumActiveRenames = 0;
+  try {
+    const save = createStoreWriter(filePath, {
+      renameFile: async (source, destination) => {
+        activeRenames += 1;
+        maximumActiveRenames = Math.max(maximumActiveRenames, activeRenames);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        try {
+          await fs.rename(source, destination);
+        } finally {
+          activeRenames -= 1;
+        }
+      },
+      retryDelay: async () => {}
+    });
+    await Promise.all([
+      save({ revision: 1 }),
+      save({ revision: 2 }),
+      save({ revision: 3 })
+    ]);
+
+    assert.equal(maximumActiveRenames, 1);
+    assert.deepEqual(JSON.parse(await fs.readFile(filePath, "utf8")), { revision: 3 });
+    assert.deepEqual(JSON.parse(await fs.readFile(`${filePath}.bak`, "utf8")), { revision: 2 });
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("removes expired push subscriptions without deleting another device subscription", async () => {
+  const store = {
+    pushSubscriptions: [
+      { userId: "bob", subscription: { endpoint: "https://push.services.mozilla.com/expired" } },
+      { userId: "bob", subscription: { endpoint: "https://push.services.mozilla.com/active" } },
+      { userId: "alice", subscription: { endpoint: "https://push.services.mozilla.com/expired" } }
+    ]
+  };
+  let persisted = 0;
+  await sendPushToUser(store, "bob", {
+    conversationId: "chat",
+    author: { username: "alice", fullName: "Alice" },
+    text: "Hello"
+  }, async () => { persisted += 1; }, {
+    sendNotification: async (subscription) => {
+      if (subscription.endpoint.endsWith("/expired")) {
+        const error = new Error("Gone");
+        error.statusCode = 410;
+        throw error;
+      }
+    }
+  });
+
+  assert.equal(persisted, 1);
+  assert.deepEqual(store.pushSubscriptions.map((item) => item.userId), ["bob", "alice"]);
+  assert.equal(store.pushSubscriptions[0].subscription.endpoint.endsWith("/active"), true);
+});
+
+test("builds short push previews and hides message content when requested", () => {
+  const message = {
+    conversationId: "channel-1",
+    author: { username: "alice", fullName: "Alice North" },
+    text: "x".repeat(150)
+  };
+  const visible = createPushPayload(message);
+  assert.equal(visible.title, "Alice North · Полюс");
+  assert.equal(visible.body.length, 100);
+  assert.equal(visible.conversationId, "channel-1");
+  assert.equal(createPushPayload(message, { hideContent: true }).body, "Новое сообщение");
+});
+
+test("serves Polus, its logo, privacy page and English/Russian app", async () => {
+  await withServer({}, async (baseUrl) => {
+    const config = await fetch(`${baseUrl}/api/config`);
+    assert.equal((await config.json()).privacyVersion, PRIVACY_VERSION);
+
+    const page = await fetch(baseUrl);
+    assert.equal(page.status, 200);
+    const pageBody = await page.text();
+    assert.match(pageBody, /ПОЛЮС/);
+    assert.match(pageBody, /message-context-menu/);
+    assert.match(pageBody, /profile-avatar-picker/);
+    assert.match(pageBody, /profile-avatar-preview/);
+    assert.match(pageBody, /id="chat-search"/);
+    assert.doesNotMatch(pageBody, /id="search-button"/);
+    assert.match(pageBody, /class="composer-entry"/);
+    assert.match(pageBody, /class="send-button" type="submit"/);
+    assert.doesNotMatch(pageBody, /composer-hint/);
+
+    const styles = await fetch(`${baseUrl}/styles.css`);
+    const stylesBody = await styles.text();
+    assert.match(stylesBody, /\.send-button\s*\{[^}]*border-radius:\s*50%/s);
+
+    const appScript = await fetch(`${baseUrl}/app.js`);
+    const appScriptBody = await appScript.text();
+    assert.match(appScriptBody, /contextmenu/);
+    assert.match(appScriptBody, /openMessageContextMenu/);
+    assert.match(appScriptBody, /info-member-avatar/);
+    assert.match(appScriptBody, /info-member-role/);
+
+    assert.match(stylesBody, /\.info-member\s*\{/);
+    assert.match(stylesBody, /\.info-member-meta\s*\{/);
+
+    const logo = await fetch(`${baseUrl}/logo.svg`);
+    assert.equal(logo.status, 200);
+    assert.match(await logo.text(), /полярной звезды|Полюс/i);
+
+    const privacy = await fetch(`${baseUrl}/privacy`);
+    assert.equal(privacy.status, 200);
+    assert.match(await privacy.text(), /privacy.js/);
+
+    const privacyScript = await fetch(`${baseUrl}/privacy.js`);
+    assert.equal(privacyScript.status, 200);
+
+    const manifest = await fetch(`${baseUrl}/manifest.webmanifest`);
+    assert.equal(manifest.status, 200);
+    assert.match(await manifest.text(), /Полюс/);
+  });
+});
+
+test("returns the documented error envelope for invalid, unauthorized, forbidden and missing requests", async () => {
+  await withServer({ store: createEmptyStore() }, async (baseUrl) => {
+    await assertApiError(await fetch(`${baseUrl}/api/bootstrap`), 401, "UNAUTHORIZED");
+
+    const invalidJson = await fetch(`${baseUrl}/api/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{"
+    });
+    await assertApiError(invalidJson, 400, "BAD_REQUEST");
+
+    const nonObjectJson = await fetch(`${baseUrl}/api/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "null"
+    });
+    await assertApiError(nonObjectJson, 400, "BAD_REQUEST");
+
+    const owner = await register(baseUrl, "errors_owner", "Owner");
+    const member = await register(baseUrl, "errors_member", "Member");
+    await assertApiError(
+      await fetch(`${baseUrl}/api/not-a-route`, authenticatedRequest(owner.cookie)),
+      404,
+      "NOT_FOUND"
+    );
+    const duplicate = await register(baseUrl, "errors_owner", "Duplicate");
+    assert.equal(duplicate.response.status, 409);
+    assertApiErrorBody(duplicate.body, "CONFLICT");
+
+    const channelResponse = await fetch(`${baseUrl}/api/channels`, authenticatedRequest(owner.cookie, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "Read-only channel" })
+    }));
+    const channel = await channelResponse.json();
+    const join = await fetch(`${baseUrl}/api/channels/${channel.id}/join`, authenticatedRequest(member.cookie, {
+      method: "POST"
+    }));
+    assert.equal(join.status, 200);
+
+    const forbiddenPost = await fetch(`${baseUrl}/api/messages`, authenticatedRequest(member.cookie, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ conversationId: channel.id, text: "Not allowed" })
+    }));
+    await assertApiError(forbiddenPost, 403, "FORBIDDEN");
+  });
+});
+
+test("registers unique @usernames, stores only password hashes and requires sign-in", async () => {
+  const savedStates = [];
+  await withServer({
+    store: createEmptyStore(),
+    saveStore: async (store) => savedStates.push(JSON.parse(JSON.stringify(store)))
+  }, async (baseUrl) => {
+    const unauthorized = await fetch(`${baseUrl}/api/bootstrap`);
+    assert.equal(unauthorized.status, 401);
+    assert.deepEqual(await unauthorized.json(), {
+      error: { code: "UNAUTHORIZED", message: "Please sign in again." }
+    });
+
+    const missingConsent = await fetch(`${baseUrl}/api/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: "north_star",
+        fullName: "North Star",
+        password: "a-secure-test-password",
+        confirmPassword: "a-secure-test-password",
+        acceptPrivacy: false,
+        privacyVersion: PRIVACY_VERSION
+      })
+    });
+    assert.equal(missingConsent.status, 400);
+    assert.equal((await missingConsent.json()).error.code, "BAD_REQUEST");
+
+    const { response, cookie, body } = await register(baseUrl, "North_Star", "North Star");
+    assert.equal(response.status, 201);
+    assert.equal(body.user.username, "north_star");
+    assert.equal(body.user.about, "");
+    assert.ok(cookie.startsWith("polus_session="));
+    const cookieHeader = response.headers.get("set-cookie");
+    assert.match(cookieHeader, /HttpOnly/);
+    assert.match(cookieHeader, /SameSite=Strict/);
+    assert.match(cookieHeader, /Max-Age=2592000/);
+    assert.ok(!JSON.stringify(savedStates).includes("a-secure-test-password"));
+    assert.match(savedStates.at(-1).users[0].passwordHash, /^[a-f0-9]+:[a-f0-9]+$/);
+
+    const bootstrapResponse = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(cookie));
+    assert.equal(bootstrapResponse.status, 200);
+    const bootstrap = await bootstrapResponse.json();
+    assert.equal(bootstrap.user.fullName, "North Star");
+    assert.equal(bootstrap.user.about, "");
+    assert.deepEqual(bootstrap.channels, []);
+
+    const duplicate = await register(baseUrl, "north_star", "Another Person");
+    assert.equal(duplicate.response.status, 409);
+    assert.equal(duplicate.body.error.code, "CONFLICT");
+
+    const login = await fetch(`${baseUrl}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "NORTH_STAR", password: "a-secure-test-password" })
+    });
+    assert.equal(login.status, 200);
+    const secondDeviceCookie = login.headers.get("set-cookie").split(";")[0];
+    assert.ok(secondDeviceCookie.startsWith("polus_session="));
+    assert.equal((await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(secondDeviceCookie))).status, 200);
+
+    const logout = await fetch(`${baseUrl}/api/auth/logout`, authenticatedRequest(cookie, { method: "POST" }));
+    assert.equal(logout.status, 200);
+    assert.equal((await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(cookie))).status, 401);
+    assert.equal((await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(secondDeviceCookie))).status, 200);
+  });
+});
+
+test("enforces account limits, permits an 8-character password, and edits profile about", async () => {
+  await withServer({ store: createEmptyStore() }, async (baseUrl) => {
+    const longUsername = "a".repeat(32);
+    const response = await fetch(`${baseUrl}/api/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: longUsername,
+        fullName: "A",
+        about: "Profile bio",
+        password: "12345678",
+        confirmPassword: "12345678",
+        acceptPrivacy: true,
+        privacyVersion: PRIVACY_VERSION
+      })
+    });
+    assert.equal(response.status, 201);
+    const cookie = response.headers.get("set-cookie").split(";")[0];
+    const registeredUser = (await response.json()).user;
+    assert.equal(registeredUser.about, "Profile bio");
+
+    const invalidAccounts = [
+      { username: "a".repeat(33), fullName: "Name", password: "12345678", confirmPassword: "12345678" },
+      { username: "valid_username", fullName: "a".repeat(51), password: "12345678", confirmPassword: "12345678" },
+      { username: "valid_username", fullName: "A", about: "b".repeat(201), password: "12345678", confirmPassword: "12345678" },
+      { username: "valid_username", fullName: "A", password: "1234567", confirmPassword: "1234567" }
+    ];
+    for (const invalidAccount of invalidAccounts) {
+      const invalid = await fetch(`${baseUrl}/api/auth/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...invalidAccount,
+          acceptPrivacy: true,
+          privacyVersion: PRIVACY_VERSION
+        })
+      });
+      assert.equal(invalid.status, 400);
+      assert.equal(typeof (await invalid.json()).error.message, "string");
+    }
+
+    const updated = await fetch(`${baseUrl}/api/account`, authenticatedRequest(cookie, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fullName: "New name",
+        about: "Updated bio",
+        username: "changed_name",
+        currentPassword: "12345678",
+        newPassword: "87654321"
+      })
+    }));
+    assert.equal(updated.status, 200);
+    const updatedUser = (await updated.json()).user;
+    assert.deepEqual({
+      id: updatedUser.id,
+      username: updatedUser.username,
+      fullName: updatedUser.fullName,
+      about: updatedUser.about
+    }, {
+      id: registeredUser.id,
+      username: longUsername,
+      fullName: "New name",
+      about: "Updated bio"
+    });
+    assert.equal(updatedUser.showOnlineStatus, true);
+
+    const oldPasswordLogin = await fetch(`${baseUrl}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: longUsername, password: "12345678" })
+    });
+    assert.equal(oldPasswordLogin.status, 401);
+    assert.equal((await oldPasswordLogin.json()).error.code, "UNAUTHORIZED");
+    const newPasswordLogin = await fetch(`${baseUrl}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: longUsername, password: "87654321" })
+    });
+    assert.equal(newPasswordLogin.status, 200);
+    assert.equal((await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(cookie))).status, 200);
+  });
+});
+
+test("limits failed logins to ten per IP and case-insensitive username in fifteen minutes", async () => {
+  await withServer({ store: createEmptyStore() }, async (baseUrl) => {
+    await register(baseUrl, "limit_pair_user", "Rate Limit User");
+    const attemptLogin = (username) => fetch(`${baseUrl}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password: "wrong-password" })
+    });
+
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const failed = await attemptLogin("LIMIT_PAIR_USER");
+      await assertApiError(failed, 401, "UNAUTHORIZED");
+    }
+
+    const limited = await attemptLogin("limit_pair_user");
+    await assertApiError(limited, 429, "TOO_MANY_REQUESTS");
+
+    const separateUsername = await attemptLogin("a_different_user");
+    assert.equal(separateUsername.status, 401);
+  });
+});
+
+test("isolates direct messages, broadcasts to participants, and tracks unread counts", async () => {
+  await withServer({ store: createEmptyStore() }, async (baseUrl) => {
+    const alice = await register(baseUrl, "alice_north", "Alice North");
+    const bob = await register(baseUrl, "bobby_south", "Bobby South");
+    assert.equal(alice.response.status, 201);
+    assert.equal(bob.response.status, 201);
+
+    const directResponse = await fetch(
+      `${baseUrl}/api/directs/bobby_south`,
+      authenticatedRequest(alice.cookie, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({})
+      })
+    );
+    assert.equal(directResponse.status, 200);
+    const direct = await directResponse.json();
+    assert.equal(direct.type, "direct");
+    assert.equal(direct.pending, true);
+    const initialBootstrap = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(alice.cookie));
+    assert.deepEqual((await initialBootstrap.json()).directs, []);
+
+    const controller = new AbortController();
+    const eventResponse = await fetch(`${baseUrl}/api/stream`, {
+      headers: { Cookie: bob.cookie },
+      signal: controller.signal
+    });
+    const reader = eventResponse.body.getReader();
+    const firstChunk = await reader.read();
+    assert.match(new TextDecoder().decode(firstChunk.value), /retry: 3000/);
+
+    const sent = await fetch(`${baseUrl}/api/messages`, authenticatedRequest(alice.cookie, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ recipientUsername: "bobby_south", text: "Hello!\nHow are you?" })
+    }));
+    assert.equal(sent.status, 201);
+    const sentMessage = await sent.json();
+    assert.match(sentMessage.text, /Hello!\nHow are you\?/);
+    assert.equal(sentMessage.conversation.type, "direct");
+    assert.equal(sentMessage.conversation.memberIds.length, 2);
+    assert.equal(Number.isSafeInteger(sentMessage.id), true);
+    const conversationId = sentMessage.conversation.id;
+
+    const broadcast = await reader.read();
+    const event = new TextDecoder().decode(broadcast.value);
+    assert.match(event, /event: message/);
+    assert.match(event, /Hello!/);
+    assert.match(event, /How are you/);
+    controller.abort();
+
+    const bobBootstrap = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(bob.cookie));
+    const bobDirect = (await bobBootstrap.json()).directs.find((item) => item.id === conversationId);
+    assert.equal(bobDirect.unreadCount, 1);
+    const read = await fetch(`${baseUrl}/api/conversations/read`, authenticatedRequest(bob.cookie, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ conversationId })
+    }));
+    assert.equal(read.status, 200);
+    const afterRead = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(bob.cookie));
+    const afterReadBody = await afterRead.json();
+    assert.equal(afterReadBody.directs[0].unreadCount, 0);
+    assert.equal(afterReadBody.directs[0].lastReadMessageId, sentMessage.id);
+    const bobReply = await fetch(`${baseUrl}/api/messages`, authenticatedRequest(bob.cookie, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ conversationId, text: "My own message" })
+    }));
+    assert.equal(bobReply.status, 201);
+    const afterOwnReply = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(bob.cookie));
+    const ownReplyBody = await afterOwnReply.json();
+    assert.equal(ownReplyBody.directs[0].unreadCount, 0);
+    assert.equal(ownReplyBody.directs[0].lastReadMessageId, sentMessage.id);
+
+    const edited = await fetch(`${baseUrl}/api/messages/${sentMessage.id}`, authenticatedRequest(alice.cookie, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "Updated message" })
+    }));
+    assert.equal(edited.status, 200);
+    assert.equal((await edited.json()).text, "Updated message");
+
+    const unauthorizedEdit = await fetch(`${baseUrl}/api/messages/${sentMessage.id}`, authenticatedRequest(bob.cookie, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "Not yours" })
+    }));
+    assert.equal(unauthorizedEdit.status, 403);
+  });
+});
+
+test("sends push only when the recipient is not viewing that chat and respects privacy and mute", async () => {
+  const deliveries = [];
+  await withServer({
+    store: createEmptyStore(),
+    pushSender: async (_store, userId, message, _persist, options) => {
+      deliveries.push({ userId, message, options });
+    }
+  }, async (baseUrl) => {
+    const alice = await register(baseUrl, "push_alice", "Alice North");
+    const bob = await register(baseUrl, "push_bobby", "Bobby South");
+    const json = (value) => ({ "Content-Type": "application/json", body: JSON.stringify(value) });
+    const groupResponse = await fetch(`${baseUrl}/api/groups`, authenticatedRequest(alice.cookie, {
+      method: "POST",
+      ...json({ name: "Other chat", usernames: ["push_bobby"] })
+    }));
+    const group = await groupResponse.json();
+    const initialMessage = await fetch(`${baseUrl}/api/messages`, authenticatedRequest(alice.cookie, {
+      method: "POST",
+      ...json({ recipientUsername: "push_bobby", text: "Initial message" })
+    }));
+    const direct = (await initialMessage.json()).conversation;
+    deliveries.length = 0;
+
+    const presence = (conversationId, visible = true) => fetch(
+      `${baseUrl}/api/presence/chat`,
+      authenticatedRequest(bob.cookie, {
+        method: "POST",
+        ...json({ clientId: "browser-tab-0001", conversationId, visible })
+      })
+    );
+    assert.equal((await presence(direct.id)).status, 200);
+    const send = (text) => fetch(`${baseUrl}/api/messages`, authenticatedRequest(alice.cookie, {
+      method: "POST",
+      ...json({ conversationId: direct.id, text })
+    }));
+
+    assert.equal((await send("Visible in the open direct chat")).status, 201);
+    assert.equal(deliveries.length, 0);
+    assert.equal((await presence(group.id)).status, 200);
+    assert.equal((await send("x".repeat(150))).status, 201);
+    assert.equal(deliveries.length, 1);
+    assert.equal(deliveries[0].userId, bob.body.user.id);
+    assert.equal(deliveries[0].options.hideContent, false);
+    assert.equal(createPushPayload(deliveries[0].message).body.length, 100);
+
+    const privacySettings = await fetch(`${baseUrl}/api/account`, authenticatedRequest(bob.cookie, {
+      method: "PATCH",
+      ...json({
+        fullName: "Bobby South",
+        about: "",
+        hideNotificationContent: true
+      })
+    }));
+    assert.equal(privacySettings.status, 200);
+    assert.equal((await privacySettings.json()).user.hideNotificationContent, true);
+    assert.equal((await send("Private notification")).status, 201);
+    assert.equal(deliveries.at(-1).options.hideContent, true);
+
+    const mute = await fetch(`${baseUrl}/api/chats/${direct.id}/mute`, authenticatedRequest(bob.cookie, {
+      method: "POST"
+    }));
+    assert.equal(mute.status, 200);
+    const deliveryCount = deliveries.length;
+    assert.equal((await presence(direct.id, false)).status, 200);
+    assert.equal((await send("Muted notification")).status, 201);
+    assert.equal(deliveries.length, deliveryCount);
+  });
+});
+
+test("validates messages, pages history, enforces edit limits, and keeps deletions as tombstones", async () => {
+  const store = createEmptyStore();
+  let persistedStore;
+  await withServer({
+    store,
+    saveStore: async (current) => { persistedStore = current; }
+  }, async (baseUrl) => {
+    const owner = await register(baseUrl, "history_owner", "Owner");
+    const admin = await register(baseUrl, "history_admin", "Admin");
+    const member = await register(baseUrl, "history_member", "Member");
+    const outsider = await register(baseUrl, "history_outside", "Outside");
+    const json = (value) => ({ "Content-Type": "application/json", body: JSON.stringify(value) });
+
+    const groupResponse = await fetch(`${baseUrl}/api/groups`, authenticatedRequest(owner.cookie, {
+      method: "POST",
+      ...json({ name: "History room", usernames: ["history_admin", "history_member"] })
+    }));
+    const group = await groupResponse.json();
+    const promote = await fetch(
+      `${baseUrl}/api/chats/${group.id}/admins/${admin.body.user.id}`,
+      authenticatedRequest(owner.cookie, { method: "PUT", ...json({ role: "admin" }) })
+    );
+    assert.equal(promote.status, 200);
+
+    const post = (cookie, text) => fetch(`${baseUrl}/api/messages`, authenticatedRequest(cookie, {
+      method: "POST",
+      ...json({ conversationId: group.id, text })
+    }));
+    for (const invalidText of ["   ", "a".repeat(4001), "😊".repeat(4001)]) {
+      const invalid = await post(owner.cookie, invalidText);
+      assert.equal(invalid.status, 400);
+      assert.equal((await invalid.json()).error.code, "BAD_REQUEST");
+    }
+
+    const sentByAuthor = new Map();
+    for (let index = 0; index < 18; index += 1) {
+      for (const [author, cookie] of [["owner", owner.cookie], ["admin", admin.cookie], ["member", member.cookie]]) {
+        const sent = await post(cookie, `${author}-${index}`);
+        assert.equal(sent.status, 201);
+        const message = await sent.json();
+        sentByAuthor.set(author, message);
+      }
+    }
+
+    const latestPageResponse = await fetch(
+      `${baseUrl}/api/messages?conversationId=${encodeURIComponent(group.id)}&limit=200`,
+      authenticatedRequest(owner.cookie)
+    );
+    const latestPage = await latestPageResponse.json();
+    assert.equal(latestPage.messages.length, 50);
+    assert.equal(latestPage.hasMore, true);
+    assert.ok(latestPage.messages.every((message, index, page) =>
+      index === 0 || page[index - 1].id > message.id
+    ));
+    const previousPageResponse = await fetch(
+      `${baseUrl}/api/messages?conversationId=${encodeURIComponent(group.id)}&before=${latestPage.nextCursor}`,
+      authenticatedRequest(owner.cookie)
+    );
+    const previousPage = await previousPageResponse.json();
+    assert.equal(previousPage.messages.length, 4);
+    assert.equal(previousPage.hasMore, false);
+    assert.equal(previousPage.nextCursor, null);
+    assert.ok(previousPage.messages.every((message) => message.id < latestPage.nextCursor));
+    const badCursor = await fetch(
+      `${baseUrl}/api/messages?conversationId=${encodeURIComponent(group.id)}&before=invalid`,
+      authenticatedRequest(owner.cookie)
+    );
+    assert.equal(badCursor.status, 400);
+    const unicodeMessage = await post(owner.cookie, "😊".repeat(4000));
+    assert.equal(unicodeMessage.status, 201);
+    assert.equal(Array.from((await unicodeMessage.json()).text).length, 4000);
+
+    const memberMessage = sentByAuthor.get("member");
+    const edited = await fetch(`${baseUrl}/api/messages/${memberMessage.id}`, authenticatedRequest(member.cookie, {
+      method: "PATCH",
+      ...json({ text: "Edited successfully" })
+    }));
+    assert.equal(edited.status, 200);
+    assert.equal((await edited.json()).text, "Edited successfully");
+    const forbiddenEdit = await fetch(`${baseUrl}/api/messages/${memberMessage.id}`, authenticatedRequest(admin.cookie, {
+      method: "PATCH",
+      ...json({ text: "Not the author" })
+    }));
+    assert.equal(forbiddenEdit.status, 403);
+
+    const storedMemberMessage = persistedStore.messages.find((message) => message.id === memberMessage.id);
+    storedMemberMessage.createdAt = new Date(Date.now() - 49 * 60 * 60 * 1000).toISOString();
+    storedMemberMessage.sentAt = storedMemberMessage.createdAt;
+    const tooLateEdit = await fetch(`${baseUrl}/api/messages/${memberMessage.id}`, authenticatedRequest(member.cookie, {
+      method: "PATCH",
+      ...json({ text: "Too late" })
+    }));
+    assert.equal(tooLateEdit.status, 403);
+    const oldMessageDelete = await fetch(`${baseUrl}/api/messages/${memberMessage.id}`, authenticatedRequest(member.cookie, {
+      method: "DELETE"
+    }));
+    assert.equal(oldMessageDelete.status, 200);
+    const deletedMessage = await oldMessageDelete.json();
+    assert.equal(deletedMessage.deleted, true);
+    assert.equal(deletedMessage.text, "");
+    assert.equal(storedMemberMessage.text, "");
+    assert.equal(storedMemberMessage.deleted, true);
+
+    const adminDelete = await fetch(`${baseUrl}/api/messages/${sentByAuthor.get("owner").id}`, authenticatedRequest(admin.cookie, {
+      method: "DELETE"
+    }));
+    assert.equal(adminDelete.status, 200);
+    assert.equal((await adminDelete.json()).deleted, true);
+    const memberCannotDeleteOwner = await fetch(
+      `${baseUrl}/api/messages/${sentByAuthor.get("admin").id}`,
+      authenticatedRequest(member.cookie, { method: "DELETE" })
+    );
+    assert.equal(memberCannotDeleteOwner.status, 403);
+    const hiddenFromOutsider = await fetch(
+      `${baseUrl}/api/messages?conversationId=${encodeURIComponent(group.id)}`,
+      authenticatedRequest(outsider.cookie)
+    );
+    assert.equal(hiddenFromOutsider.status, 404);
+  });
+});
+
+test("limits each user to twenty messages per minute", async () => {
+  await withServer({ store: createEmptyStore() }, async (baseUrl) => {
+    const sender = await register(baseUrl, "rate_sender", "Sender");
+    const recipient = await register(baseUrl, "rate_recipient", "Recipient");
+    const send = (text) => fetch(`${baseUrl}/api/messages`, authenticatedRequest(sender.cookie, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ recipientUsername: "rate_recipient", text })
+    }));
+    for (let index = 0; index < 20; index += 1) {
+      assert.equal((await send(`Message ${index}`)).status, 201);
+    }
+    const limited = await send("Message 21");
+    assert.equal(limited.status, 429);
+    assert.equal((await limited.json()).error.code, "TOO_MANY_REQUESTS");
+    const recipientBootstrap = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(recipient.cookie));
+    assert.equal((await recipientBootstrap.json()).directs[0].unreadCount, 20);
+  });
+});
+
+test("streams, authorizes, indexes, searches and deletes chat attachments", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "polus-uploads-"));
+  try {
+    let persistedStore;
+    await withServer({
+      store: createEmptyStore(),
+      dataDirectory: directory,
+      saveStore: async (current) => { persistedStore = current; }
+    }, async (baseUrl) => {
+      const owner = await register(baseUrl, "file_owner", "Owner");
+      const member = await register(baseUrl, "file_member", "Member");
+      const outsider = await register(baseUrl, "file_outside", "Outside");
+      const json = (value) => ({ "Content-Type": "application/json", body: JSON.stringify(value) });
+      const created = await fetch(`${baseUrl}/api/groups`, authenticatedRequest(owner.cookie, {
+        method: "POST",
+        ...json({ name: "Files", usernames: ["file_member"] })
+      }));
+      const chat = await created.json();
+
+      const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0, 1, 2]);
+      const upload = await fetch(`${baseUrl}/api/chats/${chat.id}/attachments`, authenticatedRequest(member.cookie, {
+        method: "POST",
+        headers: {
+          "Content-Type": "text/html",
+          "X-File-Name": encodeURIComponent("..\\unsafe<photo>.png")
+        },
+        body: png
+      }));
+      assert.equal(upload.status, 201);
+      const attachment = await upload.json();
+      assert.equal(attachment.mimeType, "image/png");
+      assert.equal(attachment.name, "unsafe_photo_.png");
+      assert.equal(attachment.size, png.length);
+      const thumbnailResponse = await fetch(
+        `${baseUrl}/api/chats/${chat.id}/attachments/${attachment.id}/thumbnail`,
+        authenticatedRequest(member.cookie, {
+          method: "POST",
+          headers: { "Content-Type": "image/png" },
+          body: png
+        })
+      );
+      assert.equal(thumbnailResponse.status, 201);
+      assert.ok((await thumbnailResponse.json()).thumbnailUrl);
+      const thumbnailId = persistedStore.attachments.find((item) => item.id === attachment.id).thumbnailId;
+      const executable = await fetch(`${baseUrl}/api/chats/${chat.id}/attachments`, authenticatedRequest(member.cookie, {
+        method: "POST",
+        headers: {
+          "Content-Type": "image/png",
+          "X-File-Name": "setup.exe"
+        },
+        body: Buffer.from("MZ executable")
+      }));
+      assert.equal(executable.status, 201);
+      const executableFile = await executable.json();
+      assert.equal(executableFile.mimeType, "application/octet-stream");
+
+      const messageResponse = await fetch(`${baseUrl}/api/messages`, authenticatedRequest(member.cookie, {
+        method: "POST",
+        ...json({
+          conversationId: chat.id,
+          text: "Look here https://example.com/picture",
+          attachmentIds: [attachment.id, executableFile.id]
+        })
+      }));
+      assert.equal(messageResponse.status, 201);
+      const message = await messageResponse.json();
+      assert.equal(message.attachments.length, 2);
+      assert.equal(message.attachments[0].id, attachment.id);
+      assert.ok(message.attachments[0].thumbnailUrl);
+      assert.equal(message.attachments[1].id, executableFile.id);
+      const tooManyAttachments = await fetch(`${baseUrl}/api/messages`, authenticatedRequest(member.cookie, {
+        method: "POST",
+        ...json({
+          conversationId: chat.id,
+          text: "Too many",
+          attachmentIds: Array.from({ length: 11 }, (_, index) => `fake-${index}`)
+        })
+      }));
+      assert.equal(tooManyAttachments.status, 400);
+      assert.equal(persistedStore.links.length, 1);
+      assert.equal(persistedStore.links[0].domain, "example.com");
+
+      const history = await fetch(`${baseUrl}/api/messages?conversationId=${chat.id}`, authenticatedRequest(owner.cookie));
+      const historyBody = await history.json();
+      assert.equal(historyBody.messages[0].attachments[0].name, attachment.name);
+
+      const media = await fetch(`${baseUrl}/api/chats/${chat.id}/materials?kind=media`, authenticatedRequest(owner.cookie));
+      const mediaBody = await media.json();
+      assert.equal(mediaBody.total, 1);
+      assert.ok(Array.isArray(mediaBody.items));
+      const files = await fetch(`${baseUrl}/api/chats/${chat.id}/materials?kind=files`, authenticatedRequest(owner.cookie));
+      const filesBody = await files.json();
+      assert.equal(filesBody.total, 1);
+      assert.ok(Array.isArray(filesBody.items));
+      const members = await fetch(`${baseUrl}/api/chats/${chat.id}/materials?kind=members`, authenticatedRequest(owner.cookie));
+      const membersBody = await members.json();
+      assert.ok(Array.isArray(membersBody.items));
+      const links = await fetch(`${baseUrl}/api/chats/${chat.id}/materials?kind=links`, authenticatedRequest(owner.cookie));
+      assert.equal(links.status, 200);
+      const linksBody = await links.json();
+      assert.equal(linksBody.total, 1);
+      assert.ok(Array.isArray(linksBody.items));
+      assert.equal(linksBody.items[0].domain, "example.com");
+      const search = await fetch(`${baseUrl}/api/chats/${chat.id}/search?q=unsafe_photo`, authenticatedRequest(owner.cookie));
+      assert.equal((await search.json()).results[0].id, message.id);
+
+      const fileResponse = await fetch(`${baseUrl}/api/attachments/${attachment.id}`, authenticatedRequest(owner.cookie));
+      assert.equal(fileResponse.status, 200);
+      assert.equal(fileResponse.headers.get("content-type"), "image/png");
+      assert.match(fileResponse.headers.get("content-disposition"), /^inline;/);
+      assert.equal(Buffer.compare(Buffer.from(await fileResponse.arrayBuffer()), png), 0);
+      const thumbnailFile = await fetch(
+        `${baseUrl}/api/attachments/${attachment.id}?thumbnail=1`,
+        authenticatedRequest(owner.cookie)
+      );
+      assert.equal(thumbnailFile.status, 200);
+      assert.equal(thumbnailFile.headers.get("content-type"), "image/png");
+      assert.equal(thumbnailFile.headers.get("x-content-type-options"), "nosniff");
+      const executableResponse = await fetch(
+        `${baseUrl}/api/attachments/${executableFile.id}`,
+        authenticatedRequest(owner.cookie)
+      );
+      assert.match(executableResponse.headers.get("content-disposition"), /^attachment;/);
+      assert.equal(executableResponse.headers.get("x-content-type-options"), "nosniff");
+
+      const outsiderResponse = await fetch(`${baseUrl}/api/attachments/${attachment.id}`, authenticatedRequest(outsider.cookie));
+      assert.equal(outsiderResponse.status, 404);
+      const outsiderThumbnail = await fetch(
+        `${baseUrl}/api/attachments/${attachment.id}?thumbnail=1`,
+        authenticatedRequest(outsider.cookie)
+      );
+      assert.equal(outsiderThumbnail.status, 404);
+      const outsiderMaterials = await fetch(
+        `${baseUrl}/api/chats/${chat.id}/materials?kind=media`,
+        authenticatedRequest(outsider.cookie)
+      );
+      assert.equal(outsiderMaterials.status, 404);
+
+      const deleteMessage = await fetch(`${baseUrl}/api/messages/${message.id}`, authenticatedRequest(owner.cookie, {
+        method: "DELETE"
+      }));
+      assert.equal(deleteMessage.status, 200);
+      assert.equal((await deleteMessage.json()).attachments.length, 0);
+      assert.equal(persistedStore.attachments.length, 0);
+      await assert.rejects(fs.access(path.join(directory, "uploads", chat.id, attachment.id)), { code: "ENOENT" });
+      await assert.rejects(fs.access(path.join(directory, "uploads", chat.id, executableFile.id)), { code: "ENOENT" });
+      await assert.rejects(fs.access(path.join(directory, "uploads", chat.id, thumbnailId)), { code: "ENOENT" });
+      const emptyMedia = await fetch(`${baseUrl}/api/chats/${chat.id}/materials?kind=media`, authenticatedRequest(owner.cookie));
+      assert.equal((await emptyMedia.json()).total, 0);
+
+      const channelResponse = await fetch(`${baseUrl}/api/channels`, authenticatedRequest(owner.cookie, {
+        method: "POST",
+        ...json({ name: "Public media" })
+      }));
+      const channel = await channelResponse.json();
+      const channelUpload = await fetch(`${baseUrl}/api/chats/${channel.id}/attachments`, authenticatedRequest(owner.cookie, {
+        method: "POST",
+        headers: { "Content-Type": "image/png", "X-File-Name": "public.png" },
+        body: png
+      }));
+      const publicAttachment = await channelUpload.json();
+      const channelMessage = await fetch(`${baseUrl}/api/messages`, authenticatedRequest(owner.cookie, {
+        method: "POST",
+        ...json({
+          conversationId: channel.id,
+          text: "Public link https://example.net",
+          attachmentIds: [publicAttachment.id]
+        })
+      }));
+      assert.equal(channelMessage.status, 201);
+      const publicMedia = await fetch(
+        `${baseUrl}/api/chats/${channel.id}/materials?kind=media`,
+        authenticatedRequest(outsider.cookie)
+      );
+      assert.equal((await publicMedia.json()).total, 1);
+      const publicFile = await fetch(
+        `${baseUrl}/api/attachments/${publicAttachment.id}`,
+        authenticatedRequest(outsider.cookie)
+      );
+      assert.equal(publicFile.status, 200);
+      const deniedFiles = await fetch(
+        `${baseUrl}/api/chats/${channel.id}/materials?kind=files`,
+        authenticatedRequest(outsider.cookie)
+      );
+      assert.equal(deniedFiles.status, 404);
+      const deniedMembers = await fetch(
+        `${baseUrl}/api/chats/${channel.id}/materials?kind=members`,
+        authenticatedRequest(outsider.cookie)
+      );
+      assert.equal(deniedMembers.status, 404);
+      for (let messageIndex = 0; messageIndex < 5; messageIndex += 1) {
+        const urls = Array.from({ length: 10 }, (_, linkIndex) =>
+          `https://example.net/${messageIndex}-${linkIndex}`).join(" ");
+        const linkedMessage = await fetch(`${baseUrl}/api/messages`, authenticatedRequest(owner.cookie, {
+          method: "POST",
+          ...json({ conversationId: channel.id, text: urls })
+        }));
+        assert.equal(linkedMessage.status, 201);
+      }
+      const publicLinkPage = await fetch(
+        `${baseUrl}/api/chats/${channel.id}/materials?kind=links`,
+        authenticatedRequest(outsider.cookie)
+      );
+      const firstLinkPage = await publicLinkPage.json();
+      assert.equal(firstLinkPage.total, 51);
+      assert.equal(firstLinkPage.items.length, 50);
+      assert.ok(firstLinkPage.nextCursor);
+      const secondLinkPageResponse = await fetch(
+        `${baseUrl}/api/chats/${channel.id}/materials?kind=links&before=${encodeURIComponent(firstLinkPage.nextCursor)}`,
+        authenticatedRequest(outsider.cookie)
+      );
+      const secondLinkPage = await secondLinkPageResponse.json();
+      assert.equal(secondLinkPage.items.length, 1);
+      assert.equal(secondLinkPage.hasMore, false);
+      assert.notEqual(firstLinkPage.items[49].id, secondLinkPage.items[0].id);
+    });
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("exposes profile controls, online visibility, blocks and per-chat mute settings", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "polus-profiles-"));
+  try {
+  await withServer({ store: createEmptyStore(), dataDirectory: directory }, async (baseUrl) => {
+    const alice = await register(baseUrl, "profile_alice", "Alice");
+    const bob = await register(baseUrl, "profile_bobby", "Bobby");
+    const json = (value) => ({ "Content-Type": "application/json", body: JSON.stringify(value) });
+    const direct = await fetch(`${baseUrl}/api/directs/profile_bobby`, authenticatedRequest(alice.cookie, {
+      method: "POST",
+      ...json({})
+    }));
+    assert.equal((await direct.json()).pending, true);
+    const sent = await fetch(`${baseUrl}/api/messages`, authenticatedRequest(alice.cookie, {
+      method: "POST",
+      ...json({ recipientUsername: "profile_bobby", text: "A link https://example.org" })
+    }));
+    assert.equal(sent.status, 201);
+    const sentBody = await sent.json();
+    const chat = sentBody.conversation;
+    const muted = await fetch(`${baseUrl}/api/chats/${chat.id}/mute`, authenticatedRequest(alice.cookie, {
+      method: "POST"
+    }));
+    assert.equal((await muted.json()).muted, true);
+    const bootstrap = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(alice.cookie));
+    assert.equal((await bootstrap.json()).directs[0].muted, true);
+
+    const profile = await fetch(`${baseUrl}/api/users/profile_bobby/profile`, authenticatedRequest(alice.cookie));
+    const profileBody = await profile.json();
+    assert.equal(profileBody.user.username, "profile_bobby");
+    assert.equal(profileBody.canMessage, true);
+    assert.equal(profileBody.sharedMedia.length, 0);
+
+    const blocked = await fetch(`${baseUrl}/api/users/profile_bobby/block`, authenticatedRequest(alice.cookie, {
+      method: "POST"
+    }));
+    assert.equal((await blocked.json()).blocked, true);
+    const blockedProfile = await fetch(`${baseUrl}/api/users/profile_bobby/profile`, authenticatedRequest(alice.cookie));
+    assert.equal((await blockedProfile.json()).canMessage, false);
+    const rejectedMessage = await fetch(`${baseUrl}/api/messages`, authenticatedRequest(alice.cookie, {
+      method: "POST",
+      ...json({ conversationId: chat.id, text: "blocked" })
+    }));
+    assert.equal(rejectedMessage.status, 403);
+    const unblocked = await fetch(`${baseUrl}/api/users/profile_bobby/block`, authenticatedRequest(alice.cookie, {
+      method: "DELETE"
+    }));
+    assert.equal((await unblocked.json()).blocked, false);
+    const unmuted = await fetch(`${baseUrl}/api/chats/${chat.id}/mute`, authenticatedRequest(alice.cookie, {
+      method: "DELETE"
+    }));
+    assert.equal((await unmuted.json()).muted, false);
+
+    const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+    const avatar = await fetch(`${baseUrl}/api/account/avatar`, authenticatedRequest(bob.cookie, {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: png
+    }));
+    assert.equal(avatar.status, 201);
+    const avatarInfo = await avatar.json();
+    const avatarResponse = await fetch(`${baseUrl}${avatarInfo.avatarUrl}`, authenticatedRequest(alice.cookie));
+    assert.equal(avatarResponse.status, 200);
+    assert.equal(avatarResponse.headers.get("content-type"), "image/png");
+
+    const updated = await fetch(`${baseUrl}/api/account`, authenticatedRequest(bob.cookie, {
+      method: "PATCH",
+      ...json({ fullName: "Bobby", about: "Bio", showOnlineStatus: false })
+    }));
+    assert.equal((await updated.json()).user.showOnlineStatus, false);
+    const hiddenStatus = await fetch(`${baseUrl}/api/users/profile_bobby/profile`, authenticatedRequest(alice.cookie));
+    assert.equal((await hiddenStatus.json()).user.lastSeenAt, null);
+  });
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("creates public channels and multi-member groups", async () => {
+  await withServer({ store: createEmptyStore() }, async (baseUrl) => {
+    const alice = await register(baseUrl, "group_alice", "Alice");
+    const bob = await register(baseUrl, "group_bobby", "Bobby");
+    const charlie = await register(baseUrl, "group_charlie", "Charlie");
+    const dana = await register(baseUrl, "group_dana", "Dana");
+
+    const createdChannel = await fetch(`${baseUrl}/api/channels`, authenticatedRequest(alice.cookie, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "Study club", description: "Let's learn together" })
+    }));
+    assert.equal(createdChannel.status, 201);
+    const channel = await createdChannel.json();
+    assert.equal(channel.joined, true);
+    const channelMessage = await fetch(`${baseUrl}/api/messages`, authenticatedRequest(alice.cookie, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ conversationId: channel.id, text: "Posted before joining" })
+    }));
+    assert.equal(channelMessage.status, 201);
+
+    const privateHistory = await fetch(
+      `${baseUrl}/api/messages?conversationId=${encodeURIComponent(channel.id)}`,
+      authenticatedRequest(bob.cookie)
+    );
+    assert.equal(privateHistory.status, 404);
+
+    const join = await fetch(`${baseUrl}/api/channels/${channel.id}/join`, authenticatedRequest(bob.cookie, {
+      method: "POST"
+    }));
+    assert.equal(join.status, 200);
+    assert.equal((await join.json()).joined, true);
+    const bobChannelBootstrap = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(bob.cookie));
+    const bobChannel = (await bobChannelBootstrap.json()).channels.find((item) => item.id === channel.id);
+    assert.equal(bobChannel.unreadCount, 0);
+
+    const groupResponse = await fetch(`${baseUrl}/api/groups`, authenticatedRequest(alice.cookie, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "Northern lights", usernames: ["group_bobby", "@group_charlie"] })
+    }));
+    assert.equal(groupResponse.status, 201);
+    const group = await groupResponse.json();
+    assert.equal(group.type, "group");
+    assert.equal(group.memberIds.length, 3);
+
+    const groupMessage = await fetch(`${baseUrl}/api/messages`, authenticatedRequest(alice.cookie, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ conversationId: group.id, text: "Posted before invitation" })
+    }));
+    assert.equal(groupMessage.status, 201);
+    const inviteLateMember = await fetch(`${baseUrl}/api/chats/${group.id}/members`, authenticatedRequest(alice.cookie, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "group_dana" })
+    }));
+    assert.equal(inviteLateMember.status, 201);
+    const danaBootstrap = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(dana.cookie));
+    const danaGroup = (await danaBootstrap.json()).directs.find((item) => item.id === group.id);
+    assert.equal(danaGroup.unreadCount, 0);
+
+    const groupBootstrap = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(charlie.cookie));
+    assert.ok((await groupBootstrap.json()).directs.some((direct) => direct.id === group.id));
+
+    const twoPersonGroupResponse = await fetch(`${baseUrl}/api/groups`, authenticatedRequest(alice.cookie, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "Small community", usernames: ["group_bobby"] })
+    }));
+    assert.equal(twoPersonGroupResponse.status, 201);
+    assert.equal((await twoPersonGroupResponse.json()).memberIds.length, 2);
+  });
+});
+
+test("creates exactly one direct chat when the first messages race", async () => {
+  await withServer({ store: createEmptyStore() }, async (baseUrl) => {
+    const alice = await register(baseUrl, "race_alice", "Alice");
+    const bob = await register(baseUrl, "race_bobby", "Bobby");
+    const send = (text) => fetch(`${baseUrl}/api/messages`, authenticatedRequest(alice.cookie, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ recipientUsername: "race_bobby", text })
+    }));
+
+    const responses = await Promise.all([send("First"), send("Second")]);
+    assert.deepEqual(responses.map((response) => response.status), [201, 201]);
+    const messages = await Promise.all(responses.map((response) => response.json()));
+    assert.equal(messages[0].conversation.id, messages[1].conversation.id);
+    assert.equal(messages[0].conversation.memberIds.length, 2);
+
+    const bootstrap = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(bob.cookie));
+    const bobDirects = (await bootstrap.json()).directs;
+    assert.equal(bobDirects.length, 1);
+    assert.equal(bobDirects[0].unreadCount, 2);
+  });
+});
+
+test("migrates only the three removed legacy channels and their persisted content", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "polus-migration-"));
+  try {
+    const uploads = path.join(directory, "uploads");
+    for (const id of ["general", "introductions", "off-topic", "other-channel"]) {
+      await fs.mkdir(path.join(uploads, id), { recursive: true });
+      await fs.writeFile(path.join(uploads, id, "fixture.bin"), "test");
+    }
+    const filePath = path.join(directory, "polus-store.json");
+    await fs.writeFile(filePath, JSON.stringify({
+      ...createEmptyStore(),
+      channels: ["general", "introductions", "off-topic", "other-channel"]
+        .map((id) => ({ id, memberIds: [] })),
+      messages: [
+        { id: "legacy-message", room: "general", text: "legacy" },
+        { id: "kept-message", room: "other-channel", text: "kept" }
+      ],
+      attachments: [
+        { id: "legacy-attachment", chatId: "general", messageId: "legacy-message" },
+        { id: "kept-attachment", chatId: "other-channel", messageId: "kept-message" }
+      ],
+      links: [
+        { id: "legacy-link", chatId: "general", messageId: "legacy-message" },
+        { id: "kept-link", chatId: "other-channel", messageId: "kept-message" }
+      ]
+    }));
+    await fs.writeFile(path.join(directory, "messages.jsonl"), [
+      JSON.stringify({ room: "general", message: "removed" }),
+      JSON.stringify({ room: "other-channel", message: "kept" })
+    ].join("\n"));
+
+    const store = await loadStore(filePath);
+    assert.deepEqual(store.channels.map((channel) => channel.id), ["other-channel"]);
+    assert.deepEqual(store.messages.map((message) => message.id), [1]);
+    assert.deepEqual(store.attachments.map((attachment) => attachment.id), ["kept-attachment"]);
+    assert.deepEqual(store.links.map((link) => link.id), ["kept-link"]);
+    assert.equal(store.attachments[0].messageId, 1);
+    assert.equal(store.links[0].messageId, 1);
+    for (const id of ["general", "introductions", "off-topic"]) {
+      await assert.rejects(fs.access(path.join(uploads, id)), { code: "ENOENT" });
+    }
+    await fs.access(path.join(uploads, "other-channel"));
+    const legacyMessages = await fs.readFile(path.join(directory, "messages.jsonl"), "utf8");
+    assert.match(legacyMessages, /other-channel/);
+    assert.doesNotMatch(legacyMessages, /"general"/);
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("enforces channel and group owner/admin/member permissions and ownership transfer", async () => {
+  await withServer({ store: createEmptyStore() }, async (baseUrl) => {
+    const owner = await register(baseUrl, "roles_owner", "Owner");
+    const admin = await register(baseUrl, "roles_admin", "Admin");
+    const member = await register(baseUrl, "roles_member", "Member");
+    const outsider = await register(baseUrl, "roles_outsider", "Outsider");
+    const json = (value) => ({ "Content-Type": "application/json", body: JSON.stringify(value) });
+
+    const channelResponse = await fetch(`${baseUrl}/api/channels`, authenticatedRequest(owner.cookie, {
+      method: "POST",
+      ...json({ name: "Role channel" })
+    }));
+    const channel = await channelResponse.json();
+    assert.equal(channel.role, "owner");
+    assert.equal(channel.ownerId, channel.memberIds[0]);
+
+    const join = await fetch(`${baseUrl}/api/channels/${channel.id}/join`, authenticatedRequest(member.cookie, {
+      method: "POST"
+    }));
+    assert.equal(join.status, 200);
+    const leaveChannel = await fetch(`${baseUrl}/api/chats/${channel.id}/leave`, authenticatedRequest(member.cookie, {
+      method: "POST"
+    }));
+    assert.equal(leaveChannel.status, 200);
+    const leftChannelHistory = await fetch(
+      `${baseUrl}/api/messages?conversationId=${encodeURIComponent(channel.id)}`,
+      authenticatedRequest(member.cookie)
+    );
+    assert.equal(leftChannelHistory.status, 404);
+    const rejoin = await fetch(`${baseUrl}/api/channels/${channel.id}/join`, authenticatedRequest(member.cookie, {
+      method: "POST"
+    }));
+    assert.equal(rejoin.status, 200);
+    const memberPost = await fetch(`${baseUrl}/api/messages`, authenticatedRequest(member.cookie, {
+      method: "POST",
+      ...json({ conversationId: channel.id, text: "not allowed" })
+    }));
+    assert.equal(memberPost.status, 403);
+
+    const addAdmin = await fetch(`${baseUrl}/api/chats/${channel.id}/members`, authenticatedRequest(owner.cookie, {
+      method: "POST",
+      ...json({ username: "roles_admin" })
+    }));
+    assert.equal(addAdmin.status, 201);
+    const promote = await fetch(
+      `${baseUrl}/api/chats/${channel.id}/admins/${admin.body.user.id}`,
+      authenticatedRequest(owner.cookie, { method: "PUT", ...json({ role: "admin" }) })
+    );
+    assert.equal(promote.status, 200);
+    const adminPost = await fetch(`${baseUrl}/api/messages`, authenticatedRequest(admin.cookie, {
+      method: "POST",
+      ...json({ conversationId: channel.id, text: "Admin post" })
+    }));
+    assert.equal(adminPost.status, 201);
+    const outsiderHistory = await fetch(
+      `${baseUrl}/api/messages?conversationId=${encodeURIComponent(channel.id)}`,
+      authenticatedRequest(outsider.cookie)
+    );
+    assert.equal(outsiderHistory.status, 404);
+
+    const groupResponse = await fetch(`${baseUrl}/api/groups`, authenticatedRequest(owner.cookie, {
+      method: "POST",
+      ...json({ name: "Private group", usernames: ["roles_admin", "roles_member"] })
+    }));
+    assert.equal(groupResponse.status, 201);
+    const group = await groupResponse.json();
+    const hiddenGroup = await fetch(`${baseUrl}/api/chats/${group.id}`, authenticatedRequest(outsider.cookie));
+    assert.equal(hiddenGroup.status, 404);
+    assert.equal((await hiddenGroup.json()).error.code, "NOT_FOUND");
+
+    const ownerLeave = await fetch(`${baseUrl}/api/chats/${group.id}/leave`, authenticatedRequest(owner.cookie, {
+      method: "POST"
+    }));
+    assert.equal(ownerLeave.status, 409);
+
+    const promoteGroupAdmin = await fetch(
+      `${baseUrl}/api/chats/${group.id}/admins/${admin.body.user.id}`,
+      authenticatedRequest(owner.cookie, { method: "PUT", ...json({ role: "admin" }) })
+    );
+    assert.equal(promoteGroupAdmin.status, 200);
+    const invited = await fetch(`${baseUrl}/api/chats/${group.id}/members`, authenticatedRequest(admin.cookie, {
+      method: "POST",
+      ...json({ username: "roles_outsider" })
+    }));
+    assert.equal(invited.status, 201);
+    const removed = await fetch(
+      `${baseUrl}/api/chats/${group.id}/members/${outsider.body.user.id}`,
+      authenticatedRequest(admin.cookie, { method: "DELETE" })
+    );
+    assert.equal(removed.status, 200);
+    const promotedMember = await fetch(
+      `${baseUrl}/api/chats/${group.id}/admins/${member.body.user.id}`,
+      authenticatedRequest(owner.cookie, { method: "PUT", ...json({ role: "admin" }) })
+    );
+    assert.equal(promotedMember.status, 200);
+    const adminCannotRemoveAdmin = await fetch(
+      `${baseUrl}/api/chats/${group.id}/members/${member.body.user.id}`,
+      authenticatedRequest(admin.cookie, { method: "DELETE" })
+    );
+    assert.equal(adminCannotRemoveAdmin.status, 403);
+
+    const transfer = await fetch(`${baseUrl}/api/chats/${group.id}/owner`, authenticatedRequest(owner.cookie, {
+      method: "PUT",
+      ...json({ username: "roles_admin" })
+    }));
+    assert.equal(transfer.status, 200);
+    assert.equal((await transfer.json()).chat.ownerId, admin.body.user.id);
+    const oldOwnerLeave = await fetch(`${baseUrl}/api/chats/${group.id}/leave`, authenticatedRequest(owner.cookie, {
+      method: "POST"
+    }));
+    assert.equal(oldOwnerLeave.status, 200);
+    const deleteGroup = await fetch(`${baseUrl}/api/chats/${group.id}`, authenticatedRequest(admin.cookie, {
+      method: "DELETE"
+    }));
+    assert.equal(deleteGroup.status, 200);
+    const deletedGroup = await fetch(`${baseUrl}/api/chats/${group.id}`, authenticatedRequest(member.cookie));
+    assert.equal(deletedGroup.status, 404);
+  });
+});

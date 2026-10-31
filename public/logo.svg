@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Полюс — логотип мессенджера</title>
+  <desc id="desc">Сине-белая полярная звезда внутри диалогового облака с орбитой и названием Полюс.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#071735"/>
+      <stop offset="1" stop-color="#020b20"/>
+    </linearGradient>
+    <linearGradient id="blue" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1488ff"/>
+      <stop offset="0.55" stop-color="#18c5f4"/>
+      <stop offset="1" stop-color="#7be7ff"/>
+    </linearGradient>
+    <linearGradient id="whiteBlue" x1="0" y1="0" x2="0.9" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#a7e8ff"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="7" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="1024" height="1024" rx="0" fill="url(#bg)"/>
+  <g transform="translate(0,-4)">
+    <!-- orbit -->
+    <path d="M218 470 C285 302 491 228 681 282 C800 316 864 405 846 492 C827 582 723 633 621 626"
+          fill="none" stroke="url(#blue)" stroke-width="17" stroke-linecap="round" opacity=".95"/>
+    <path d="M224 485 C275 368 392 306 506 306" fill="none" stroke="#218eff" stroke-width="5" stroke-linecap="round" opacity=".65"/>
+    <!-- speech bubble outline -->
+    <path d="M310 281 C310 244 340 214 377 214 H648 C685 214 715 244 715 281 V478 C715 515 685 545 648 545 H456 L368 606 L385 545 H377 C340 545 310 515 310 478 Z"
+          fill="#061733" stroke="url(#whiteBlue)" stroke-width="16" stroke-linejoin="round"/>
+    <path d="M329 282 C329 255 350 234 377 234 H648 C674 234 695 255 695 282 V477 C695 504 674 525 648 525 H450 L395 563 L406 525 H377 C350 525 329 504 329 477 Z"
+          fill="#08244a" opacity=".72"/>
+    <!-- compass star -->
+    <g transform="translate(512 379)" filter="url(#glow)">
+      <path d="M0 -143 L25 -26 L143 0 L25 25 L0 143 L-25 25 L-143 0 L-25 -26 Z" fill="url(#whiteBlue)"/>
+      <path d="M0 -143 L0 0 L25 -26 Z" fill="#ffffff"/>
+      <path d="M0 -143 L-25 -26 L0 0 Z" fill="#72d9ff"/>
+      <path d="M143 0 L0 0 L25 25 Z" fill="#b9f0ff"/>
+      <path d="M0 143 L0 0 L-25 25 Z" fill="#138cff"/>
+      <path d="M-143 0 L0 0 L-25 -26 Z" fill="#eafaff"/>
+      <path d="M0 -94 L16 -16 L94 0 L16 16 L0 94 L-16 16 L-94 0 L-16 -16 Z" fill="url(#blue)" opacity=".9"/>
+      <circle r="11" fill="#ffffff"/>
+    </g>
+    <!-- small polar dot -->
+    <circle cx="729" cy="292" r="10" fill="#9cecff"/>
+  </g>
+  <text x="512" y="765" text-anchor="middle" font-family="Inter, Montserrat, Arial, sans-serif" font-size="112" font-weight="800" letter-spacing="-3" fill="#ffffff">Полюс</text>
+  <text x="512" y="822" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="24" font-weight="500" letter-spacing="8" fill="#65cfff" opacity=".9">МЕССЕНДЖЕР</text>
+</svg>

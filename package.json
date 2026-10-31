@@ -1,0 +1,16 @@
+{
+  "name": "polus-messenger",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Polus: an adaptive real-time messenger with accounts, channels, groups and push notifications.",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "web-push": "^3.6.7"
+  }
+}
