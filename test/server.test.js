@@ -1,19 +1,134 @@
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
+const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
+const Database = require("better-sqlite3");
 const {
   createEmptyStore,
   createPushPayload,
+  cleanupExpiredData,
+  createSqliteStoreWriter,
   createStoreWriter,
   createMessengerServer,
   getLanAddresses,
   PRIVACY_VERSION,
+  loadSqliteStore,
   loadStore,
+  normalizeStore,
   sendPushToUser,
   writeStoreAtomically
 } = require("../server");
+
+test("cleans expired sessions and orphaned attachment files", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "polus-cleanup-"));
+  try {
+    const now = Date.now();
+    const chatDirectory = path.join(directory, "uploads", "chat-1");
+    await fs.mkdir(chatDirectory, { recursive: true });
+    await fs.writeFile(path.join(chatDirectory, "orphan"), "file");
+    await fs.writeFile(path.join(chatDirectory, "thumbnail"), "thumbnail");
+    const store = createEmptyStore();
+    store.sessions = [
+      { id: "expired", expiresAt: now - 1 },
+      { id: "active", expiresAt: now + 60_000 }
+    ];
+    store.attachments = [
+      {
+        id: "orphan",
+        thumbnailId: "thumbnail",
+        chatId: "chat-1",
+        createdAt: new Date(now - 25 * 60 * 60 * 1000).toISOString(),
+        messageId: null
+      },
+      {
+        id: "attached",
+        chatId: "chat-1",
+        createdAt: new Date(now - 25 * 60 * 60 * 1000).toISOString(),
+        messageId: "message-1"
+      }
+    ];
+    store.uploadUsage = [
+      { createdAt: new Date(now - 25 * 60 * 60 * 1000).toISOString() },
+      { createdAt: new Date(now - 60 * 60 * 1000).toISOString() }
+    ];
+    let persistCount = 0;
+    assert.equal(await cleanupExpiredData(store, directory, async () => { persistCount += 1; }, now), true);
+    assert.equal(persistCount, 1);
+    assert.deepEqual(store.sessions.map((session) => session.id), ["active"]);
+    assert.deepEqual(store.attachments.map((attachment) => attachment.id), ["attached"]);
+    assert.equal(store.uploadUsage.length, 1);
+    await assert.rejects(fs.access(path.join(chatDirectory, "orphan")), { code: "ENOENT" });
+    await assert.rejects(fs.access(path.join(chatDirectory, "thumbnail")), { code: "ENOENT" });
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("persists expired-session cleanup through the SQLite store writer", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "polus-sqlite-cleanup-"));
+  let database;
+  try {
+    const loaded = await loadSqliteStore(
+      path.join(directory, "store.sqlite"),
+      path.join(directory, "legacy.json")
+    );
+    database = loaded.database;
+    const { store } = loaded;
+    store.sessions.push({
+      id: "expired-session",
+      userId: "cleanup-user",
+      tokenHash: "expired-token",
+      expiresAt: Date.now() - 1
+    });
+    const saveStore = createSqliteStoreWriter(database, store);
+    await saveStore(store);
+
+    assert.equal(await cleanupExpiredData(store, directory, saveStore), true);
+    assert.deepEqual(store.sessions, []);
+    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM sessions").get().count, 0);
+  } finally {
+    database?.close();
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("normalizes exactly one saved chat per user, including legacy single-member records", () => {
+  const store = createEmptyStore();
+  store.users.push(
+    { id: "saved-user", username: "saved_user", fullName: "Saved User" },
+    { id: "other-user", username: "other_user", fullName: "Other User" }
+  );
+  store.conversations.push({
+    id: "legacy_saved_a",
+    type: "saved",
+    ownerId: "saved-user",
+    memberIds: ["saved-user"],
+    name: "must not persist"
+  }, {
+    id: "legacy_saved_b",
+    type: "saved",
+    ownerId: "saved-user",
+    memberIds: ["saved-user"]
+  }, {
+    id: "legacy_single_member",
+    createdBy: "other-user",
+    memberIds: ["other-user"]
+  });
+  const normalized = normalizeStore(store);
+  assert.equal(normalized.conversations.filter((chat) => chat.type === "saved").length, 2);
+  const saved = normalized.conversations.find((chat) => chat.id === "saved_saved-user");
+  assert.equal(saved.type, "saved");
+  assert.deepEqual(saved.memberIds, ["saved-user"]);
+  assert.equal(saved.ownerId, "saved-user");
+  assert.equal(Object.hasOwn(saved, "name"), false);
+  const migratedSingleMember = normalized.conversations.find((chat) => chat.id === "saved_other-user");
+  assert.equal(migratedSingleMember.type, "saved");
+  assert.deepEqual(migratedSingleMember.memberIds, ["other-user"]);
+  const repeated = normalizeStore(normalized);
+  assert.equal(repeated.conversations.filter((chat) => chat.type === "saved").length, 2);
+});
 
 async function withServer(options, run) {
   const server = createMessengerServer(options);
@@ -27,6 +142,386 @@ async function withServer(options, run) {
     });
   }
 }
+
+test("creates a saved chat when registering a new user", async () => {
+  await withServer({ store: createEmptyStore() }, async (baseUrl) => {
+    const account = await register(baseUrl, "saved_signup", "Saved Signup");
+    assert.equal(account.response.status, 201);
+    const bootstrap = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(account.cookie));
+    const { directs } = await bootstrap.json();
+    assert.equal(directs.filter((chat) => chat.type === "saved").length, 1);
+    assert.equal(directs[0].id, `saved_${account.body.user.id}`);
+    assert.equal(directs[0].type, "saved");
+    assert.equal(directs[0].name, null);
+    assert.equal(directs[0].unreadCount, 0);
+  });
+});
+
+test("accepts recorded voice messages and preserves their media type", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "polus-recorded-voice-"));
+  try {
+    await withServer({
+      store: createEmptyStore(),
+      dataDirectory: directory
+    }, async (baseUrl) => {
+      const account = await register(baseUrl, "voice_recorder", "Voice Recorder");
+      const chatId = `saved_${account.body.user.id}`;
+      const uploaded = await fetch(`${baseUrl}/api/chats/${chatId}/attachments`, authenticatedRequest(account.cookie, {
+        method: "POST",
+        headers: {
+          "Content-Type": "audio/webm",
+          "X-File-Mime-Type": "audio/webm",
+          "X-File-Name": "voice-message.webm"
+        },
+        body: Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x93, 0x42, 0x82, 0x88])
+      }));
+      assert.equal(uploaded.status, 201);
+      const attachment = await uploaded.json();
+      assert.equal(attachment.mimeType, "audio/webm");
+      const playableAttachment = await fetch(
+        `${baseUrl}/api/attachments/${attachment.id}`,
+        authenticatedRequest(account.cookie)
+      );
+      assert.equal(playableAttachment.status, 200);
+      assert.equal(playableAttachment.headers.get("content-type"), "audio/webm");
+      assert.match(playableAttachment.headers.get("content-disposition"), /^inline;/);
+
+      const json = (value) => ({ "Content-Type": "application/json", body: JSON.stringify(value) });
+      const mismatched = await fetch(`${baseUrl}/api/messages`, authenticatedRequest(account.cookie, {
+        method: "POST",
+        ...json({ conversationId: chatId, text: "", attachmentIds: [attachment.id], mediaType: "video_note" })
+      }));
+      assert.equal(mismatched.status, 400);
+
+      const sent = await fetch(`${baseUrl}/api/messages`, authenticatedRequest(account.cookie, {
+        method: "POST",
+        ...json({ conversationId: chatId, text: "", attachmentIds: [attachment.id], mediaType: "voice" })
+      }));
+      assert.equal(sent.status, 201);
+      assert.equal((await sent.json()).mediaType, "voice");
+      const history = await fetch(`${baseUrl}/api/messages?conversationId=${chatId}`, authenticatedRequest(account.cookie));
+      assert.equal((await history.json()).messages[0].mediaType, "voice");
+    });
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("protects saved chats and preserves shared files until the last message reference is removed", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "polus-saved-attachments-"));
+  try {
+    let persistedStore;
+    let pushDeliveries = 0;
+    await withServer({
+      store: createEmptyStore(),
+      dataDirectory: directory,
+      pushSender: async () => { pushDeliveries += 1; },
+      saveStore: async (current) => { persistedStore = current; }
+    }, async (baseUrl) => {
+      const alice = await register(baseUrl, "saved_alice", "Alice North");
+      const bob = await register(baseUrl, "saved_bob", "Bob South");
+      const json = (value) => ({ "Content-Type": "application/json", body: JSON.stringify(value) });
+      const savedId = `saved_${alice.body.user.id}`;
+      const foreignChat = await fetch(`${baseUrl}/api/chats/${savedId}`, authenticatedRequest(bob.cookie));
+      await assertApiError(foreignChat, 404, "NOT_FOUND");
+      const foreignMessages = await fetch(
+        `${baseUrl}/api/messages?conversationId=${encodeURIComponent(savedId)}`,
+        authenticatedRequest(bob.cookie)
+      );
+      await assertApiError(foreignMessages, 404, "NOT_FOUND");
+
+      for (const [pathName, method, body] of [
+        [`/api/chats/${savedId}`, "DELETE", undefined],
+        [`/api/chats/${savedId}/leave`, "POST", undefined],
+        [`/api/chats/${savedId}/members`, "POST", { username: "saved_bob" }],
+        [`/api/chats/${savedId}/owner`, "PUT", { username: "saved_bob" }]
+      ]) {
+        const response = await fetch(`${baseUrl}${pathName}`, authenticatedRequest(alice.cookie, {
+          method,
+          ...(body ? json(body) : {})
+        }));
+        await assertApiError(response, 400, "BAD_REQUEST");
+      }
+
+      const selfMessage = await fetch(`${baseUrl}/api/messages`, authenticatedRequest(alice.cookie, {
+        method: "POST",
+        ...json({ conversationId: savedId, text: "Private note" })
+      }));
+      assert.equal(selfMessage.status, 201);
+      const selfMessageBody = await selfMessage.json();
+      assert.equal(selfMessageBody.conversation.type, "saved");
+      assert.equal(selfMessageBody.conversation.unreadCount, 0);
+      const editedSelfMessage = await fetch(`${baseUrl}/api/messages/${selfMessageBody.id}`, authenticatedRequest(alice.cookie, {
+        method: "PATCH",
+        ...json({ text: "Edited private note" })
+      }));
+      assert.equal(editedSelfMessage.status, 200);
+      assert.equal((await editedSelfMessage.json()).text, "Edited private note");
+
+      const sourceResponse = await fetch(`${baseUrl}/api/messages`, authenticatedRequest(alice.cookie, {
+        method: "POST",
+        ...json({ recipientUsername: "saved_bob", text: "Remember https://example.org" })
+      }));
+      const source = await sourceResponse.json();
+      const uploaded = await fetch(`${baseUrl}/api/chats/${source.conversation.id}/attachments`,
+        authenticatedRequest(alice.cookie, {
+          method: "POST",
+          headers: { "X-File-Name": "shared.txt", "Content-Type": "application/octet-stream" },
+          body: Buffer.from("shared attachment contents")
+        }));
+      assert.equal(uploaded.status, 201);
+      const uploadedAttachment = await uploaded.json();
+      const sourceWithAttachment = await fetch(`${baseUrl}/api/messages`, authenticatedRequest(alice.cookie, {
+        method: "POST",
+        ...json({
+          conversationId: source.conversation.id,
+          text: "Saved source https://example.org/path",
+          attachmentIds: [uploadedAttachment.id]
+        })
+      }));
+      const sourceMessage = await sourceWithAttachment.json();
+      const pushesBeforeSave = pushDeliveries;
+      const savedResponse = await fetch(`${baseUrl}/api/messages/${sourceMessage.id}/save`,
+        authenticatedRequest(alice.cookie, { method: "POST" }));
+      assert.equal(savedResponse.status, 201);
+      const savedCopy = await savedResponse.json();
+      assert.equal(savedCopy.conversationId, savedId);
+      assert.equal(pushDeliveries, pushesBeforeSave);
+      assert.equal(savedCopy.text, sourceMessage.text);
+      assert.deepEqual(savedCopy.savedSource, {
+        chatName: "Bob South",
+        authorName: "Alice North",
+        authorUsername: "saved_alice"
+      });
+      assert.notEqual(savedCopy.attachments[0].id, uploadedAttachment.id);
+      const copiedAttachment = persistedStore.attachments.find((item) => item.id === savedCopy.attachments[0].id);
+      assert.equal(copiedAttachment.storageId, uploadedAttachment.id);
+      assert.equal(copiedAttachment.storageChatId, source.conversation.id);
+
+      const savedBootstrap = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(alice.cookie));
+      assert.equal((await savedBootstrap.json()).directs.find((chat) => chat.id === savedId).unreadCount, 0);
+      const savedHistory = await fetch(`${baseUrl}/api/messages?conversationId=${encodeURIComponent(savedId)}`,
+        authenticatedRequest(alice.cookie));
+      assert.ok((await savedHistory.json()).messages.some((message) => message.id === savedCopy.id));
+      const savedLinks = await fetch(`${baseUrl}/api/chats/${savedId}/materials?kind=links`,
+        authenticatedRequest(alice.cookie));
+      assert.equal((await savedLinks.json()).items.some((link) => link.url === "https://example.org/path"), true);
+
+      const sourceFile = path.join(directory, "uploads", source.conversation.id, uploadedAttachment.id);
+      const savedAttachmentResponse = await fetch(
+        `${baseUrl}/api/attachments/${savedCopy.attachments[0].id}`,
+        authenticatedRequest(alice.cookie)
+      );
+      assert.equal(savedAttachmentResponse.status, 200);
+      const deletedSource = await fetch(`${baseUrl}/api/messages/${sourceMessage.id}`,
+        authenticatedRequest(alice.cookie, { method: "DELETE" }));
+      assert.equal(deletedSource.status, 200);
+      assert.equal((await fs.readFile(sourceFile, "utf8")), "shared attachment contents");
+      const savedAfterSourceDelete = await fetch(
+        `${baseUrl}/api/messages?conversationId=${encodeURIComponent(savedId)}`,
+        authenticatedRequest(alice.cookie)
+      );
+      assert.ok((await savedAfterSourceDelete.json()).messages.some((message) =>
+        message.id === savedCopy.id && message.attachments.length === 1
+      ));
+
+      const deletedSavedCopy = await fetch(`${baseUrl}/api/messages/${savedCopy.id}`,
+        authenticatedRequest(alice.cookie, { method: "DELETE" }));
+      assert.equal(deletedSavedCopy.status, 200);
+      await assert.rejects(fs.access(sourceFile), { code: "ENOENT" });
+    });
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("replies to messages, toggles private reactions, and forwards messages with shared attachments", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "polus-message-actions-"));
+  try {
+    let persistedStore;
+    await withServer({
+      store: createEmptyStore(),
+      dataDirectory: directory,
+      saveStore: async (current) => { persistedStore = current; }
+    }, async (baseUrl) => {
+      const alice = await register(baseUrl, "actions_alice", "Alice North");
+      const bob = await register(baseUrl, "actions_bob", "Bob South");
+      const carol = await register(baseUrl, "actions_carol", "Carol West");
+      const json = (value) => ({ "Content-Type": "application/json", body: JSON.stringify(value) });
+      const sourceResponse = await fetch(`${baseUrl}/api/messages`,
+        authenticatedRequest(alice.cookie, {
+          method: "POST",
+          ...json({ recipientUsername: "actions_bob", text: "Forward this https://example.org/source" })
+        }));
+      assert.equal(sourceResponse.status, 201);
+      const source = await sourceResponse.json();
+      const channelResponse = await fetch(`${baseUrl}/api/channels`,
+        authenticatedRequest(alice.cookie, {
+          method: "POST",
+          ...json({ name: "Forward target", description: "" })
+        }));
+      assert.equal(channelResponse.status, 201);
+      const channel = await channelResponse.json();
+      const joinedChannel = await fetch(
+        `${baseUrl}/api/channels/${encodeURIComponent(channel.id)}/join`,
+        authenticatedRequest(bob.cookie, { method: "POST" })
+      );
+      assert.equal(joinedChannel.status, 200);
+      const forbiddenChannelForward = await fetch(
+        `${baseUrl}/api/messages/${source.id}/forward`,
+        authenticatedRequest(bob.cookie, {
+          method: "POST",
+          ...json({ conversationId: channel.id })
+        })
+      );
+      await assertApiError(forbiddenChannelForward, 403, "FORBIDDEN");
+      const uploadedResponse = await fetch(
+        `${baseUrl}/api/chats/${encodeURIComponent(source.conversationId)}/attachments`,
+        authenticatedRequest(alice.cookie, {
+          method: "POST",
+          headers: { "X-File-Name": "forwarded.txt", "Content-Type": "application/octet-stream" },
+          body: Buffer.from("shared forwarded file")
+        })
+      );
+      assert.equal(uploadedResponse.status, 201);
+      const uploaded = await uploadedResponse.json();
+      const sourceWithFileResponse = await fetch(`${baseUrl}/api/messages`,
+        authenticatedRequest(alice.cookie, {
+          method: "POST",
+          ...json({
+            conversationId: source.conversationId,
+            text: "Forward this https://example.org/source",
+            attachmentIds: [uploaded.id]
+          })
+        }));
+      assert.equal(sourceWithFileResponse.status, 201);
+      const sourceWithFile = await sourceWithFileResponse.json();
+      const aliceHistoryUrl = `${baseUrl}/api/messages?conversationId=${encodeURIComponent(source.conversationId)}`;
+      const unreadHistoryResponse = await fetch(aliceHistoryUrl, authenticatedRequest(alice.cookie));
+      const unreadHistory = await unreadHistoryResponse.json();
+      assert.equal(unreadHistory.messages.find((message) => message.id === sourceWithFile.id).seenByRecipient, false);
+      const bobReadResponse = await fetch(`${baseUrl}/api/conversations/read`,
+        authenticatedRequest(bob.cookie, {
+          method: "POST",
+          ...json({ conversationId: source.conversationId })
+        }));
+      assert.equal(bobReadResponse.status, 200);
+      const readHistoryResponse = await fetch(aliceHistoryUrl, authenticatedRequest(alice.cookie));
+      const readHistory = await readHistoryResponse.json();
+      assert.equal(readHistory.messages.find((message) => message.id === sourceWithFile.id).seenByRecipient, true);
+
+      const replyResponse = await fetch(`${baseUrl}/api/messages`,
+        authenticatedRequest(alice.cookie, {
+          method: "POST",
+          ...json({
+            conversationId: source.conversationId,
+            text: "A reply",
+            replyToId: sourceWithFile.id
+          })
+        }));
+      assert.equal(replyResponse.status, 201);
+      const reply = await replyResponse.json();
+      assert.equal(reply.replyTo.id, sourceWithFile.id);
+      assert.equal(reply.replyTo.author.username, "actions_alice");
+      assert.equal(reply.replyTo.text, sourceWithFile.text);
+
+      const crossChatReply = await fetch(`${baseUrl}/api/messages`,
+        authenticatedRequest(alice.cookie, {
+          method: "POST",
+          ...json({
+            conversationId: `saved_${alice.body.user.id}`,
+            text: "Invalid cross-chat reply",
+            replyToId: sourceWithFile.id
+          })
+        }));
+      await assertApiError(crossChatReply, 404, "NOT_FOUND");
+
+      const react = async (cookie, messageId, emoji) => fetch(
+        `${baseUrl}/api/messages/${messageId}/reactions`,
+        authenticatedRequest(cookie, { method: "POST", ...json({ emoji }) })
+      );
+      const aliceReaction = await react(alice.cookie, sourceWithFile.id, "👍");
+      assert.equal(aliceReaction.status, 200);
+      assert.deepEqual((await aliceReaction.json()).reactions, [
+        { emoji: "👍", count: 1, reactedByMe: true }
+      ]);
+      const bobHistoryResponse = await fetch(
+        `${baseUrl}/api/messages?conversationId=${encodeURIComponent(source.conversationId)}`,
+        authenticatedRequest(bob.cookie)
+      );
+      const bobSource = (await bobHistoryResponse.json()).messages
+        .find((message) => message.id === sourceWithFile.id);
+      assert.deepEqual(bobSource.reactions, [{ emoji: "👍", count: 1, reactedByMe: false }]);
+      const bobReaction = await react(bob.cookie, sourceWithFile.id, "👍");
+      assert.equal((await bobReaction.json()).reactions[0].count, 2);
+      const aliceRemoval = await react(alice.cookie, sourceWithFile.id, "👍");
+      assert.deepEqual((await aliceRemoval.json()).reactions, [
+        { emoji: "👍", count: 1, reactedByMe: false }
+      ]);
+      await assertApiError(await react(alice.cookie, sourceWithFile.id, "not-an-emoji"), 400, "BAD_REQUEST");
+      await assertApiError(await react(carol.cookie, sourceWithFile.id, "❤️"), 404, "NOT_FOUND");
+
+      const existingChatForward = await fetch(
+        `${baseUrl}/api/messages/${sourceWithFile.id}/forward`,
+        authenticatedRequest(alice.cookie, {
+          method: "POST",
+          ...json({ conversationId: source.conversationId })
+        })
+      );
+      assert.equal(existingChatForward.status, 201);
+      const sameChatCopy = await existingChatForward.json();
+      assert.equal(sameChatCopy.forwardedFrom.authorName, "Alice North");
+      assert.equal(sameChatCopy.attachments.length, 1);
+      assert.notEqual(sameChatCopy.attachments[0].id, uploaded.id);
+
+      const userForwardResponse = await fetch(
+        `${baseUrl}/api/messages/${sourceWithFile.id}/forward`,
+        authenticatedRequest(alice.cookie, {
+          method: "POST",
+          ...json({ recipientUsername: "actions_carol" })
+        })
+      );
+      assert.equal(userForwardResponse.status, 201);
+      const forwarded = await userForwardResponse.json();
+      assert.equal(forwarded.text, sourceWithFile.text);
+      assert.equal(forwarded.forwardedFrom.authorName, "Alice North");
+      assert.equal(forwarded.forwardedFrom.chatName, "Bob South");
+      assert.notEqual(forwarded.attachments[0].id, uploaded.id);
+      const copiedAttachment = persistedStore.attachments.find((item) => item.id === forwarded.attachments[0].id);
+      assert.equal(copiedAttachment.storageId, uploaded.id);
+      assert.equal(copiedAttachment.storageChatId, source.conversationId);
+
+      const deletedSource = await fetch(`${baseUrl}/api/messages/${sourceWithFile.id}`,
+        authenticatedRequest(alice.cookie, { method: "DELETE" }));
+      assert.equal(deletedSource.status, 200);
+      const sourceFile = path.join(directory, "uploads", source.conversationId, uploaded.id);
+      assert.equal((await fs.readFile(sourceFile)).toString(), "shared forwarded file");
+      const forwardedFileResponse = await fetch(
+        `${baseUrl}/api/attachments/${encodeURIComponent(forwarded.attachments[0].id)}`,
+        authenticatedRequest(carol.cookie)
+      );
+      assert.equal(forwardedFileResponse.status, 200);
+      assert.equal(await forwardedFileResponse.text(), "shared forwarded file");
+
+      const historyAfterDeletion = await fetch(
+        `${baseUrl}/api/messages?conversationId=${encodeURIComponent(forwarded.conversationId)}`,
+        authenticatedRequest(carol.cookie)
+      );
+      const retainedCopy = (await historyAfterDeletion.json()).messages
+        .find((message) => message.id === forwarded.id);
+      assert.equal(retainedCopy.text, sourceWithFile.text);
+      assert.equal(retainedCopy.attachments.length, 1);
+      assert.equal((await fetch(`${baseUrl}/api/messages/${sameChatCopy.id}`,
+        authenticatedRequest(alice.cookie, { method: "DELETE" }))).status, 200);
+      assert.equal((await fs.readFile(sourceFile)).toString(), "shared forwarded file");
+      assert.equal((await fetch(`${baseUrl}/api/messages/${forwarded.id}`,
+        authenticatedRequest(alice.cookie, { method: "DELETE" }))).status, 200);
+      await assert.rejects(fs.access(sourceFile), { code: "ENOENT" });
+    });
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
 
 async function register(baseUrl, username, fullName = username) {
   const response = await fetch(`${baseUrl}/api/auth/register`, {
@@ -64,6 +559,180 @@ async function assertApiError(response, status, code) {
   assert.equal(response.status, status);
   assertApiErrorBody(await response.json(), code);
 }
+
+test("delivers a saved-message event to every account stream and no other account", async () => {
+  await withServer({ store: createEmptyStore() }, async (baseUrl) => {
+    const owner = await register(baseUrl, "stream_saved_owner", "Saved Owner");
+    const other = await register(baseUrl, "stream_saved_other", "Other User");
+    const sourceResponse = await fetch(`${baseUrl}/api/messages`, authenticatedRequest(owner.cookie, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ recipientUsername: "stream_saved_other", text: "Save this" })
+    }));
+    const source = await sourceResponse.json();
+    const controllers = [new AbortController(), new AbortController(), new AbortController()];
+    const readers = [];
+    try {
+      for (const [cookie, index] of [
+        [owner.cookie, 0],
+        [owner.cookie, 1],
+        [other.cookie, 2]
+      ]) {
+        const response = await fetch(`${baseUrl}/api/stream`, {
+          headers: { Cookie: cookie },
+          signal: controllers[index].signal
+        });
+        const reader = response.body.getReader();
+        readers.push(reader);
+        assert.match(new TextDecoder().decode((await reader.read()).value), /retry: 3000/);
+      }
+
+      const savedResponse = await fetch(`${baseUrl}/api/messages/${source.id}/save`,
+        authenticatedRequest(owner.cookie, { method: "POST" }));
+      assert.equal(savedResponse.status, 201);
+      const saved = await savedResponse.json();
+      for (const reader of readers.slice(0, 2)) {
+        const { value, done } = await reader.read();
+        assert.equal(done, false);
+        const event = new TextDecoder().decode(value);
+        assert.match(event, /event: message/);
+        assert.match(event, new RegExp(`"id":${saved.id}`));
+      }
+      const otherEvent = await Promise.race([
+        readers[2].read(),
+        new Promise((resolve) => setTimeout(() => resolve(null), 100))
+      ]);
+      assert.equal(otherEvent, null);
+    } finally {
+      for (const controller of controllers) controller.abort();
+      await Promise.all(readers.map((reader) => reader.cancel().catch(() => {})));
+    }
+  });
+});
+
+test("imports an existing JSON store into normalized SQLite tables without changing the source", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "polus-sqlite-migration-"));
+  const legacyPath = path.join(directory, "polus-store.json");
+  const databasePath = path.join(directory, "polus.sqlite");
+  const legacyStore = createEmptyStore();
+  legacyStore.users.push({
+    id: "user-1",
+    username: "north_star",
+    fullName: "North Star",
+    passwordHash: "salt:hash"
+  });
+  legacyStore.channels.push({
+    id: "chat-1",
+    type: "channel",
+    name: "Northern lights",
+    createdBy: "user-1",
+    ownerId: "user-1",
+    memberIds: ["user-1"],
+    adminIds: [],
+    lastReadMessageIds: { "user-1": 0 },
+    unreadCounts: { "user-1": 0 }
+  });
+  legacyStore.messages.push({
+    id: 1,
+    conversationId: "chat-1",
+    authorId: "someone-else",
+    text: "Stored separately",
+    createdAt: new Date(1).toISOString(),
+    attachmentIds: []
+  });
+  legacyStore.pushSubscriptions.push(
+    { userId: "user-1", subscription: { endpoint: "https://notify.windows.com/one", keys: {} } },
+    { userId: "user-2", subscription: { endpoint: "https://notify.windows.com/one", keys: {} } }
+  );
+  legacyStore.nextMessageId = 2;
+  const sourceSnapshot = JSON.stringify(legacyStore);
+  const databases = [];
+
+  try {
+    await fs.writeFile(legacyPath, sourceSnapshot, "utf8");
+    const firstLoad = await loadSqliteStore(databasePath, legacyPath);
+    databases.push(firstLoad.database);
+    assert.equal(firstLoad.store.users[0].username, "north_star");
+    const saveStore = createSqliteStoreWriter(firstLoad.database, firstLoad.store);
+    firstLoad.store.messages.push({
+      id: 2,
+      conversationId: "chat-1",
+      authorId: "someone-else",
+      text: "Incremental insert",
+      createdAt: new Date(2).toISOString(),
+      attachmentIds: []
+    });
+    firstLoad.store.nextMessageId = 3;
+    await saveStore(firstLoad.store);
+    firstLoad.store.messages.push({
+      id: 3,
+      conversationId: "chat-1",
+      authorId: "someone-else",
+      text: "One more insert",
+      createdAt: new Date(3).toISOString(),
+      attachmentIds: []
+    });
+    firstLoad.store.nextMessageId = 4;
+    await saveStore(firstLoad.store);
+    assert.equal(saveStore.countUnreadMessages("chat-1", 0, "user-1"), 3);
+    assert.equal(saveStore.lastMessageForChat("chat-1").text, "One more insert");
+    const tables = firstLoad.database.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+    ).all().map((row) => row.name);
+    for (const table of ["users", "sessions", "chats", "members", "messages", "attachments", "push_subscriptions"]) {
+      assert.ok(tables.includes(table), `missing normalized table ${table}`);
+    }
+    assert.ok(!tables.includes("polus_store"));
+
+    await fs.writeFile(legacyPath, "{}", "utf8");
+    const secondLoad = await loadSqliteStore(databasePath, legacyPath);
+    databases.push(secondLoad.database);
+    assert.equal(secondLoad.store.users[0].username, "north_star");
+    assert.equal(secondLoad.store.users[0].passwordHash, "salt:hash");
+    assert.equal(secondLoad.store.messages.length, 3);
+    assert.equal(secondLoad.store.channels[0].memberIds[0], "user-1");
+    assert.equal(secondLoad.store.pushSubscriptions.length, 2);
+    assert.equal(await fs.readFile(legacyPath, "utf8"), "{}");
+    assert.equal((await fs.readFile(databasePath)).subarray(0, 15).toString(), "SQLite format 3");
+  } finally {
+    for (const database of databases) database.close();
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("migrates the former SQLite snapshot table into normalized tables", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "polus-sqlite-snapshot-"));
+  const databasePath = path.join(directory, "polus.sqlite");
+  const legacyStore = createEmptyStore();
+  legacyStore.users.push({
+    id: "snapshot-user",
+    username: "snapshot_user",
+    fullName: "Snapshot User",
+    passwordHash: "salt:hash"
+  });
+  const legacyDatabase = new Database(databasePath);
+  legacyDatabase.exec(`CREATE TABLE polus_store (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    snapshot TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`);
+  legacyDatabase.prepare("INSERT INTO polus_store (id, snapshot) VALUES (1, ?)").run(JSON.stringify(legacyStore));
+  legacyDatabase.close();
+
+  let database;
+  try {
+    const loaded = await loadSqliteStore(databasePath, path.join(directory, "missing.json"));
+    database = loaded.database;
+    assert.equal(loaded.store.users[0].username, "snapshot_user");
+    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM users").get().count, 1);
+    assert.equal(database.prepare(
+      "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'polus_store'"
+    ).get().count, 0);
+  } finally {
+    database?.close();
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
 
 test("lists usable LAN IPv4 addresses for the startup URL", () => {
   const addresses = getLanAddresses({
@@ -209,27 +878,93 @@ test("serves Polus, its logo, privacy page and English/Russian app", async () =>
 
     const page = await fetch(baseUrl);
     assert.equal(page.status, 200);
+    assert.equal(page.headers.get("x-powered-by"), null);
+    assert.match(page.headers.get("content-security-policy"), /img-src 'self' data: blob:/);
+    assert.equal(page.headers.get("strict-transport-security"), null);
     const pageBody = await page.text();
-    assert.match(pageBody, /ПОЛЮС/);
-    assert.match(pageBody, /message-context-menu/);
-    assert.match(pageBody, /profile-avatar-picker/);
-    assert.match(pageBody, /profile-avatar-preview/);
-    assert.match(pageBody, /id="chat-search"/);
-    assert.doesNotMatch(pageBody, /id="search-button"/);
-    assert.match(pageBody, /class="composer-entry"/);
-    assert.match(pageBody, /class="send-button" type="submit"/);
-    assert.doesNotMatch(pageBody, /composer-hint/);
+    const builtClient = pageBody.includes('id="root"');
+    if (builtClient) {
+      assert.match(pageBody, /\/assets\/index-[^"]+\.js/);
+    }
+    const profilePage = await fetch(`${baseUrl}/profile`);
+    assert.equal(profilePage.status, 200);
+    assert.equal(profilePage.headers.get("content-type"), "text/html; charset=utf-8");
+    assert.match(await profilePage.text(), /id="root"/);
 
     const styles = await fetch(`${baseUrl}/styles.css`);
     const stylesBody = await styles.text();
     assert.match(stylesBody, /\.send-button\s*\{[^}]*border-radius:\s*50%/s);
+    assert.match(stylesBody, /\.message-avatar\.avatar-tone-0\s*\{[^}]*background:/s);
 
-    const appScript = await fetch(`${baseUrl}/app.js`);
-    const appScriptBody = await appScript.text();
-    assert.match(appScriptBody, /contextmenu/);
-    assert.match(appScriptBody, /openMessageContextMenu/);
-    assert.match(appScriptBody, /info-member-avatar/);
-    assert.match(appScriptBody, /info-member-role/);
+    assert.equal((await fetch(`${baseUrl}/app.js`)).status, 404);
+    assert.equal((await fetch(`${baseUrl}/legacy-app.html`)).status, 404);
+    const controllerSource = await fs.readFile(path.join(__dirname, "..", "client", "src", "messengerController.js"), "utf8");
+    assert.match(controllerSource, /polus:message-context-menu-request/);
+    assert.match(controllerSource, /controllerListeners\.splice\(0\)/);
+    assert.match(controllerSource, /openMessageContextMenu/);
+    assert.doesNotMatch(controllerSource, /chatInfoContent|chatManagementContent|addManagementButton/);
+    assert.doesNotMatch(controllerSource, /#message-input|#composer|#attachment-input|#user-search|#sidebar-search/);
+    assert.doesNotMatch(controllerSource, /searchUsers|polus:user-search|polus:users-changed/);
+    assert.doesNotMatch(controllerSource, /startDirectMessage|\/api\/directs/);
+    assert.doesNotMatch(controllerSource, /async function createChannel|async function createGroup|listen\(document, "polus:create-(channel|group)"/);
+    assert.doesNotMatch(controllerSource, /async function saveProfile|listen\(document, "polus:save-profile"/);
+    const reactSource = await fs.readFile(path.join(__dirname, "..", "client", "src", "App.jsx"), "utf8");
+    assert.match(reactSource, /function UserSearchResults\(\{ query \}\)/);
+    assert.match(reactSource, /requestJson\(`\/api\/users\?q=\$\{encodeURIComponent\(query\)\}`\)/);
+    assert.match(reactSource, /polus:request-direct-message/);
+    assert.match(reactSource, /\/api\/directs\/\$\{encodeURIComponent\(event\.detail\.username\)\}/);
+    assert.match(reactSource, /const handleCreateChannel = \(event\) => void handleCreateRequest\(event\)/);
+    assert.match(reactSource, /const endpoint = channel \? \"\/api\/channels\" : \"\/api\/groups\"/);
+    assert.match(reactSource, /A group must have at least one other member\./);
+    assert.match(reactSource, /const handleSaveProfile = async \(event\)/);
+    assert.match(reactSource, /requestJson\(\"\/api\/account\", \{/);
+    assert.match(reactSource, /polus:profile-saved/);
+    assert.doesNotMatch(controllerSource, /async function submitMessage|uploadSelectedFiles|polus:submit-message|polus:upload-selected-files/);
+    assert.match(reactSource, /requestJson\("\/api\/messages"/);
+    assert.match(reactSource, /uploadAttachment\(conversationId/);
+    assert.match(reactSource, /polus:message-sent/);
+    assert.doesNotMatch(controllerSource, /async function editMessage|async function deleteMessage|polus:edit-message|polus:delete-message/);
+    assert.match(reactSource, /const handleEditMessage = async \(event\)/);
+    assert.match(reactSource, /method: "PATCH",\s*body: JSON\.stringify\(\{ text: value \}\)/);
+    assert.match(reactSource, /const handleDeleteMessage = async \(event\)/);
+    assert.match(reactSource, /polus:message-edited/);
+    assert.match(reactSource, /polus:message-deleted/);
+    assert.doesNotMatch(controllerSource, /api\(`\/api\/messages\?`|api\(\"\/api\/conversations\/read\"/);
+    assert.match(reactSource, /polus:load-message-history/);
+    assert.match(reactSource, /polus:mark-conversation-read/);
+    assert.match(reactSource, /requestJson\(`\/api\/messages\?\$\{query\}`\)/);
+    assert.match(reactSource, /requestJson\(\"\/api\/conversations\/read\"/);
+    assert.doesNotMatch(controllerSource, /new EventSource|\/api\/stream|\/api\/presence\/chat|reportChatViewingState|viewingHeartbeatTimer/);
+    assert.match(reactSource, /new EventSource\(\"\/api\/stream\"\)/);
+    assert.match(reactSource, /fetch\(\"\/api\/presence\/chat\"/);
+    assert.match(reactSource, /document\.addEventListener\(\"polus:composer-state\", handlePresenceConversation\)/);
+    assert.match(reactSource, /polus:realtime-message/);
+    assert.match(reactSource, /ПОЛЮС/);
+    assert.match(reactSource, /function MessengerShell\(/);
+    assert.match(reactSource, /<main id="messenger-view"/);
+    assert.doesNotMatch(reactSource, /LegacyMessenger|legacy-app\.html|createRoot\(document\.getElementById/);
+    assert.doesNotMatch(reactSource, /MutationObserver/);
+    assert.match(reactSource, /disposeController\?\.\(\)/);
+    assert.doesNotMatch(reactSource, /data-i18n/);
+    assert.doesNotMatch(controllerSource, /applyTranslations|querySelectorAll/);
+    assert.match(reactSource, /function SidebarSearch\(/);
+    assert.match(reactSource, /function ChatSearchDialog\(/);
+    assert.match(reactSource, /aria-expanded=\{menuOpen\}/);
+    assert.match(reactSource, /polus:create-channel/);
+    assert.match(reactSource, /polus:save-profile/);
+    assert.match(reactSource, /function ChatInfoDialogContent\(\)/);
+    assert.match(reactSource, /function ChatManagementContent\(\)/);
+    assert.match(reactSource, /function ProfileAvatarEditor\(\{ inputRef \}\)/);
+    assert.match(reactSource, /function HeaderActions\(\)/);
+    assert.match(reactSource, /function MediaViewer\(\)/);
+    assert.match(reactSource, /polus:media-viewer-open/);
+    assert.doesNotMatch(controllerSource, /mediaViewerIndex|navigateMediaViewer/);
+    assert.match(reactSource, /profile-avatar-picker/);
+    assert.match(reactSource, /profile-avatar-preview/);
+    assert.match(reactSource, /id="chat-search"/);
+    assert.match(reactSource, /info-member-avatar/);
+    assert.match(reactSource, /info-member-role/);
+    assert.doesNotMatch(controllerSource, /avatar\.replaceChildren\(\)|preview\.replaceChildren\(\)/);
 
     assert.match(stylesBody, /\.info-member\s*\{/);
     assert.match(stylesBody, /\.info-member-meta\s*\{/);
@@ -248,6 +983,93 @@ test("serves Polus, its logo, privacy page and English/Russian app", async () =>
     const manifest = await fetch(`${baseUrl}/manifest.webmanifest`);
     assert.equal(manifest.status, 200);
     assert.match(await manifest.text(), /Полюс/);
+  });
+
+});
+
+test("limits registration attempts and returns client errors for malformed encodings", async () => {
+  await withServer({ store: createEmptyStore() }, async (baseUrl) => {
+    const account = await register(baseUrl, "encoding_test", "Encoding Test");
+    const invalidRegistration = () => fetch(`${baseUrl}/api/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: "invalid",
+        fullName: "",
+        password: "a-secure-test-password",
+        confirmPassword: "a-secure-test-password",
+        acceptPrivacy: true,
+        privacyVersion: PRIVACY_VERSION
+      })
+    });
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      assert.equal((await invalidRegistration()).status, 400);
+    }
+    await assertApiError(await invalidRegistration(), 429, "TOO_MANY_REQUESTS");
+
+    const malformedCookie = await fetch(`${baseUrl}/api/bootstrap`, {
+      headers: { Cookie: "polus_session=%ZZ" }
+    });
+    await assertApiError(malformedCookie, 400, "BAD_REQUEST");
+    const channelResponse = await fetch(`${baseUrl}/api/channels`, authenticatedRequest(account.cookie, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "Encoding test" })
+    }));
+    const channel = await channelResponse.json();
+    assert.ok(channel.id, JSON.stringify({ status: channelResponse.status, channel }));
+    const { port } = new URL(baseUrl);
+    const malformedPath = await new Promise((resolve, reject) => {
+      const request = http.request({
+        method: "POST",
+        hostname: "127.0.0.1",
+        port,
+        path: `/api/chats/${channel.id}/attachments`,
+        headers: { Cookie: account.cookie, "X-File-Name": "%ZZ" }
+      }, (response) => {
+        const chunks = [];
+        response.on("data", (chunk) => chunks.push(chunk));
+        response.on("end", () => resolve({
+          status: response.statusCode,
+          body: JSON.parse(Buffer.concat(chunks).toString("utf8"))
+        }));
+      });
+      request.on("error", reject);
+      request.end();
+    });
+    assert.equal(malformedPath.status, 400, JSON.stringify(malformedPath.body));
+    assertApiErrorBody(malformedPath.body, "BAD_REQUEST");
+  });
+});
+
+test("enables HSTS when secure cookies are explicitly enabled", async () => {
+  const previous = process.env.POLUS_COOKIE_SECURE;
+  process.env.POLUS_COOKIE_SECURE = "true";
+  try {
+    await withServer({}, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/config`);
+      assert.equal(response.headers.get("strict-transport-security"), "max-age=31536000");
+    });
+  } finally {
+    if (previous === undefined) delete process.env.POLUS_COOKIE_SECURE;
+    else process.env.POLUS_COOKIE_SECURE = previous;
+  }
+});
+
+test("accepts Edge push subscription endpoints", async () => {
+  await withServer({ store: createEmptyStore() }, async (baseUrl) => {
+    const account = await register(baseUrl, "edge_push", "Edge Push");
+    const response = await fetch(`${baseUrl}/api/push/subscribe`, authenticatedRequest(account.cookie, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        subscription: {
+          endpoint: "https://notify.windows.com/?token=test",
+          keys: { p256dh: "public-key", auth: "auth-key" }
+        }
+      })
+    }));
+    assert.equal(response.status, 201);
   });
 });
 
@@ -387,6 +1209,13 @@ test("enforces account limits, permits an 8-character password, and edits profil
     const cookie = response.headers.get("set-cookie").split(";")[0];
     const registeredUser = (await response.json()).user;
     assert.equal(registeredUser.about, "Profile bio");
+    const anotherDeviceLogin = await fetch(`${baseUrl}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: longUsername, password: "12345678" })
+    });
+    const anotherDeviceCookie = anotherDeviceLogin.headers.get("set-cookie").split(";")[0];
+    assert.equal(anotherDeviceLogin.status, 200);
 
     const invalidAccounts = [
       { username: "a".repeat(33), fullName: "Name", password: "12345678", confirmPassword: "12345678" },
@@ -448,6 +1277,7 @@ test("enforces account limits, permits an 8-character password, and edits profil
     });
     assert.equal(newPasswordLogin.status, 200);
     assert.equal((await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(cookie))).status, 200);
+    assert.equal((await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(anotherDeviceCookie))).status, 401);
   });
 });
 
@@ -493,7 +1323,7 @@ test("isolates direct messages, broadcasts to participants, and tracks unread co
     assert.equal(direct.type, "direct");
     assert.equal(direct.pending, true);
     const initialBootstrap = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(alice.cookie));
-    assert.deepEqual((await initialBootstrap.json()).directs, []);
+    assert.deepEqual((await initialBootstrap.json()).directs.filter((chat) => chat.type === "direct"), []);
 
     const controller = new AbortController();
     const eventResponse = await fetch(`${baseUrl}/api/stream`, {
@@ -524,6 +1354,22 @@ test("isolates direct messages, broadcasts to participants, and tracks unread co
     assert.match(event, /How are you/);
     controller.abort();
 
+    const replayController = new AbortController();
+    const replayResponse = await fetch(`${baseUrl}/api/stream`, {
+      headers: { Cookie: bob.cookie, "Last-Event-ID": "0" },
+      signal: replayController.signal
+    });
+    const replayReader = replayResponse.body.getReader();
+    let replayText = "";
+    while (!replayText.includes("event: message")) {
+      const { value, done } = await replayReader.read();
+      assert.equal(done, false);
+      replayText += new TextDecoder().decode(value);
+    }
+    assert.match(replayText, /id: 1\nevent: message/);
+    assert.match(replayText, /Hello!/);
+    replayController.abort();
+
     const bobBootstrap = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(bob.cookie));
     const bobDirect = (await bobBootstrap.json()).directs.find((item) => item.id === conversationId);
     assert.equal(bobDirect.unreadCount, 1);
@@ -535,8 +1381,9 @@ test("isolates direct messages, broadcasts to participants, and tracks unread co
     assert.equal(read.status, 200);
     const afterRead = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(bob.cookie));
     const afterReadBody = await afterRead.json();
-    assert.equal(afterReadBody.directs[0].unreadCount, 0);
-    assert.equal(afterReadBody.directs[0].lastReadMessageId, sentMessage.id);
+    const readDirect = afterReadBody.directs.find((chat) => chat.id === conversationId);
+    assert.equal(readDirect.unreadCount, 0);
+    assert.equal(readDirect.lastReadMessageId, sentMessage.id);
     const bobReply = await fetch(`${baseUrl}/api/messages`, authenticatedRequest(bob.cookie, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -545,8 +1392,9 @@ test("isolates direct messages, broadcasts to participants, and tracks unread co
     assert.equal(bobReply.status, 201);
     const afterOwnReply = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(bob.cookie));
     const ownReplyBody = await afterOwnReply.json();
-    assert.equal(ownReplyBody.directs[0].unreadCount, 0);
-    assert.equal(ownReplyBody.directs[0].lastReadMessageId, sentMessage.id);
+    const repliedDirect = ownReplyBody.directs.find((chat) => chat.id === conversationId);
+    assert.equal(repliedDirect.unreadCount, 0);
+    assert.equal(repliedDirect.lastReadMessageId, sentMessage.id);
 
     const edited = await fetch(`${baseUrl}/api/messages/${sentMessage.id}`, authenticatedRequest(alice.cookie, {
       method: "PATCH",
@@ -771,7 +1619,7 @@ test("limits each user to twenty messages per minute", async () => {
     assert.equal(limited.status, 429);
     assert.equal((await limited.json()).error.code, "TOO_MANY_REQUESTS");
     const recipientBootstrap = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(recipient.cookie));
-    assert.equal((await recipientBootstrap.json()).directs[0].unreadCount, 20);
+    assert.equal((await recipientBootstrap.json()).directs.find((chat) => chat.type === "direct").unreadCount, 20);
   });
 });
 
@@ -886,6 +1734,24 @@ test("streams, authorizes, indexes, searches and deletes chat attachments", asyn
       assert.equal(fileResponse.headers.get("content-type"), "image/png");
       assert.match(fileResponse.headers.get("content-disposition"), /^inline;/);
       assert.equal(Buffer.compare(Buffer.from(await fileResponse.arrayBuffer()), png), 0);
+      const partialFile = await fetch(`${baseUrl}/api/attachments/${attachment.id}`, authenticatedRequest(owner.cookie, {
+        headers: { Range: "bytes=2-5" }
+      }));
+      assert.equal(partialFile.status, 206);
+      assert.equal(partialFile.headers.get("content-range"), `bytes 2-5/${png.length}`);
+      assert.deepEqual(Buffer.from(await partialFile.arrayBuffer()), png.subarray(2, 6));
+      const unsatisfiableRange = await fetch(`${baseUrl}/api/attachments/${attachment.id}`, authenticatedRequest(owner.cookie, {
+        headers: { Range: `bytes=${png.length}-` }
+      }));
+      assert.equal(unsatisfiableRange.status, 416);
+      assert.equal(unsatisfiableRange.headers.get("content-range"), `bytes */${png.length}`);
+      const headFile = await fetch(`${baseUrl}/api/attachments/${attachment.id}`, authenticatedRequest(owner.cookie, {
+        method: "HEAD",
+        headers: { Range: "bytes=0-1" }
+      }));
+      assert.equal(headFile.status, 206);
+      assert.equal(headFile.headers.get("content-length"), "2");
+      assert.equal(await headFile.text(), "");
       const thumbnailFile = await fetch(
         `${baseUrl}/api/attachments/${attachment.id}?thumbnail=1`,
         authenticatedRequest(owner.cookie)
@@ -1020,7 +1886,7 @@ test("exposes profile controls, online visibility, blocks and per-chat mute sett
     }));
     assert.equal((await muted.json()).muted, true);
     const bootstrap = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(alice.cookie));
-    assert.equal((await bootstrap.json()).directs[0].muted, true);
+    assert.equal((await bootstrap.json()).directs.find((item) => item.id === chat.id).muted, true);
 
     const profile = await fetch(`${baseUrl}/api/users/profile_bobby/profile`, authenticatedRequest(alice.cookie));
     const profileBody = await profile.json();
@@ -1166,7 +2032,7 @@ test("creates exactly one direct chat when the first messages race", async () =>
     assert.equal(messages[0].conversation.memberIds.length, 2);
 
     const bootstrap = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(bob.cookie));
-    const bobDirects = (await bootstrap.json()).directs;
+    const bobDirects = (await bootstrap.json()).directs.filter((chat) => chat.type === "direct");
     assert.equal(bobDirects.length, 1);
     assert.equal(bobDirects[0].unreadCount, 2);
   });
@@ -1220,6 +2086,91 @@ test("migrates only the three removed legacy channels and their persisted conten
   } finally {
     await fs.rm(directory, { recursive: true, force: true });
   }
+});
+
+test("lets only channel owners choose whether messages are displayed as the channel", async () => {
+  await withServer({ store: createEmptyStore() }, async (baseUrl) => {
+    const owner = await register(baseUrl, "identity_owner", "Channel Owner");
+    const admin = await register(baseUrl, "identity_admin", "Channel Admin");
+    const member = await register(baseUrl, "identity_member", "Channel Member");
+    const json = (value) => ({ "Content-Type": "application/json", body: JSON.stringify(value) });
+    const created = await fetch(`${baseUrl}/api/channels`, authenticatedRequest(owner.cookie, {
+      method: "POST",
+      ...json({ name: "Identity channel" })
+    }));
+    const channel = await created.json();
+    assert.equal(channel.postAs, "person");
+
+    for (const username of ["identity_admin", "identity_member"]) {
+      const invited = await fetch(`${baseUrl}/api/chats/${channel.id}/members`, authenticatedRequest(owner.cookie, {
+        method: "POST",
+        ...json({ username })
+      }));
+      assert.equal(invited.status, 201);
+    }
+    const promoted = await fetch(
+      `${baseUrl}/api/chats/${channel.id}/admins/${admin.body.user.id}`,
+      authenticatedRequest(owner.cookie, { method: "PUT", ...json({ role: "admin" }) })
+    );
+    assert.equal(promoted.status, 200);
+
+    const send = async (account, text) => {
+      const response = await fetch(`${baseUrl}/api/messages`, authenticatedRequest(account.cookie, {
+        method: "POST",
+        ...json({ conversationId: channel.id, text })
+      }));
+      assert.equal(response.status, 201);
+      return response.json();
+    };
+    const beforeChange = await send(owner, "Before identity change");
+    assert.equal(beforeChange.displayAuthor, undefined);
+    assert.equal(beforeChange.author.fullName, "Channel Owner");
+
+    for (const account of [admin, member]) {
+      const forbidden = await fetch(`${baseUrl}/api/chats/${channel.id}/settings`, authenticatedRequest(account.cookie, {
+        method: "PUT",
+        ...json({ postAs: "channel" })
+      }));
+      assert.equal(forbidden.status, 403);
+    }
+    const invalid = await fetch(`${baseUrl}/api/chats/${channel.id}/settings`, authenticatedRequest(owner.cookie, {
+      method: "PUT",
+      ...json({ postAs: "everyone" })
+    }));
+    assert.equal(invalid.status, 400);
+
+    const changed = await fetch(`${baseUrl}/api/chats/${channel.id}/settings`, authenticatedRequest(owner.cookie, {
+      method: "PUT",
+      ...json({ postAs: "channel" })
+    }));
+    assert.equal(changed.status, 200);
+    assert.equal((await changed.json()).chat.postAs, "channel");
+
+    const afterChange = await send(admin, "Posted as the channel");
+    assert.equal(afterChange.authorId, admin.body.user.id);
+    assert.equal(afterChange.author.fullName, "Channel Admin");
+    assert.deepEqual(afterChange.displayAuthor, {
+      id: channel.id,
+      fullName: "Identity channel",
+      avatarUrl: null,
+      isChannel: true
+    });
+
+    const history = await fetch(`${baseUrl}/api/messages?conversationId=${encodeURIComponent(channel.id)}`,
+      authenticatedRequest(member.cookie));
+    const historyBody = await history.json();
+    assert.equal(historyBody.messages[0].displayAuthor.fullName, "Identity channel");
+    assert.equal(historyBody.messages[1].displayAuthor.fullName, "Identity channel");
+
+    const restored = await fetch(`${baseUrl}/api/chats/${channel.id}/settings`, authenticatedRequest(owner.cookie, {
+      method: "PUT",
+      ...json({ postAs: "person" })
+    }));
+    assert.equal((await restored.json()).chat.postAs, "person");
+    const personHistory = await fetch(`${baseUrl}/api/messages?conversationId=${encodeURIComponent(channel.id)}`,
+      authenticatedRequest(member.cookie));
+    assert.equal((await personHistory.json()).messages.every((message) => !message.displayAuthor), true);
+  });
 });
 
 test("enforces channel and group owner/admin/member permissions and ownership transfer", async () => {

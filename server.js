@@ -1,23 +1,29 @@
 const crypto = require("node:crypto");
 const fs = require("node:fs/promises");
 const http = require("node:http");
+const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 const { pipeline } = require("node:stream/promises");
+const Database = require("better-sqlite3");
+const express = require("express");
 const webpush = require("web-push");
 
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || "0.0.0.0";
-const DATA_FILE = path.join(__dirname, "data", "polus-store.json");
+const DATA_DIRECTORY = path.join(__dirname, "data");
+const DATABASE_FILE = path.join(DATA_DIRECTORY, "polus.sqlite");
+const LEGACY_DATA_FILE = path.join(DATA_DIRECTORY, "polus-store.json");
+const BUILD_DIRECTORY = path.join(__dirname, "dist");
+const CLIENT_BUILD_DIRECTORY = path.join(BUILD_DIRECTORY, "client");
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const ORPHAN_ATTACHMENT_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_BODY_BYTES = 64 * 1024;
 const PRIVACY_VERSION = "2026-10-31";
 const USERNAME_PATTERN = /^[a-zA-Z0-9_]{3,32}$/;
 const LEGACY_CHANNEL_IDS = new Set(["general", "introductions", "off-topic"]);
 const PUBLIC_FILES = new Map([
-  ["/", ["index.html", "text/html; charset=utf-8"]],
   ["/styles.css", ["styles.css", "text/css; charset=utf-8"]],
-  ["/app.js", ["app.js", "text/javascript; charset=utf-8"]],
   ["/privacy.js", ["privacy.js", "text/javascript; charset=utf-8"]],
   ["/sw.js", ["sw.js", "text/javascript; charset=utf-8"]],
   ["/logo.svg", ["logo.svg", "image/svg+xml"]],
@@ -37,12 +43,15 @@ const loginAttemptsCleanup = setInterval(() => {
   }
 }, 60 * 1000);
 loginAttemptsCleanup.unref();
+const trustedProxyAddresses = new Set((process.env.POLUS_TRUSTED_PROXIES || "")
+  .split(",").map((address) => address.trim()).filter((address) => net.isIP(address)));
 const MAX_LOGIN_FAILURES = 10;
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const MAX_MESSAGES_PER_MINUTE = 20;
 const MESSAGE_RATE_WINDOW_MS = 60 * 1000;
 const MESSAGE_EDIT_WINDOW_MS = 48 * 60 * 60 * 1000;
 const MESSAGE_PAGE_SIZE = 50;
+const MESSAGE_REACTIONS = new Set(["👍", "❤️", "😂", "😮", "😢", "👏"]);
 const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
 const MAX_THUMBNAIL_BYTES = 2 * 1024 * 1024;
 const MAX_ATTACHMENTS_PER_MESSAGE = 10;
@@ -124,7 +133,11 @@ function cookieValue(request, name) {
     const separator = cookie.indexOf("=");
     if (separator < 0) continue;
     if (cookie.slice(0, separator).trim() === name) {
-      return decodeURIComponent(cookie.slice(separator + 1).trim());
+      try {
+        return decodeURIComponent(cookie.slice(separator + 1).trim());
+      } catch {
+        throw new HttpError(400, "Invalid cookie encoding.");
+      }
     }
   }
   return "";
@@ -185,6 +198,20 @@ function createEmptyStore() {
   };
 }
 
+function createSavedConversation(user) {
+  return {
+    id: `saved_${user.id}`,
+    type: "saved",
+    ownerId: user.id,
+    createdBy: user.id,
+    memberIds: [user.id],
+    adminIds: [],
+    unreadCounts: {},
+    lastReadMessageIds: {},
+    createdAt: user.createdAt || new Date().toISOString()
+  };
+}
+
 function getLanAddresses(networkInterfaces = os.networkInterfaces()) {
   const addresses = [];
   for (const entries of Object.values(networkInterfaces)) {
@@ -225,17 +252,84 @@ function normalizeStore(input) {
     channel.type = "channel";
     channel.memberIds = Array.isArray(channel.memberIds) ? channel.memberIds : [];
     channel.adminIds = Array.isArray(channel.adminIds) ? channel.adminIds : [];
+    channel.postAs = channel.postAs === "channel" ? "channel" : "person";
     channel.unreadCounts = channel.unreadCounts || {};
     channel.lastReadMessageIds = channel.lastReadMessageIds || {};
     channel.ownerId = channel.ownerId || channel.createdBy || null;
   }
   for (const conversation of base.conversations) {
-    conversation.type ||= conversation.memberIds?.length === 2 ? "direct" : "group";
     conversation.memberIds = Array.isArray(conversation.memberIds) ? conversation.memberIds : [];
+    conversation.type ||= conversation.memberIds.length === 2
+      ? "direct"
+      : conversation.memberIds.length === 1 ? "saved" : "group";
     conversation.adminIds = Array.isArray(conversation.adminIds) ? conversation.adminIds : [];
     conversation.unreadCounts = conversation.unreadCounts || {};
     conversation.lastReadMessageIds = conversation.lastReadMessageIds || {};
     conversation.ownerId = conversation.ownerId || conversation.createdBy || null;
+  }
+  const savedChatsByUser = new Map();
+  const duplicateSavedChats = new Set();
+  for (const conversation of base.conversations) {
+    if (conversation.type !== "saved") continue;
+    const userId = conversation.ownerId || conversation.memberIds[0];
+    if (!base.users.some((user) => user.id === userId)) {
+      duplicateSavedChats.add(conversation);
+      continue;
+    }
+    const canonicalId = `saved_${userId}`;
+    const existing = savedChatsByUser.get(userId);
+    if (!existing) {
+      savedChatsByUser.set(userId, conversation);
+      const previousId = conversation.id;
+      conversation.id = canonicalId;
+      conversation.ownerId = userId;
+      conversation.createdBy = userId;
+      conversation.type = "saved";
+      conversation.memberIds = [userId];
+      conversation.adminIds = [];
+      conversation.unreadCounts = {};
+      conversation.lastReadMessageIds = {};
+      delete conversation.name;
+      if (previousId !== canonicalId) {
+        for (const message of base.messages || []) {
+          if ((message.conversationId || message.room || message.chatId) === previousId) {
+            message.conversationId = canonicalId;
+            delete message.room;
+            delete message.chatId;
+          }
+        }
+        for (const item of [...base.attachments, ...base.links]) {
+          if ((item.chatId || item.conversationId || item.room) === previousId) {
+            item.chatId = canonicalId;
+            delete item.conversationId;
+            delete item.room;
+          }
+        }
+      }
+    } else {
+      duplicateSavedChats.add(conversation);
+      for (const message of base.messages || []) {
+        if ((message.conversationId || message.room || message.chatId) === conversation.id) {
+          message.conversationId = canonicalId;
+          delete message.room;
+          delete message.chatId;
+        }
+      }
+      for (const item of [...base.attachments, ...base.links]) {
+        if ((item.chatId || item.conversationId || item.room) === conversation.id) {
+          item.chatId = canonicalId;
+          delete item.conversationId;
+          delete item.room;
+        }
+      }
+    }
+  }
+  base.conversations = base.conversations.filter((conversation) =>
+    !duplicateSavedChats.has(conversation)
+  );
+  for (const user of base.users) {
+    if (savedChatsByUser.has(user.id)) continue;
+    base.conversations.push(createSavedConversation(user));
   }
   if (base.messages.some((message) => !Number.isSafeInteger(Number(message.id)) || Number(message.id) < 1)) {
     const ordered = base.messages.map((message, index) => ({ message, index }))
@@ -261,30 +355,45 @@ function normalizeStore(input) {
     if (message.deleted) message.text = "";
     maxMessageId = Math.max(maxMessageId, message.id);
   }
+  const messagesByChat = new Map();
+  for (const message of base.messages) {
+    const chatId = message.conversationId || message.room;
+    if (!messagesByChat.has(chatId)) messagesByChat.set(chatId, []);
+    messagesByChat.get(chatId).push(message);
+  }
   for (const chat of [...base.channels, ...base.conversations]) {
-    const chatMessages = base.messages
-      .filter((message) => (message.conversationId || message.room) === chat.id)
-      .sort((left, right) => left.id - right.id);
+    if (chat.type === "saved") {
+      chat.unreadCounts = {};
+      continue;
+    }
+    const chatMessages = messagesByChat.get(chat.id) || [];
+    chatMessages.sort((left, right) => left.id - right.id);
     for (const memberId of chat.memberIds) {
-      if (Number.isSafeInteger(chat.lastReadMessageIds[memberId])
-        && chat.lastReadMessageIds[memberId] >= 0) continue;
-      const unreadTarget = Math.max(0, Number(chat.unreadCounts[memberId]) || 0);
-      let unreadFound = 0;
-      let lastReadMessageId = unreadTarget ? 0 : chatMessages.at(-1)?.id || 0;
-      if (unreadTarget) {
-        for (let index = chatMessages.length - 1; index >= 0; index -= 1) {
-          if (chatMessages[index].authorId === memberId) continue;
-          unreadFound += 1;
-          if (unreadFound === unreadTarget) {
-            lastReadMessageId = chatMessages[index - 1]?.id || 0;
-            break;
+      if (!Number.isSafeInteger(chat.lastReadMessageIds[memberId])
+        || chat.lastReadMessageIds[memberId] < 0) {
+        const unreadTarget = Math.max(0, Number(chat.unreadCounts[memberId]) || 0);
+        let unreadFound = 0;
+        let lastReadMessageId = unreadTarget ? 0 : chatMessages.at(-1)?.id || 0;
+        if (unreadTarget) {
+          for (let index = chatMessages.length - 1; index >= 0; index -= 1) {
+            if (chatMessages[index].authorId === memberId) continue;
+            unreadFound += 1;
+            if (unreadFound === unreadTarget) {
+              lastReadMessageId = chatMessages[index - 1]?.id || 0;
+              break;
+            }
           }
         }
+        chat.lastReadMessageIds[memberId] = lastReadMessageId;
       }
-      chat.lastReadMessageIds[memberId] = lastReadMessageId;
-      chat.unreadCounts[memberId] = chatMessages.filter((message) =>
-        message.id > lastReadMessageId && message.authorId !== memberId
-      ).length;
+      chat.unreadCounts[memberId] = 0;
+    }
+    for (const message of chatMessages) {
+      for (const memberId of chat.memberIds) {
+        if (message.id > chat.lastReadMessageIds[memberId] && message.authorId !== memberId) {
+          chat.unreadCounts[memberId] += 1;
+        }
+      }
     }
   }
   base.nextMessageId = Number.isSafeInteger(store.nextMessageId) && store.nextMessageId > maxMessageId
@@ -365,6 +474,371 @@ async function loadStore(filePath) {
   return normalizeStore(input);
 }
 
+function createSqliteSchema(database) {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS app_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      username TEXT NOT NULL,
+      password_hash TEXT NOT NULL,
+      data TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS users_username ON users(username);
+    CREATE TABLE IF NOT EXISTS sessions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      token_hash TEXT NOT NULL,
+      expires_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS sessions_user_id ON sessions(user_id);
+    CREATE TABLE IF NOT EXISTS chats (
+      id TEXT PRIMARY KEY,
+      type TEXT NOT NULL,
+      name TEXT,
+      created_by TEXT,
+      owner_id TEXT,
+      data TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS members (
+      chat_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      last_read_message_id INTEGER NOT NULL,
+      unread_count INTEGER NOT NULL,
+      muted INTEGER NOT NULL,
+      PRIMARY KEY (chat_id, user_id)
+    );
+    CREATE INDEX IF NOT EXISTS members_user_id ON members(user_id);
+    CREATE TABLE IF NOT EXISTS messages (
+      id INTEGER PRIMARY KEY,
+      chat_id TEXT NOT NULL,
+      author_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      data TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS messages_chat_id_id ON messages(chat_id, id DESC);
+    CREATE INDEX IF NOT EXISTS messages_unread ON messages(chat_id, id, author_id);
+    CREATE TABLE IF NOT EXISTS attachments (
+      id TEXT PRIMARY KEY,
+      chat_id TEXT NOT NULL,
+      message_id INTEGER,
+      data TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS attachments_message_id ON attachments(message_id);
+    CREATE TABLE IF NOT EXISTS links (
+      id TEXT PRIMARY KEY,
+      chat_id TEXT NOT NULL,
+      message_id INTEGER NOT NULL,
+      data TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS push_subscriptions (
+      endpoint TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      data TEXT NOT NULL,
+      PRIMARY KEY (user_id, endpoint)
+    );
+    CREATE INDEX IF NOT EXISTS push_subscriptions_user_id ON push_subscriptions(user_id);
+    CREATE TABLE IF NOT EXISTS upload_usage (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      size INTEGER NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS upload_usage_user_id_created_at ON upload_usage(user_id, created_at);
+  `);
+}
+
+function withoutProperties(value, properties) {
+  return Object.fromEntries(Object.entries(value).filter(([key]) => !properties.has(key)));
+}
+
+function serializeSqliteStore(store) {
+  const rows = {};
+  const setRows = (table, values) => {
+    rows[table] = new Map(values.map(([key, columns]) => [String(key), columns]));
+  };
+  const json = (value) => JSON.stringify(value);
+
+  setRows("users", store.users.map((user) => [
+    user.id,
+    [user.id, user.username, user.passwordHash || "", json(withoutProperties(user,
+      new Set(["id", "username", "passwordHash"])))]
+  ]));
+  setRows("sessions", store.sessions.map((session) => [
+    session.id,
+    [session.id, session.userId, session.tokenHash, session.expiresAt]
+  ]));
+
+  const chats = [...store.channels, ...store.conversations];
+  const memberRows = [];
+  setRows("chats", chats.map((chat) => {
+    const type = chat.type || (store.channels.includes(chat)
+      ? "channel"
+      : chat.memberIds?.length === 2 ? "direct" : chat.memberIds?.length === 1 ? "saved" : "group");
+    const data = withoutProperties(chat, new Set([
+      "id", "type", "name", "createdBy", "ownerId", "memberIds", "adminIds",
+      "lastReadMessageIds", "unreadCounts", "mutedUserIds"
+    ]));
+    for (const userId of chat.memberIds || []) {
+      const role = chat.ownerId === userId || (!chat.ownerId && chat.createdBy === userId)
+        ? "owner"
+        : (chat.adminIds || []).includes(userId) ? "admin" : "member";
+      memberRows.push([
+        `${chat.id}\u0000${userId}`,
+        [chat.id, userId, role, chat.lastReadMessageIds?.[userId] || 0,
+          chat.unreadCounts?.[userId] || 0, (chat.mutedUserIds || []).includes(userId) ? 1 : 0]
+      ]);
+    }
+    return [chat.id, [chat.id, type, chat.name || null, chat.createdBy || null,
+      chat.ownerId || chat.createdBy || null, json(data)]];
+  }));
+  setRows("members", memberRows);
+
+  setRows("messages", store.messages.map((message) => {
+    const chatId = message.conversationId || message.room;
+    return [message.id, [message.id, chatId, message.authorId, message.createdAt, json(withoutProperties(
+      message, new Set(["id", "conversationId", "room", "authorId", "createdAt"])
+    ))]];
+  }));
+  setRows("attachments", store.attachments.map((attachment) => [
+    attachment.id,
+    [attachment.id, attachment.chatId, attachment.messageId ?? null,
+      json(withoutProperties(attachment, new Set(["id", "chatId", "messageId"])))]
+  ]));
+  setRows("links", store.links.map((link) => [
+    link.id,
+    [link.id, link.chatId || link.conversationId || link.room, link.messageId,
+      json(withoutProperties(link, new Set(["id", "chatId", "conversationId", "room", "messageId"])))]
+  ]));
+  setRows("push_subscriptions", store.pushSubscriptions.map((item) => [
+    `${item.userId}\u0000${item.subscription.endpoint}`,
+    [item.subscription.endpoint, item.userId, json(item.subscription)]
+  ]));
+
+  const usageCounts = new Map();
+  setRows("upload_usage", store.uploadUsage.map((usage) => {
+    const signature = json(usage);
+    const occurrence = usageCounts.get(signature) || 0;
+    usageCounts.set(signature, occurrence + 1);
+    const id = crypto.createHash("sha256").update(`${signature}\u0000${occurrence}`).digest("hex");
+    return [id, [id, usage.userId || "", usage.size || 0, usage.createdAt || ""]];
+  }));
+  setRows("app_settings", [
+    ["initialized", ["initialized", "1"]],
+    ["nextMessageId", ["nextMessageId", String(store.nextMessageId)]],
+    ["vapidKeys", ["vapidKeys", json(store.vapidKeys)]]
+  ]);
+  return rows;
+}
+
+const SQLITE_TABLES = {
+  users: {
+    upsert: `INSERT INTO users (id, username, password_hash, data) VALUES (?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET username=excluded.username, password_hash=excluded.password_hash, data=excluded.data`,
+    remove: "DELETE FROM users WHERE id = ?"
+  },
+  sessions: {
+    upsert: `INSERT INTO sessions (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET user_id=excluded.user_id, token_hash=excluded.token_hash, expires_at=excluded.expires_at`,
+    remove: "DELETE FROM sessions WHERE id = ?"
+  },
+  chats: {
+    upsert: `INSERT INTO chats (id, type, name, created_by, owner_id, data) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET type=excluded.type, name=excluded.name, created_by=excluded.created_by,
+      owner_id=excluded.owner_id, data=excluded.data`,
+    remove: "DELETE FROM chats WHERE id = ?"
+  },
+  members: {
+    upsert: `INSERT INTO members (chat_id, user_id, role, last_read_message_id, unread_count, muted)
+      VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(chat_id, user_id) DO UPDATE SET role=excluded.role,
+      last_read_message_id=excluded.last_read_message_id, unread_count=excluded.unread_count, muted=excluded.muted`,
+    remove: "DELETE FROM members WHERE chat_id = ? AND user_id = ?"
+  },
+  messages: {
+    upsert: `INSERT INTO messages (id, chat_id, author_id, created_at, data) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET chat_id=excluded.chat_id, author_id=excluded.author_id,
+      created_at=excluded.created_at, data=excluded.data`,
+    remove: "DELETE FROM messages WHERE id = ?"
+  },
+  attachments: {
+    upsert: `INSERT INTO attachments (id, chat_id, message_id, data) VALUES (?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET chat_id=excluded.chat_id, message_id=excluded.message_id, data=excluded.data`,
+    remove: "DELETE FROM attachments WHERE id = ?"
+  },
+  links: {
+    upsert: `INSERT INTO links (id, chat_id, message_id, data) VALUES (?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET chat_id=excluded.chat_id, message_id=excluded.message_id, data=excluded.data`,
+    remove: "DELETE FROM links WHERE id = ?"
+  },
+  push_subscriptions: {
+    upsert: `INSERT INTO push_subscriptions (endpoint, user_id, data) VALUES (?, ?, ?)
+      ON CONFLICT(user_id, endpoint) DO UPDATE SET data=excluded.data`,
+    remove: "DELETE FROM push_subscriptions WHERE user_id = ? AND endpoint = ?"
+  },
+  upload_usage: {
+    upsert: `INSERT INTO upload_usage (id, user_id, size, created_at) VALUES (?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET user_id=excluded.user_id, size=excluded.size, created_at=excluded.created_at`,
+    remove: "DELETE FROM upload_usage WHERE id = ?"
+  },
+  app_settings: {
+    upsert: "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+    remove: "DELETE FROM app_settings WHERE key = ?"
+  }
+};
+
+function persistSqliteRows(database, rows, previousRows) {
+  for (const [table, spec] of Object.entries(SQLITE_TABLES)) {
+    const desired = rows[table];
+    const previous = previousRows[table] || new Map();
+    const upsert = database.prepare(spec.upsert);
+    const remove = database.prepare(spec.remove);
+    for (const [key, columns] of desired) {
+      if (JSON.stringify(previous.get(key)) !== JSON.stringify(columns)) upsert.run(...columns);
+    }
+    for (const key of previous.keys()) {
+      if (desired.has(key)) continue;
+      remove.run(...key.split("\u0000"));
+    }
+  }
+}
+
+function readNormalizedSqliteStore(database) {
+  const store = createEmptyStore();
+  store.users = database.prepare("SELECT id, username, password_hash, data FROM users").all()
+    .map((row) => ({ ...JSON.parse(row.data), id: row.id, username: row.username, passwordHash: row.password_hash }));
+  store.sessions = database.prepare("SELECT id, user_id, token_hash, expires_at FROM sessions").all()
+    .map((row) => ({ id: row.id, userId: row.user_id, tokenHash: row.token_hash, expiresAt: row.expires_at }));
+
+  const membersByChat = new Map();
+  for (const row of database.prepare(`SELECT chat_id, user_id, role, last_read_message_id,
+    unread_count, muted FROM members ORDER BY chat_id, user_id`).all()) {
+    if (!membersByChat.has(row.chat_id)) membersByChat.set(row.chat_id, []);
+    membersByChat.get(row.chat_id).push(row);
+  }
+  for (const row of database.prepare("SELECT id, type, name, created_by, owner_id, data FROM chats").all()) {
+    const chat = {
+      ...JSON.parse(row.data),
+      id: row.id,
+      type: row.type,
+      name: row.name,
+      createdBy: row.created_by,
+      ownerId: row.owner_id,
+      memberIds: [],
+      adminIds: [],
+      lastReadMessageIds: {},
+      unreadCounts: {},
+      mutedUserIds: []
+    };
+    for (const member of membersByChat.get(row.id) || []) {
+      chat.memberIds.push(member.user_id);
+      if (member.role === "admin") chat.adminIds.push(member.user_id);
+      chat.lastReadMessageIds[member.user_id] = member.last_read_message_id;
+      chat.unreadCounts[member.user_id] = member.unread_count;
+      if (member.muted) chat.mutedUserIds.push(member.user_id);
+    }
+    (row.type === "channel" ? store.channels : store.conversations).push(chat);
+  }
+  store.messages = database.prepare("SELECT id, chat_id, author_id, created_at, data FROM messages ORDER BY id").all()
+    .map((row) => ({
+      ...JSON.parse(row.data),
+      id: row.id,
+      conversationId: row.chat_id,
+      authorId: row.author_id,
+      createdAt: row.created_at
+    }));
+  store.attachments = database.prepare("SELECT id, chat_id, message_id, data FROM attachments").all()
+    .map((row) => ({
+      ...JSON.parse(row.data),
+      id: row.id,
+      chatId: row.chat_id,
+      messageId: row.message_id
+    }));
+  store.links = database.prepare("SELECT id, chat_id, message_id, data FROM links").all()
+    .map((row) => ({
+      ...JSON.parse(row.data),
+      id: row.id,
+      chatId: row.chat_id,
+      messageId: row.message_id
+    }));
+  store.pushSubscriptions = database.prepare("SELECT user_id, data FROM push_subscriptions").all()
+    .map((row) => ({ userId: row.user_id, subscription: JSON.parse(row.data) }));
+  store.uploadUsage = database.prepare("SELECT user_id, size, created_at FROM upload_usage ORDER BY rowid").all()
+    .map((row) => ({ userId: row.user_id, size: row.size, createdAt: row.created_at }));
+  const settings = new Map(database.prepare("SELECT key, value FROM app_settings").all()
+    .map((row) => [row.key, row.value]));
+  store.nextMessageId = Number(settings.get("nextMessageId")) || 1;
+  store.vapidKeys = settings.has("vapidKeys") ? JSON.parse(settings.get("vapidKeys")) : null;
+  return normalizeStore(store);
+}
+
+async function loadSqliteStore(databasePath, legacyFilePath) {
+  const database = new Database(databasePath);
+  database.pragma("journal_mode = WAL");
+  database.pragma("synchronous = FULL");
+  createSqliteSchema(database);
+
+  const initialized = database.prepare("SELECT value FROM app_settings WHERE key = 'initialized'").get();
+  const hasLegacySnapshot = database.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'polus_store'"
+  ).get();
+  let store;
+  if (initialized) {
+    store = readNormalizedSqliteStore(database);
+  } else {
+    const saved = hasLegacySnapshot
+      ? database.prepare("SELECT snapshot FROM polus_store WHERE id = 1").get()
+      : null;
+    if (saved) {
+      const input = JSON.parse(saved.snapshot);
+      await migrateLegacyChannelData(input, path.dirname(databasePath));
+      store = normalizeStore(input);
+    } else {
+      store = await loadStore(legacyFilePath);
+    }
+    const rows = serializeSqliteStore(store);
+    database.transaction(() => persistSqliteRows(database, rows, {}))();
+  }
+
+  if (hasLegacySnapshot) database.exec("DROP TABLE polus_store");
+  return { database, store };
+}
+
+function createSqliteStoreWriter(database, initialStore = createEmptyStore()) {
+  let persistedRows = serializeSqliteStore(normalizeStore(initialStore));
+  let queue = Promise.resolve();
+  const saveStore = (store) => {
+    const rows = serializeSqliteStore(store);
+    const write = queue.then(() => {
+      database.transaction(() => persistSqliteRows(database, rows, persistedRows))();
+      persistedRows = rows;
+    });
+    queue = write.catch(() => {});
+    return write;
+  };
+  const countUnread = database.prepare(`
+    SELECT COUNT(*) AS count FROM messages
+    WHERE chat_id = ? AND id > ? AND author_id != ?
+  `);
+  const findLastMessage = database.prepare(`SELECT id, chat_id, author_id, created_at, data
+    FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT 1`);
+  saveStore.countUnreadMessages = (chatId, lastReadMessageId, userId) =>
+    countUnread.get(chatId, lastReadMessageId, userId).count;
+  saveStore.lastMessageForChat = (chatId) => {
+    const row = findLastMessage.get(chatId);
+    return row ? {
+      ...JSON.parse(row.data),
+      id: row.id,
+      conversationId: row.chat_id,
+      authorId: row.author_id,
+      createdAt: row.created_at
+    } : null;
+  };
+  return saveStore;
+}
+
 function publicUser(user) {
   return {
     id: user.id,
@@ -411,6 +885,23 @@ function makeSession(request, store, user) {
   return { session, cookie: `polus_session=${encodeURIComponent(token)}; ${cookieOptions(request)}` };
 }
 
+function getClientAddress(request) {
+  const remoteAddress = request.socket.remoteAddress || "unknown";
+  if (!trustedProxyAddresses.has(remoteAddress)) return remoteAddress;
+  const forwarded = request.headers["x-forwarded-for"];
+  if (typeof forwarded !== "string") return remoteAddress;
+  const addresses = forwarded.split(",").map((address) => address.trim()).filter((address) => net.isIP(address));
+  return addresses.at(-1) || remoteAddress;
+}
+
+function decodePathComponent(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    throw new HttpError(400, "Invalid URL encoding.");
+  }
+}
+
 function findConversation(store, id, userId) {
   const channel = store.channels.find((item) => item.id === id);
   if (channel) {
@@ -420,7 +911,9 @@ function findConversation(store, id, userId) {
   const conversation = store.conversations.find((item) => item.id === id && item.memberIds.includes(userId));
   if (!conversation) throw new HttpError(404, "Chat not found.");
   return {
-    type: conversation.type || (conversation.memberIds.length === 2 ? "direct" : "group"),
+    type: conversation.type || (conversation.memberIds.length === 2
+      ? "direct"
+      : conversation.memberIds.length === 1 ? "saved" : "group"),
     conversation
   };
 }
@@ -461,20 +954,65 @@ function removeChatData(store, chatId) {
   const messageIds = new Set(store.messages
     .filter((message) => (message.chatId || message.conversationId || message.room) === chatId)
     .map((message) => message.id));
-  const attachmentIds = new Set(store.attachments
-    .filter((attachment) => attachment.chatId === chatId || messageIds.has(attachment.messageId))
-    .map((attachment) => attachment.id));
+  const removedAttachments = store.attachments.filter((attachment) =>
+    attachment.chatId === chatId || messageIds.has(attachment.messageId)
+  );
+  const attachmentIds = new Set(removedAttachments.map((attachment) => attachment.id));
 
   store.messages = store.messages.filter((message) => !messageIds.has(message.id));
   store.attachments = store.attachments.filter((attachment) =>
-    !attachmentIds.has(attachment.id) && attachment.chatId !== chatId
+    !attachmentIds.has(attachment.id)
   );
   store.links = store.links.filter((link) =>
     link.chatId !== chatId && !messageIds.has(link.messageId)
   );
   store.channels = store.channels.filter((chat) => chat.id !== chatId);
   store.conversations = store.conversations.filter((chat) => chat.id !== chatId);
-  return { messageIds, attachmentIds };
+  return { messageIds, attachmentIds, removedAttachments };
+}
+
+function attachmentAssetLocations(attachment) {
+  const storageChatId = attachment.storageChatId || attachment.chatId;
+  const locations = [{
+    chatId: storageChatId,
+    id: attachment.storageId || attachment.id
+  }];
+  if (attachment.thumbnailId) {
+    locations.push({
+      chatId: attachment.thumbnailStorageChatId || storageChatId,
+      id: attachment.thumbnailStorageId || attachment.thumbnailId
+    });
+  }
+  return locations;
+}
+
+function removeAttachmentRecords(store, removedAttachments, uploadsRoot) {
+  const removedIds = new Set(removedAttachments.map((attachment) => attachment.id));
+  store.attachments = store.attachments.filter((attachment) => !removedIds.has(attachment.id));
+  const referenceCounts = new Map();
+  for (const attachment of store.attachments) {
+    for (const { chatId, id } of attachmentAssetLocations(attachment)) {
+      const key = `${chatId}\u0000${id}`;
+      referenceCounts.set(key, (referenceCounts.get(key) || 0) + 1);
+    }
+  }
+  const filePaths = new Map();
+  for (const attachment of removedAttachments) {
+    for (const { chatId, id } of attachmentAssetLocations(attachment)) {
+      if ((referenceCounts.get(`${chatId}\u0000${id}`) || 0) > 0) continue;
+      const filePath = path.resolve(uploadsRoot, chatId, id);
+      if (!filePath.startsWith(`${uploadsRoot}${path.sep}`)) {
+        throw new Error("Unsafe attachment path.");
+      }
+      filePaths.set(filePath, filePath);
+    }
+  }
+  return [...filePaths.values()];
+}
+
+async function removeUnreferencedAttachmentFiles(store, removedAttachments, uploadsRoot) {
+  const filePaths = removeAttachmentRecords(store, removedAttachments, uploadsRoot);
+  for (const filePath of filePaths) await fs.rm(filePath, { force: true });
 }
 
 function canReadMessage(store, message, userId) {
@@ -486,19 +1024,56 @@ function canReadMessage(store, message, userId) {
   }
 }
 
-function visibleMessage(message, store) {
+function visibleMessage(message, store, viewerId = null) {
   const author = store.users.find((user) => user.id === message.authorId);
+  const conversationId = message.conversationId || message.room;
+  const channel = store.channels.find((item) => item.id === conversationId);
+  const conversation = channel || store.conversations.find((item) => item.id === conversationId);
+  const otherMemberIds = (conversation?.memberIds || []).filter((memberId) => memberId !== message.authorId);
+  const seenByRecipient = viewerId === message.authorId && otherMemberIds.some((memberId) =>
+    (conversation.lastReadMessageIds?.[memberId] || 0) >= message.id
+  );
+  const replyToMessage = message.replyToId
+    ? store.messages.find((item) => item.id === message.replyToId) || null
+    : null;
+  const replyAuthor = replyToMessage
+    ? store.users.find((user) => user.id === replyToMessage.authorId)
+    : null;
   return {
     id: message.id,
-    conversationId: message.conversationId || message.room,
-    chatId: message.conversationId || message.room,
+    conversationId,
+    chatId: conversationId,
     authorId: message.authorId,
+    ...(message.mediaType ? { mediaType: message.mediaType } : {}),
     author: author ? publicUser(author) : message.author || { id: "legacy", username: "system", fullName: "Слово" },
+    ...(channel?.postAs === "channel"
+      ? { displayAuthor: { id: channel.id, fullName: channel.name, avatarUrl: channel.avatarUrl || null, isChannel: true } }
+      : {}),
     text: message.deleted ? "" : message.text,
     sentAt: message.createdAt || message.sentAt,
     createdAt: message.createdAt || message.sentAt,
     editedAt: message.editedAt || null,
     deleted: Boolean(message.deleted),
+    seenByRecipient,
+    replyTo: replyToMessage ? {
+      id: replyToMessage.id,
+      author: replyAuthor ? publicUser(replyAuthor) : null,
+      text: replyToMessage.deleted ? "" : replyToMessage.text,
+      deleted: Boolean(replyToMessage.deleted),
+      attachments: replyToMessage.deleted ? [] : (replyToMessage.attachmentIds || [])
+        .map((id) => store.attachments.find((attachment) => attachment.id === id))
+        .filter(Boolean)
+        .map((attachment) => attachment.name)
+    } : null,
+    forwardedFrom: message.forwardedFrom ? { ...message.forwardedFrom } : null,
+    reactions: Object.entries(message.reactions || {})
+      .filter(([, userIds]) => Array.isArray(userIds) && userIds.length > 0)
+      .map(([emoji, userIds]) => ({
+        emoji,
+        count: userIds.length,
+        reactedByMe: viewerId ? userIds.includes(viewerId) : false
+      })),
+    ...(message.savedSource ? { savedSource: { ...message.savedSource } } : {}),
     attachments: message.deleted ? [] : (message.attachmentIds || [])
       .map((id) => store.attachments.find((attachment) => attachment.id === id))
       .filter(Boolean)
@@ -529,6 +1104,28 @@ function safeFileName(value) {
     .replace(/[. ]+$/g, "")
     .slice(0, 180);
   return safe && safe !== "." ? safe : "file";
+}
+
+function parseByteRange(value, size) {
+  if (typeof value !== "string" || !value.startsWith("bytes=") || value.includes(",")) return null;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(value.trim());
+  if (!match || (!match[1] && !match[2])) return null;
+  let start;
+  let end;
+  if (!match[1]) {
+    const suffixLength = Number(match[2]);
+    if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0 || size === 0) return { unsatisfiable: true };
+    start = Math.max(0, size - suffixLength);
+    end = size - 1;
+  } else {
+    start = Number(match[1]);
+    end = match[2] ? Number(match[2]) : size - 1;
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start >= size || end < start) {
+      return { unsatisfiable: true };
+    }
+    end = Math.min(end, size - 1);
+  }
+  return { start, end };
 }
 
 function sniffMimeType(buffer) {
@@ -572,6 +1169,32 @@ function latestMessageId(store, chatId) {
   return latest;
 }
 
+function buildConversationSummaryIndex(store, conversations, userId, queryUnreadCount = null, queryLastMessage = null) {
+  const conversationsById = new Map(conversations.map((conversation) => [conversation.id, conversation]));
+  const summaries = new Map(conversations.map((conversation) => [conversation.id, {
+    lastMessage: queryLastMessage ? queryLastMessage(conversation.id) : null,
+    unreadCount: conversation.type === "saved" ? 0 : queryUnreadCount
+      ? queryUnreadCount(conversation.id, conversation.lastReadMessageIds?.[userId] || 0, userId)
+      : 0
+  }]));
+  if (!queryUnreadCount || !queryLastMessage) {
+    for (const message of store.messages) {
+      const conversationId = message.conversationId || message.room;
+      const conversation = conversationsById.get(conversationId);
+      if (!conversation) continue;
+      const summary = summaries.get(conversationId);
+      if (!queryLastMessage && (!summary.lastMessage || message.id > summary.lastMessage.id)) {
+        summary.lastMessage = message;
+      }
+      if (!queryUnreadCount) {
+        const lastReadId = conversation.lastReadMessageIds?.[userId] || 0;
+        if (message.id > lastReadId && message.authorId !== userId) summary.unreadCount += 1;
+      }
+    }
+  }
+  return summaries;
+}
+
 function countUnreadMessages(store, conversation, userId) {
   const lastReadId = conversation.lastReadMessageIds?.[userId] || 0;
   return store.messages.reduce((total, message) =>
@@ -579,46 +1202,105 @@ function countUnreadMessages(store, conversation, userId) {
       && message.id > lastReadId && message.authorId !== userId ? 1 : 0), 0);
 }
 
-function conversationSummary(store, conversation, userId) {
-  const lastMessage = store.messages.findLast((message) =>
-    (message.conversationId || message.room) === conversation.id
-  );
+function conversationSummary(
+  store,
+  conversation,
+  userId,
+  summaries = null,
+  queryUnreadCount = null,
+  queryLastMessage = null
+) {
+  const indexedSummary = summaries?.get(conversation.id);
+  const lastMessage = indexedSummary
+    ? indexedSummary.lastMessage
+    : queryLastMessage
+      ? queryLastMessage(conversation.id)
+      : store.messages.findLast((message) => (message.conversationId || message.room) === conversation.id);
   const otherUserId = conversation.memberIds?.find((id) => id !== userId);
   const otherUser = store.users.find((user) => user.id === otherUserId);
   const type = conversation.type || (store.channels.includes(conversation)
     ? "channel"
-    : conversation.memberIds?.length === 2 ? "direct" : "group");
+    : conversation.memberIds?.length === 2
+      ? "direct"
+      : conversation.memberIds?.length === 1 ? "saved" : "group");
   return {
     id: conversation.id,
     type,
-    name: type === "direct"
+    name: type === "saved" ? null : type === "direct"
       ? otherUser?.fullName || `@${otherUser?.username || ""}`
       : conversation.name,
     username: type === "direct" ? otherUser?.username || null : null,
-    avatarUrl: type === "direct" && otherUser ? publicUser(otherUser).avatarUrl : null,
+    avatarUrl: type === "direct" && otherUser
+      ? publicUser(otherUser).avatarUrl
+      : type === "channel" ? conversation.avatarUrl || null : null,
     description: conversation.description || "",
     memberIds: conversation.memberIds || [],
     joined: conversation.memberIds?.includes(userId) || false,
-    unreadCount: countUnreadMessages(store, conversation, userId),
+    unreadCount: type === "saved" ? 0 : indexedSummary
+      ? indexedSummary.unreadCount
+      : queryUnreadCount
+        ? queryUnreadCount(conversation.id, conversation.lastReadMessageIds?.[userId] || 0, userId)
+        : countUnreadMessages(store, conversation, userId),
     lastReadMessageId: conversation.lastReadMessageIds?.[userId] || 0,
-    lastMessage: lastMessage ? visibleMessage(lastMessage, store) : null,
+    lastMessage: lastMessage ? visibleMessage(lastMessage, store, userId) : null,
     createdBy: conversation.createdBy,
     ownerId: conversation.ownerId || conversation.createdBy || null,
     adminIds: conversation.adminIds || [],
     muted: (conversation.mutedUserIds || []).includes(userId),
-    role: getChatRole(conversation, userId)
+    role: getChatRole(conversation, userId),
+    ...(type === "channel" ? { postAs: conversation.postAs === "channel" ? "channel" : "person" } : {})
   };
+}
+
+async function cleanupExpiredData(store, dataDirectory, persist, now = Date.now()) {
+  const cutoff = now - ORPHAN_ATTACHMENT_TTL_MS;
+  const expiredAttachments = store.attachments.filter((attachment) => {
+    const createdAt = Date.parse(attachment.createdAt);
+    return !attachment.messageId && Number.isFinite(createdAt) && createdAt < cutoff;
+  });
+  const uploadsRoot = path.resolve(dataDirectory, "uploads");
+  const previous = {
+    sessions: store.sessions,
+    attachments: store.attachments,
+    uploadUsage: store.uploadUsage
+  };
+  const expiredFiles = removeAttachmentRecords(store, expiredAttachments, uploadsRoot);
+  for (const filePath of expiredFiles) await fs.rm(filePath, { force: true });
+  store.sessions = store.sessions.filter((session) =>
+    Number.isFinite(session.expiresAt) && session.expiresAt > now);
+  store.uploadUsage = store.uploadUsage.filter((usage) => {
+    const createdAt = Date.parse(usage.createdAt);
+    return Number.isFinite(createdAt) && createdAt >= cutoff;
+  });
+  const changed = store.sessions.length !== previous.sessions.length
+    || store.attachments.length !== previous.attachments.length
+    || store.uploadUsage.length !== previous.uploadUsage.length;
+  if (!changed) return false;
+  try {
+    await persist(store);
+  } catch (error) {
+    Object.assign(store, previous);
+    throw error;
+  }
+  return true;
 }
 
 function createMessengerServer({
   store = createEmptyStore(),
   saveStore = async () => {},
   dataDirectory = path.join(__dirname, "data"),
-  pushSender = sendPushToUser
+  pushSender = sendPushToUser,
+  queryUnreadCount = null,
+  queryLastMessage = null,
+  maintenanceEnabled = false
 } = {}) {
   const connectedUsers = new Map();
+  const recentEvents = new Map();
+  const eventSequences = new Map();
   const viewingClients = new Map();
+  const registrationAttempts = new Map();
   let currentStore = normalizeStore(store);
+  let maintenanceRunning = false;
 
   function isUserViewingChat(userId, chatId) {
     const clients = viewingClients.get(userId);
@@ -645,22 +1327,72 @@ function createMessengerServer({
     }
   }, 30_000);
   presenceCleanupTimer.unref();
+  const registrationAttemptsCleanupTimer = setInterval(() => {
+    const cutoff = Date.now() - 60 * 60 * 1000;
+    for (const [address, attempts] of registrationAttempts) {
+      const recent = attempts.filter((time) => time > cutoff);
+      if (recent.length) registrationAttempts.set(address, recent);
+      else registrationAttempts.delete(address);
+    }
+  }, 60 * 1000);
+  registrationAttemptsCleanupTimer.unref();
+  const maintenanceTimer = maintenanceEnabled
+    ? setInterval(() => {
+      if (maintenanceRunning) return;
+      maintenanceRunning = true;
+      void cleanupExpiredData(currentStore, dataDirectory, persist)
+        .catch((error) => console.error("Expired data cleanup failed:", error))
+        .finally(() => { maintenanceRunning = false; });
+    }, 60 * 60 * 1000)
+    : null;
+  maintenanceTimer?.unref();
 
   function persist() {
     return saveStore(currentStore);
   }
 
+  function chatSummary(conversation, userId, summaries = null) {
+    return conversationSummary(
+      currentStore,
+      conversation,
+      userId,
+      summaries,
+      queryUnreadCount,
+      queryLastMessage
+    );
+  }
+
   function broadcast(userId, event, payload) {
+    const sequence = (eventSequences.get(userId) || 0) + 1;
+    eventSequences.set(userId, sequence);
+    const item = { id: sequence, event, data: JSON.stringify(payload) };
+    const history = recentEvents.get(userId) || [];
+    history.push(item);
+    if (history.length > 100) history.shift();
+    recentEvents.set(userId, history);
     const clients = connectedUsers.get(userId);
     if (!clients) return;
-    const data = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
+    const data = `id: ${item.id}\nevent: ${item.event}\ndata: ${item.data}\n\n`;
     for (const response of clients) response.write(data);
   }
 
-  const server = http.createServer(async (request, response) => {
+  const app = express();
+  app.disable("x-powered-by");
+  app.use((request, response, next) => {
+    response.setHeader("Referrer-Policy", "no-referrer");
+    response.setHeader("X-Content-Type-Options", "nosniff");
+    response.setHeader("Content-Security-Policy", "default-src 'self'; connect-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'");
+    if (request.socket.encrypted || process.env.POLUS_COOKIE_SECURE === "true") {
+      response.setHeader("Strict-Transport-Security", "max-age=31536000");
+    }
+    next();
+  });
+  app.use(express.static(CLIENT_BUILD_DIRECTORY, { index: false }));
+  app.use(express.static(path.join(BUILD_DIRECTORY, "public"), { index: false }));
+  app.use(async (request, response) => {
     try {
       const url = new URL(request.url, "http://localhost");
-      const ip = request.socket.remoteAddress || "unknown";
+      const ip = getClientAddress(request);
 
       if (request.method === "GET" && url.pathname === "/") {
         // Если форму когда-то отправили обычным GET-запросом, убираем личные данные из адреса.
@@ -684,18 +1416,35 @@ function createMessengerServer({
         throw new HttpError(400, "JavaScript is required. Reload the page and try again.");
       }
 
-      if (request.method === "GET" && PUBLIC_FILES.has(url.pathname)) {
-        const [fileName, contentType] = PUBLIC_FILES.get(url.pathname);
-        const contents = await fs.readFile(path.join(__dirname, "public", fileName));
+      if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/profile" || PUBLIC_FILES.has(url.pathname))) {
+        const isAppPage = url.pathname === "/" || url.pathname === "/profile";
+        const [fallbackFileName, contentType] = isAppPage
+          ? [path.join(__dirname, "client", "index.html"), "text/html; charset=utf-8"]
+          : PUBLIC_FILES.get(url.pathname);
+        const builtIndex = isAppPage ? path.join(CLIENT_BUILD_DIRECTORY, "index.html") : "";
+        let contents;
+        if (builtIndex) {
+          try {
+            contents = await fs.readFile(builtIndex);
+          } catch (error) {
+            if (error.code !== "ENOENT") throw error;
+          }
+        }
+        if (!contents) {
+          contents = isAppPage
+            ? await fs.readFile(fallbackFileName)
+            : await fs.readFile(path.join(__dirname, "public", fallbackFileName));
+        }
         response.writeHead(200, {
           "Content-Type": contentType,
-          "Cache-Control": contentType.startsWith("text/html") ? "no-store" : "no-cache",
-          "Referrer-Policy": "no-referrer",
-          "X-Content-Type-Options": "nosniff",
-          "Content-Security-Policy": "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+          "Cache-Control": contentType.startsWith("text/html") ? "no-store" : "no-cache"
         });
         response.end(contents);
         return;
+      }
+
+      if (!url.pathname.startsWith("/api/")) {
+        throw new HttpError(404, "Not found.");
       }
 
       if (request.method === "GET" && url.pathname === "/api/auth/me") {
@@ -715,6 +1464,15 @@ function createMessengerServer({
         const password = typeof input.password === "string" ? input.password : "";
 
         if (url.pathname === "/api/auth/register") {
+          const now = Date.now();
+          const registrationCutoff = now - 60 * 60 * 1000;
+          const recentRegistrations = (registrationAttempts.get(ip) || [])
+            .filter((time) => time > registrationCutoff);
+          if (recentRegistrations.length >= 5) {
+            registrationAttempts.set(ip, recentRegistrations);
+            throw new HttpError(429, "Too many registration attempts. Try again later.");
+          }
+          registrationAttempts.set(ip, [...recentRegistrations, now]);
           const fullName = cleanText(input.fullName, 256);
           const about = cleanText(input.about, 1000);
           if (!USERNAME_PATTERN.test(username)) {
@@ -748,6 +1506,7 @@ function createMessengerServer({
             createdAt: new Date().toISOString()
           };
           currentStore.users.push(user);
+          currentStore.conversations.push(createSavedConversation(user));
           const { cookie } = makeSession(request, currentStore, user);
           await persist();
           sendJson(response, 201, { user: publicUser(user) }, { "Set-Cookie": cookie });
@@ -823,14 +1582,14 @@ function createMessengerServer({
 
       const uploadRoute = /^\/api\/chats\/([^/]+)\/attachments$/.exec(url.pathname);
       if (request.method === "POST" && uploadRoute) {
-        const chatId = decodeURIComponent(uploadRoute[1]);
+        const chatId = decodePathComponent(uploadRoute[1]);
         const { type, conversation } = findConversation(currentStore, chatId, user.id);
         if (type === "channel" && !["owner", "admin"].includes(getChatRole(conversation, user.id))) {
           throw new HttpError(403, "Only channel owners and administrators can upload to this channel.");
         }
         const declaredSize = Number(request.headers["content-length"] || 0);
         if (declaredSize > MAX_ATTACHMENT_BYTES) throw new HttpError(413, "Files cannot exceed 100 MB.");
-        const name = safeFileName(decodeURIComponent(String(request.headers["x-file-name"] || "file")));
+        const name = safeFileName(decodePathComponent(String(request.headers["x-file-name"] || "file")));
         const attachmentId = randomId();
         const uploadsRoot = path.resolve(dataDirectory, "uploads");
         const chatDirectory = path.resolve(uploadsRoot, chatId);
@@ -878,7 +1637,17 @@ function createMessengerServer({
         const attachment = {
           id: attachmentId,
           name,
-          mimeType: sniffMimeType(sniffBuffer),
+          mimeType: (() => {
+            const detectedType = sniffMimeType(sniffBuffer);
+            const declaredType = String(request.headers["x-file-mime-type"] || "")
+              .toLowerCase()
+              .split(";", 1)[0]
+              .trim();
+            return detectedType === "video/webm" && declaredType === "audio/webm"
+              || detectedType === "video/mp4" && declaredType === "audio/mp4"
+              ? declaredType
+              : detectedType;
+          })(),
           size,
           authorId: user.id,
           chatId,
@@ -904,8 +1673,8 @@ function createMessengerServer({
 
       const thumbnailRoute = /^\/api\/chats\/([^/]+)\/attachments\/([^/]+)\/thumbnail$/.exec(url.pathname);
       if (request.method === "POST" && thumbnailRoute) {
-        const chatId = decodeURIComponent(thumbnailRoute[1]);
-        const attachmentId = decodeURIComponent(thumbnailRoute[2]);
+        const chatId = decodePathComponent(thumbnailRoute[1]);
+        const attachmentId = decodePathComponent(thumbnailRoute[2]);
         const { type, conversation } = findConversation(currentStore, chatId, user.id);
         if (type === "channel" && !["owner", "admin"].includes(getChatRole(conversation, user.id))) {
           throw new HttpError(403, "Only channel owners and administrators can upload to this channel.");
@@ -984,25 +1753,19 @@ function createMessengerServer({
 
       const attachmentRoute = /^\/api\/attachments\/([^/]+)$/.exec(url.pathname);
       if (request.method === "DELETE" && attachmentRoute) {
-        const attachment = currentStore.attachments.find((item) => item.id === decodeURIComponent(attachmentRoute[1]));
+        const attachment = currentStore.attachments.find((item) => item.id === decodePathComponent(attachmentRoute[1]));
         if (!attachment || attachment.authorId !== user.id || attachment.messageId) {
           throw new HttpError(404, "File not found.");
         }
-        currentStore.attachments = currentStore.attachments.filter((item) => item.id !== attachment.id);
         const uploadsRoot = path.resolve(dataDirectory, "uploads");
-        const filePath = path.resolve(uploadsRoot, attachment.chatId, attachment.id);
-        if (!filePath.startsWith(`${uploadsRoot}${path.sep}`)) throw new Error("Unsafe attachment path.");
-        await fs.rm(filePath, { force: true });
-        if (attachment.thumbnailId) {
-          await fs.rm(path.resolve(uploadsRoot, attachment.chatId, attachment.thumbnailId), { force: true });
-        }
+        await removeUnreferencedAttachmentFiles(currentStore, [attachment], uploadsRoot);
         await persist();
         sendJson(response, 200, { ok: true });
         return;
       }
 
-      if (request.method === "GET" && attachmentRoute) {
-        const attachment = currentStore.attachments.find((item) => item.id === decodeURIComponent(attachmentRoute[1]));
+      if (["GET", "HEAD"].includes(request.method) && attachmentRoute) {
+        const attachment = currentStore.attachments.find((item) => item.id === decodePathComponent(attachmentRoute[1]));
         const attachmentChat = attachment ? getChatRecord(currentStore, attachment.chatId) : null;
         const publicMedia = attachmentChat && currentStore.channels.includes(attachmentChat)
           && /^(image|video)\//.test(attachment?.mimeType || "");
@@ -1014,7 +1777,13 @@ function createMessengerServer({
         const storedId = isThumbnail ? attachment.thumbnailId : attachment.id;
         const mimeType = isThumbnail ? attachment.thumbnailMimeType : attachment.mimeType;
         if (!storedId || !mimeType) throw new HttpError(404, "File not found.");
-        const filePath = path.resolve(uploadsRoot, attachment.chatId, storedId);
+        const storageChatId = isThumbnail
+          ? attachment.thumbnailStorageChatId || attachment.storageChatId || attachment.chatId
+          : attachment.storageChatId || attachment.chatId;
+        const storageId = isThumbnail
+          ? attachment.thumbnailStorageId || storedId
+          : attachment.storageId || storedId;
+        const filePath = path.resolve(uploadsRoot, storageChatId, storageId);
         if (!filePath.startsWith(`${uploadsRoot}${path.sep}`)) throw new Error("Unsafe attachment path.");
         let fileHandle;
         try {
@@ -1024,20 +1793,44 @@ function createMessengerServer({
           throw error;
         }
         const fileStats = await fileHandle.stat();
+        const range = url.searchParams.has("thumbnail") ? null
+          : parseByteRange(request.headers.range, fileStats.size);
+        if (range?.unsatisfiable) {
+          await fileHandle.close();
+          response.writeHead(416, {
+            "Content-Range": `bytes */${fileStats.size}`,
+            "Accept-Ranges": "bytes",
+            "Content-Length": "0",
+            "Cache-Control": "private, no-store"
+          });
+          response.end();
+          return;
+        }
         const safeInline = isThumbnail
-          || /^(image\/(jpeg|png|gif|webp)|audio\/(mpeg|ogg|wav)|video\/(mp4|webm))$/.test(attachment.mimeType);
+          || /^(image\/(jpeg|png|gif|webp)|audio\/(mpeg|ogg|wav|webm|mp4)|video\/(mp4|webm))$/.test(attachment.mimeType);
         const disposition = url.searchParams.get("download") === "1" || !safeInline ? "attachment" : "inline";
         const encodedName = encodeURIComponent(attachment.name).replace(/['()*]/g, (character) =>
           `%${character.charCodeAt(0).toString(16).toUpperCase()}`
         );
-        response.writeHead(200, {
+        const start = range ? range.start : 0;
+        const end = range ? range.end : fileStats.size - 1;
+        const status = range ? 206 : 200;
+        const responseHeaders = {
           "Content-Type": safeInline ? mimeType : "application/octet-stream",
-          "Content-Length": fileStats.size,
+          "Content-Length": range ? end - start + 1 : fileStats.size,
           "Content-Disposition": `${disposition}; filename*=UTF-8''${encodedName}`,
           "X-Content-Type-Options": "nosniff",
+          "Accept-Ranges": "bytes",
           "Cache-Control": "private, no-store"
-        });
-        const fileStream = fileHandle.createReadStream();
+        };
+        if (range) responseHeaders["Content-Range"] = `bytes ${start}-${end}/${fileStats.size}`;
+        response.writeHead(status, responseHeaders);
+        if (request.method === "HEAD") {
+          await fileHandle.close();
+          response.end();
+          return;
+        }
+        const fileStream = fileHandle.createReadStream(range ? { start, end } : {});
         fileStream.on("close", () => { void fileHandle.close().catch((error) => console.error("Attachment close failed:", error)); });
         fileStream.pipe(response);
         return;
@@ -1045,7 +1838,7 @@ function createMessengerServer({
 
       const avatarRoute = /^\/api\/avatars\/([^/]+)$/.exec(url.pathname);
       if (request.method === "GET" && avatarRoute) {
-        const target = currentStore.users.find((candidate) => candidate.id === decodeURIComponent(avatarRoute[1]));
+        const target = currentStore.users.find((candidate) => candidate.id === decodePathComponent(avatarRoute[1]));
         if (!target?.avatarId || !target.avatarMimeType?.startsWith("image/")) {
           throw new HttpError(404, "Avatar not found.");
         }
@@ -1075,7 +1868,7 @@ function createMessengerServer({
 
       const profileRoute = /^\/api\/users\/([^/]+)\/profile$/.exec(url.pathname);
       if (request.method === "GET" && profileRoute) {
-        const username = decodeURIComponent(profileRoute[1]).replace(/^@/, "").toLowerCase();
+        const username = decodePathComponent(profileRoute[1]).replace(/^@/, "").toLowerCase();
         const target = currentStore.users.find((candidate) => candidate.username === username);
         if (!target) throw new HttpError(404, "User not found.");
         const blocked = (user.blockedUserIds || []).includes(target.id);
@@ -1115,7 +1908,7 @@ function createMessengerServer({
 
       const blockRoute = /^\/api\/users\/([^/]+)\/block$/.exec(url.pathname);
       if (blockRoute && ["POST", "DELETE"].includes(request.method)) {
-        const username = decodeURIComponent(blockRoute[1]).replace(/^@/, "").toLowerCase();
+        const username = decodePathComponent(blockRoute[1]).replace(/^@/, "").toLowerCase();
         const target = currentStore.users.find((candidate) => candidate.username === username);
         if (!target) throw new HttpError(404, "User not found.");
         if (target.id === user.id) throw new HttpError(400, "You cannot block yourself.");
@@ -1189,7 +1982,7 @@ function createMessengerServer({
 
       const muteRoute = /^\/api\/chats\/([^/]+)\/mute$/.exec(url.pathname);
       if (muteRoute && ["POST", "DELETE"].includes(request.method)) {
-        const chatId = decodeURIComponent(muteRoute[1]);
+        const chatId = decodePathComponent(muteRoute[1]);
         const chat = getChatRecord(currentStore, chatId);
         if (!chat || !getChatRole(chat, user.id)) throw new HttpError(404, "Chat not found.");
         chat.mutedUserIds = Array.isArray(chat.mutedUserIds) ? chat.mutedUserIds : [];
@@ -1201,7 +1994,7 @@ function createMessengerServer({
       }
 
       if (request.method === "GET" && /^\/api\/chats\/[^/]+\/materials$/.test(url.pathname)) {
-        const chatId = decodeURIComponent(url.pathname.split("/")[3]);
+        const chatId = decodePathComponent(url.pathname.split("/")[3]);
         const chat = getChatRecord(currentStore, chatId);
         const role = chat ? getChatRole(chat, user.id) : null;
         const isPublicChannel = Boolean(chat && currentStore.channels.includes(chat));
@@ -1290,7 +2083,7 @@ function createMessengerServer({
 
       const searchRoute = /^\/api\/chats\/([^/]+)\/search$/.exec(url.pathname);
       if (request.method === "GET" && searchRoute) {
-        const chatId = decodeURIComponent(searchRoute[1]);
+        const chatId = decodePathComponent(searchRoute[1]);
         const { conversation } = findConversation(currentStore, chatId, user.id);
         const query = cleanText(url.searchParams.get("q") || "", 200).toLocaleLowerCase();
         if (!query) {
@@ -1308,7 +2101,7 @@ function createMessengerServer({
             .map((link) => `${link.url} ${link.domain}`)
             .join(" ");
           if (`${message.text} ${attachmentNames} ${linkedText}`.toLocaleLowerCase().includes(query)) {
-            results.push(visibleMessage(message, currentStore));
+            results.push(visibleMessage(message, currentStore, user.id));
           }
         }
         results.sort((left, right) => right.id - left.id);
@@ -1321,10 +2114,18 @@ function createMessengerServer({
       }
 
       if (request.method === "GET" && url.pathname === "/api/bootstrap") {
-        const channels = currentStore.channels.map((channel) => conversationSummary(currentStore, channel, user.id));
+        const userConversations = [
+          ...currentStore.channels,
+          ...currentStore.conversations.filter((conversation) => conversation.memberIds.includes(user.id))
+        ];
+        const summaryIndex = buildConversationSummaryIndex(
+          currentStore, userConversations, user.id, queryUnreadCount, queryLastMessage
+        );
+        const channels = currentStore.channels
+          .map((channel) => chatSummary(channel, user.id, summaryIndex));
         const directs = currentStore.conversations
           .filter((conversation) => conversation.memberIds.includes(user.id))
-          .map((conversation) => conversationSummary(currentStore, conversation, user.id));
+          .map((conversation) => chatSummary(conversation, user.id, summaryIndex));
         sendJson(response, 200, {
           user: { ...publicUser(user), hideNotificationContent: user.hideNotificationContent === true },
           channels,
@@ -1335,25 +2136,40 @@ function createMessengerServer({
         return;
       }
 
-      const chatRoute = /^\/api\/chats\/([^/]+)(?:\/(members|admins|owner|leave))?(?:\/([^/]+))?$/.exec(url.pathname);
+      const chatRoute = /^\/api\/chats\/([^/]+)(?:\/(members|admins|owner|leave|settings))?(?:\/([^/]+))?$/.exec(url.pathname);
       if (chatRoute) {
-        const chatId = decodeURIComponent(chatRoute[1]);
+        const chatId = decodePathComponent(chatRoute[1]);
         const section = chatRoute[2] || "";
-        const targetId = chatRoute[3] ? decodeURIComponent(chatRoute[3]) : "";
+        const targetId = chatRoute[3] ? decodePathComponent(chatRoute[3]) : "";
         const chat = getChatRecord(currentStore, chatId);
         const role = chat ? getChatRole(chat, user.id) : null;
         if (!chat || !role) throw new HttpError(404, "Chat not found.");
         const chatType = currentStore.channels.includes(chat) ? "channel" : chat.type || "group";
+        if (chatType === "saved") throw new HttpError(400, "Saved Messages cannot be managed.");
         if (chatType === "direct") throw new HttpError(400, "Direct chats cannot be managed.");
 
         if (request.method === "GET" && !section) {
           sendJson(response, 200, {
-            chat: conversationSummary(currentStore, chat, user.id),
+            chat: chatSummary(chat, user.id),
             members: chat.memberIds.map((memberId) => {
               const member = currentStore.users.find((candidate) => candidate.id === memberId);
               return member ? { ...publicUser(member), role: getChatRole(chat, memberId) } : null;
             }).filter(Boolean)
           });
+          return;
+        }
+
+        if (request.method === "PUT" && section === "settings" && !targetId) {
+          requireChatRole(chat, user.id, ["owner"]);
+          if (chatType !== "channel") throw new HttpError(400, "Only channel settings can be changed here.");
+          const input = await readJsonBody(request);
+          if (input.postAs !== "channel" && input.postAs !== "person") {
+            throw new HttpError(400, "Post identity must be channel or person.");
+          }
+          chat.postAs = input.postAs;
+          await persist();
+          broadcastChatMembers(chat, "chat-updated", { chatId, action: "settings-changed" }, broadcast);
+          sendJson(response, 200, { chat: chatSummary(chat, user.id) });
           return;
         }
 
@@ -1364,7 +2180,7 @@ function createMessengerServer({
           const invitee = currentStore.users.find((candidate) => candidate.username === username);
           if (!invitee) throw new HttpError(404, "User not found.");
           if (chat.memberIds.includes(invitee.id)) {
-            sendJson(response, 200, { chat: conversationSummary(currentStore, chat, user.id), added: false });
+            sendJson(response, 200, { chat: chatSummary(chat, user.id), added: false });
             return;
           }
           if (chatType === "group" && chat.memberIds.length >= 200) {
@@ -1378,7 +2194,7 @@ function createMessengerServer({
           await persist();
           const event = { chatId, action: "member-added", userId: invitee.id };
           broadcastChatMembers(chat, "chat-updated", event, broadcast);
-          sendJson(response, 201, { chat: conversationSummary(currentStore, chat, user.id), added: true });
+          sendJson(response, 201, { chat: chatSummary(chat, user.id), added: true });
           return;
         }
 
@@ -1418,7 +2234,7 @@ function createMessengerServer({
           }
           await persist();
           broadcastChatMembers(chat, "chat-updated", { chatId, action: "role-changed", userId: targetId }, broadcast);
-          sendJson(response, 200, { chat: conversationSummary(currentStore, chat, user.id) });
+          sendJson(response, 200, { chat: chatSummary(chat, user.id) });
           return;
         }
 
@@ -1436,7 +2252,7 @@ function createMessengerServer({
           chat.adminIds = (chat.adminIds || []).filter((adminId) => adminId !== newOwner.id);
           await persist();
           broadcastChatMembers(chat, "chat-updated", { chatId, action: "owner-changed", userId: newOwner.id }, broadcast);
-          sendJson(response, 200, { chat: conversationSummary(currentStore, chat, user.id) });
+          sendJson(response, 200, { chat: chatSummary(chat, user.id) });
           return;
         }
 
@@ -1456,13 +2272,9 @@ function createMessengerServer({
 
         if (request.method === "DELETE" && !section) {
           requireChatRole(chat, user.id, ["owner"]);
-          removeChatData(currentStore, chatId);
+          const removed = removeChatData(currentStore, chatId);
           const uploadsRoot = path.resolve(dataDirectory, "uploads");
-          const chatUploads = path.resolve(uploadsRoot, chatId);
-          if (!chatUploads.startsWith(`${uploadsRoot}${path.sep}`)) {
-            throw new Error("Unsafe chat upload directory.");
-          }
-          await fs.rm(chatUploads, { recursive: true, force: true });
+          await removeUnreferencedAttachmentFiles(currentStore, removed.removedAttachments, uploadsRoot);
           await persist();
           broadcastChatMembers(chat, "chat-updated", { chatId, action: "chat-deleted" }, broadcast);
           sendJson(response, 200, { ok: true });
@@ -1492,6 +2304,9 @@ function createMessengerServer({
             throw new HttpError(401, "Current password is incorrect.");
           }
           user.passwordHash = await passwordHash(input.newPassword);
+          currentStore.sessions = currentStore.sessions.filter((session) =>
+            session.userId !== user.id || session.id === auth.session.id
+          );
         }
         user.fullName = fullName;
         user.about = about;
@@ -1542,7 +2357,7 @@ function createMessengerServer({
         };
         currentStore.channels.push(channel);
         await persist();
-        sendJson(response, 201, conversationSummary(currentStore, channel, user.id));
+        sendJson(response, 201, chatSummary(channel, user.id));
         return;
       }
 
@@ -1576,12 +2391,12 @@ function createMessengerServer({
         };
         currentStore.conversations.push(conversation);
         await persist();
-        sendJson(response, 201, conversationSummary(currentStore, conversation, user.id));
+        sendJson(response, 201, chatSummary(conversation, user.id));
         return;
       }
 
       if (request.method === "POST" && /^\/api\/channels\/[^/]+\/join$/.test(url.pathname)) {
-        const id = decodeURIComponent(url.pathname.split("/")[3]);
+        const id = decodePathComponent(url.pathname.split("/")[3]);
         const channel = currentStore.channels.find((item) => item.id === id);
         if (!channel) throw new HttpError(404, "Channel not found.");
         if (!channel.memberIds.includes(user.id)) {
@@ -1593,20 +2408,20 @@ function createMessengerServer({
           await persist();
           broadcastChatMembers(channel, "chat-updated", { chatId: id, action: "member-added", userId: user.id }, broadcast);
         }
-        sendJson(response, 200, conversationSummary(currentStore, channel, user.id));
+        sendJson(response, 200, chatSummary(channel, user.id));
         return;
       }
 
       if (request.method === "POST" && /^\/api\/directs\/[^/]+$/.test(url.pathname)) {
         const input = await readJsonBody(request);
-        const username = cleanText(input.username || decodeURIComponent(url.pathname.split("/")[3]), 32)
+        const username = cleanText(input.username || decodePathComponent(url.pathname.split("/")[3]), 32)
           .replace(/^@/, "").toLowerCase();
         const otherUser = currentStore.users.find((candidate) => candidate.username === username);
         if (!otherUser) throw new HttpError(404, "User not found.");
         if (otherUser.id === user.id) throw new HttpError(400, "You cannot message yourself.");
         const conversation = findDirectConversation(currentStore, user.id, otherUser.id);
         if (conversation) {
-          sendJson(response, 200, conversationSummary(currentStore, conversation, user.id));
+          sendJson(response, 200, chatSummary(conversation, user.id));
           return;
         }
         const memberIds = [user.id, otherUser.id].sort();
@@ -1634,10 +2449,20 @@ function createMessengerServer({
         conversation.lastReadMessageIds[user.id] = latestMessageId(currentStore, conversation.id);
         conversation.unreadCounts[user.id] = 0;
         await persist();
+        const readThrough = conversation.lastReadMessageIds[user.id];
+        for (const memberId of conversation.memberIds) {
+          if (memberId !== user.id) {
+            broadcast(memberId, "messages-read", {
+              conversationId: conversation.id,
+              readerId: user.id,
+              lastReadMessageId: readThrough
+            });
+          }
+        }
         sendJson(response, 200, {
           ok: true,
-          lastReadMessageId: conversation.lastReadMessageIds[user.id],
-          unreadCount: countUnreadMessages(currentStore, conversation, user.id)
+          lastReadMessageId: readThrough,
+          unreadCount: 0
         });
         return;
       }
@@ -1660,7 +2485,7 @@ function createMessengerServer({
         const selectedMessages = eligibleMessages.slice(-MESSAGE_PAGE_SIZE);
         const hasMore = eligibleMessages.length > selectedMessages.length;
         const messages = [...selectedMessages].reverse()
-          .map((message) => visibleMessage(message, currentStore));
+          .map((message) => visibleMessage(message, currentStore, user.id));
         sendJson(response, 200, {
           messages,
           nextCursor: hasMore ? selectedMessages[0].id : null,
@@ -1674,9 +2499,15 @@ function createMessengerServer({
         const conversationId = cleanText(input.conversationId, 100);
         const recipientUsername = cleanText(input.recipientUsername, 32).replace(/^@/, "").toLowerCase();
         const text = cleanMessageText(input.text);
+        const mediaType = input.mediaType === undefined || input.mediaType === null
+          ? null
+          : input.mediaType;
         const attachmentIds = Array.isArray(input.attachmentIds)
           ? [...new Set(input.attachmentIds.filter((id) => typeof id === "string"))]
           : [];
+        if (mediaType !== null && mediaType !== "voice") {
+          throw new HttpError(400, "Invalid message media type.");
+        }
         if ((!text && attachmentIds.length === 0) || Array.from(text).length > 4000) {
           throw new HttpError(400, "Message must contain 1–4000 characters.");
         }
@@ -1720,6 +2551,19 @@ function createMessengerServer({
           chatId = direct.id;
         }
         const { type, conversation } = findConversation(currentStore, chatId, user.id);
+        const replyToId = input.replyToId === undefined || input.replyToId === null
+          ? null
+          : Number(input.replyToId);
+        if (replyToId !== null) {
+          if (!Number.isSafeInteger(replyToId) || replyToId <= 0) {
+            throw new HttpError(400, "Invalid reply target.");
+          }
+          const replyTarget = currentStore.messages.find((item) => item.id === replyToId);
+          if (!replyTarget || (replyTarget.conversationId || replyTarget.room) !== chatId
+            || !canReadMessage(currentStore, replyTarget, user.id)) {
+            throw new HttpError(404, "Reply target not found.");
+          }
+        }
         if (type === "channel" && !["owner", "admin"].includes(getChatRole(conversation, user.id))) {
           throw new HttpError(403, "Only channel owners and administrators can post.");
         }
@@ -1737,6 +2581,10 @@ function createMessengerServer({
           || attachment.chatId !== chatId || attachment.messageId)) {
           throw new HttpError(400, "One or more attachments are invalid.");
         }
+        if (mediaType === "voice" && (attachments.length !== 1
+          || !attachments[0].mimeType.startsWith("audio/"))) {
+          throw new HttpError(400, "A voice message must contain one audio file.");
+        }
         messageAttempts.set(user.id, [...recentAttempts, now]);
         const createdAt = new Date(now).toISOString();
         const message = {
@@ -1744,10 +2592,12 @@ function createMessengerServer({
           conversationId: chatId,
           authorId: user.id,
           text,
+          ...(mediaType ? { mediaType } : {}),
           createdAt,
           sentAt: createdAt,
           deleted: false,
-          attachmentIds
+          attachmentIds,
+          ...(replyToId ? { replyToId } : {})
         };
         for (const attachment of attachments) attachment.messageId = message.id;
         currentStore.links.push(...extractLinks(text).map((link) => ({
@@ -1763,10 +2613,13 @@ function createMessengerServer({
         for (const recipientId of conversation.memberIds) {
           conversation.unreadCounts = conversation.unreadCounts || {};
           conversation.lastReadMessageIds = conversation.lastReadMessageIds || {};
-          conversation.unreadCounts[recipientId] = countUnreadMessages(currentStore, conversation, recipientId);
+          const previousUnreadCount = Number(conversation.unreadCounts[recipientId]) || 0;
+          conversation.unreadCounts[recipientId] = previousUnreadCount
+            + (recipientId !== user.id
+              && message.id > (conversation.lastReadMessageIds[recipientId] || 0) ? 1 : 0);
         }
         await persist();
-        const safeMessage = visibleMessage(message, currentStore);
+        const safeMessage = visibleMessage(message, currentStore, user.id);
         for (const recipientId of conversation.memberIds) {
           broadcast(recipientId, "message", safeMessage);
           if (recipientId !== user.id
@@ -1782,13 +2635,284 @@ function createMessengerServer({
         }
         sendJson(response, 201, {
           ...safeMessage,
-          conversation: conversationSummary(currentStore, conversation, user.id)
+          conversation: chatSummary(conversation, user.id)
         });
         return;
       }
 
+      const saveMessageRoute = /^\/api\/messages\/([^/]+)\/save$/.exec(url.pathname);
+      if (request.method === "POST" && saveMessageRoute) {
+        const sourceMessage = currentStore.messages.find((item) => item.id === Number(decodePathComponent(saveMessageRoute[1])));
+        if (!sourceMessage || sourceMessage.deleted) throw new HttpError(404, "Message not found.");
+        const sourceChatId = sourceMessage.conversationId || sourceMessage.room;
+        const { type: sourceType, conversation: sourceChat } = findConversation(currentStore, sourceChatId, user.id);
+        if (sourceType === "saved") throw new HttpError(400, "Messages already in Saved Messages cannot be saved again.");
+
+        const now = Date.now();
+        const recentAttempts = (messageAttempts.get(user.id) || [])
+          .filter((time) => now - time < MESSAGE_RATE_WINDOW_MS);
+        if (recentAttempts.length >= MAX_MESSAGES_PER_MINUTE) {
+          messageAttempts.set(user.id, recentAttempts);
+          throw new HttpError(429, "You can send at most 20 messages per minute.");
+        }
+
+        const savedChat = currentStore.conversations.find((item) => item.id === `saved_${user.id}`);
+        if (!savedChat || savedChat.type !== "saved" || savedChat.ownerId !== user.id) {
+          throw new HttpError(404, "Chat not found.");
+        }
+        const sourceAttachments = (sourceMessage.attachmentIds || []).map((attachmentId) =>
+          currentStore.attachments.find((attachment) => attachment.id === attachmentId
+            && attachment.chatId === sourceChatId && attachment.messageId === sourceMessage.id)
+        );
+        if (sourceAttachments.some((attachment) => !attachment)) {
+          throw new HttpError(404, "Message not found.");
+        }
+        messageAttempts.set(user.id, [...recentAttempts, now]);
+        const createdAt = new Date(now).toISOString();
+        const savedMessageId = currentStore.nextMessageId++;
+        const copiedAttachmentIds = sourceAttachments.map(() => randomId());
+        const copiedAttachments = sourceAttachments.map((attachment, index) => ({
+          ...attachment,
+          id: copiedAttachmentIds[index],
+          chatId: savedChat.id,
+          messageId: savedMessageId,
+          authorId: user.id,
+          createdAt,
+          storageId: attachment.storageId || attachment.id,
+          storageChatId: attachment.storageChatId || attachment.chatId,
+          ...(attachment.thumbnailId ? {
+            thumbnailStorageId: attachment.thumbnailStorageId || attachment.thumbnailId,
+            thumbnailStorageChatId: attachment.thumbnailStorageChatId
+              || attachment.storageChatId
+              || attachment.chatId
+          } : {})
+        }));
+        const sourceVisible = visibleMessage(sourceMessage, currentStore, user.id);
+        const sourceAuthor = sourceVisible.displayAuthor || sourceVisible.author;
+        const sourceName = chatSummary(sourceChat, user.id).name || sourceChat.name || "";
+        const message = {
+          id: savedMessageId,
+          conversationId: savedChat.id,
+          authorId: user.id,
+          text: sourceMessage.text || "",
+          ...(sourceMessage.mediaType ? { mediaType: sourceMessage.mediaType } : {}),
+          createdAt,
+          sentAt: createdAt,
+          deleted: false,
+          attachmentIds: copiedAttachmentIds,
+          savedSource: {
+            chatName: sourceName,
+            authorName: sourceAuthor.fullName || sourceAuthor.username || "",
+            authorUsername: sourceAuthor.username || ""
+          }
+        };
+        currentStore.attachments.push(...copiedAttachments);
+        currentStore.links.push(...currentStore.links
+          .filter((link) => link.messageId === sourceMessage.id && link.chatId === sourceChatId)
+          .map((link) => ({
+            ...link,
+            id: randomId(),
+            chatId: savedChat.id,
+            messageId: savedMessageId,
+            authorId: user.id,
+            createdAt
+          })));
+        currentStore.messages.push(message);
+        savedChat.unreadCounts = {};
+        await persist();
+        const safeMessage = visibleMessage(message, currentStore, user.id);
+        broadcast(user.id, "message", safeMessage);
+        sendJson(response, 201, {
+          ...safeMessage,
+          conversation: chatSummary(savedChat, user.id)
+        });
+        return;
+      }
+
+      const forwardMessageRoute = /^\/api\/messages\/([^/]+)\/forward$/.exec(url.pathname);
+      if (request.method === "POST" && forwardMessageRoute) {
+        const sourceMessage = currentStore.messages.find((item) =>
+          item.id === Number(decodePathComponent(forwardMessageRoute[1]))
+        );
+        if (!sourceMessage || sourceMessage.deleted || !canReadMessage(currentStore, sourceMessage, user.id)) {
+          throw new HttpError(404, "Message not found.");
+        }
+        const input = await readJsonBody(request);
+        const conversationId = cleanText(input.conversationId, 100);
+        const recipientUsername = cleanText(input.recipientUsername, 32).replace(/^@/, "").toLowerCase();
+        if (Boolean(conversationId) === Boolean(recipientUsername)) {
+          throw new HttpError(400, "Choose one destination.");
+        }
+        const recentAttempts = (messageAttempts.get(user.id) || [])
+          .filter((time) => Date.now() - time < MESSAGE_RATE_WINDOW_MS);
+        if (recentAttempts.length >= MAX_MESSAGES_PER_MINUTE) {
+          messageAttempts.set(user.id, recentAttempts);
+          throw new HttpError(429, "You can send at most 20 messages per minute.");
+        }
+        const sourceChatId = sourceMessage.conversationId || sourceMessage.room;
+        const sourceAttachments = (sourceMessage.attachmentIds || []).map((attachmentId) =>
+          currentStore.attachments.find((attachment) => attachment.id === attachmentId
+            && attachment.chatId === sourceChatId && attachment.messageId === sourceMessage.id)
+        );
+        if (sourceAttachments.some((attachment) => !attachment)) {
+          throw new HttpError(404, "Message not found.");
+        }
+        let targetChatId = conversationId;
+        if (recipientUsername) {
+          const recipient = currentStore.users.find((candidate) => candidate.username === recipientUsername);
+          if (!recipient) throw new HttpError(404, "User not found.");
+          if (recipient.id === user.id) throw new HttpError(400, "You cannot message yourself.");
+          if ((user.blockedUserIds || []).includes(recipient.id)
+            || (recipient.blockedUserIds || []).includes(user.id)) {
+            throw new HttpError(403, "This user cannot receive your messages.");
+          }
+          let direct = findDirectConversation(currentStore, user.id, recipient.id);
+          if (!direct) {
+            const memberIds = [user.id, recipient.id].sort();
+            direct = {
+              id: `dm_${memberIds.join("_")}`,
+              type: "direct",
+              memberIds,
+              ownerId: null,
+              adminIds: [],
+              unreadCounts: {},
+              lastReadMessageIds: {},
+              createdAt: new Date().toISOString()
+            };
+            currentStore.conversations.push(direct);
+          }
+          targetChatId = direct.id;
+        }
+
+        const { type: targetType, conversation: targetChat } =
+          findConversation(currentStore, targetChatId, user.id);
+        if (targetType === "channel" && !["owner", "admin"].includes(getChatRole(targetChat, user.id))) {
+          throw new HttpError(403, "Only channel owners and administrators can post.");
+        }
+        if (targetType === "direct") {
+          const otherUserId = targetChat.memberIds.find((memberId) => memberId !== user.id);
+          const otherUser = currentStore.users.find((candidate) => candidate.id === otherUserId);
+          if ((user.blockedUserIds || []).includes(otherUserId)
+            || (otherUser?.blockedUserIds || []).includes(user.id)) {
+            throw new HttpError(403, "This user cannot receive your messages.");
+          }
+        }
+        messageAttempts.set(user.id, [...recentAttempts, Date.now()]);
+        const createdAt = new Date().toISOString();
+        const forwardedMessageId = currentStore.nextMessageId++;
+        const forwardedAttachmentIds = sourceAttachments.map(() => randomId());
+        const forwardedAttachments = sourceAttachments.map((attachment, index) => ({
+          ...attachment,
+          id: forwardedAttachmentIds[index],
+          chatId: targetChatId,
+          messageId: forwardedMessageId,
+          authorId: user.id,
+          createdAt,
+          storageId: attachment.storageId || attachment.id,
+          storageChatId: attachment.storageChatId || attachment.chatId,
+          ...(attachment.thumbnailId ? {
+            thumbnailStorageId: attachment.thumbnailStorageId || attachment.thumbnailId,
+            thumbnailStorageChatId: attachment.thumbnailStorageChatId
+              || attachment.storageChatId
+              || attachment.chatId
+          } : {})
+        }));
+        const sourceVisible = visibleMessage(sourceMessage, currentStore, user.id);
+        const sourceAuthor = sourceVisible.displayAuthor || sourceVisible.author;
+        const sourceChat = getChatRecord(currentStore, sourceChatId);
+        const { type: sourceType } = findConversation(currentStore, sourceChatId, user.id);
+        const sourceSummary = sourceChat ? chatSummary(sourceChat, user.id) : null;
+        const message = {
+          id: forwardedMessageId,
+          conversationId: targetChatId,
+          authorId: user.id,
+          text: sourceMessage.text || "",
+          ...(sourceMessage.mediaType ? { mediaType: sourceMessage.mediaType } : {}),
+          createdAt,
+          sentAt: createdAt,
+          deleted: false,
+          attachmentIds: forwardedAttachmentIds,
+          forwardedFrom: {
+            chatName: sourceSummary?.name || "",
+            chatType: sourceType,
+            authorName: sourceAuthor.fullName || sourceAuthor.username || "",
+            authorUsername: sourceAuthor.username || ""
+          }
+        };
+        currentStore.attachments.push(...forwardedAttachments);
+        currentStore.links.push(...currentStore.links
+          .filter((link) => link.messageId === sourceMessage.id && link.chatId === sourceChatId)
+          .map((link) => ({
+            ...link,
+            id: randomId(),
+            chatId: targetChatId,
+            messageId: forwardedMessageId,
+            authorId: user.id,
+            createdAt
+          })));
+        currentStore.messages.push(message);
+        for (const recipientId of targetChat.memberIds) {
+          targetChat.unreadCounts = targetChat.unreadCounts || {};
+          targetChat.lastReadMessageIds = targetChat.lastReadMessageIds || {};
+          const previousUnreadCount = Number(targetChat.unreadCounts[recipientId]) || 0;
+          targetChat.unreadCounts[recipientId] = previousUnreadCount
+            + (recipientId !== user.id
+              && forwardedMessageId > (targetChat.lastReadMessageIds[recipientId] || 0) ? 1 : 0);
+        }
+        await persist();
+        const safeMessage = visibleMessage(message, currentStore, user.id);
+        for (const recipientId of targetChat.memberIds) {
+          broadcast(recipientId, "message", safeMessage);
+          if (recipientId !== user.id
+            && !(targetChat.mutedUserIds || []).includes(recipientId)
+            && !isUserViewingChat(recipientId, targetChatId)) {
+            const recipient = currentStore.users.find((candidate) => candidate.id === recipientId);
+            pushSender(currentStore, recipientId, safeMessage, persist, {
+              hideContent: recipient?.hideNotificationContent === true
+            }).catch((error) => console.error("Push notification failed:", error));
+          }
+        }
+        sendJson(response, 201, {
+          ...safeMessage,
+          conversation: chatSummary(targetChat, user.id)
+        });
+        return;
+      }
+
+      const reactToMessageRoute = /^\/api\/messages\/([^/]+)\/reactions$/.exec(url.pathname);
+      if (request.method === "POST" && reactToMessageRoute) {
+        const id = Number(decodePathComponent(reactToMessageRoute[1]));
+        const message = currentStore.messages.find((item) => item.id === id);
+        if (!message || message.deleted || !canReadMessage(currentStore, message, user.id)) {
+          throw new HttpError(404, "Message not found.");
+        }
+        const input = await readJsonBody(request);
+        if (typeof input.emoji !== "string" || !MESSAGE_REACTIONS.has(input.emoji)) {
+          throw new HttpError(400, "Unsupported reaction.");
+        }
+        const reactions = message.reactions && typeof message.reactions === "object"
+          ? message.reactions
+          : {};
+        const userIds = Array.isArray(reactions[input.emoji]) ? reactions[input.emoji] : [];
+        message.reactions = { ...reactions };
+        if (userIds.includes(user.id)) {
+          message.reactions[input.emoji] = userIds.filter((userId) => userId !== user.id);
+          if (message.reactions[input.emoji].length === 0) delete message.reactions[input.emoji];
+        } else {
+          message.reactions[input.emoji] = [...userIds, user.id];
+        }
+        await persist();
+        const conversationId = message.conversationId || message.room;
+        const { conversation } = findConversation(currentStore, conversationId, user.id);
+        for (const recipientId of conversation.memberIds) {
+          broadcast(recipientId, "message-updated", visibleMessage(message, currentStore, recipientId));
+        }
+        sendJson(response, 200, visibleMessage(message, currentStore, user.id));
+        return;
+      }
+
       if (request.method === "PATCH" && /^\/api\/messages\/[^/]+$/.test(url.pathname)) {
-        const id = decodeURIComponent(url.pathname.split("/")[3]);
+        const id = decodePathComponent(url.pathname.split("/")[3]);
         const numericId = Number(id);
         const targetMessage = currentStore.messages.find((item) => item.id === numericId);
         if (!targetMessage || !canReadMessage(currentStore, targetMessage, user.id)) {
@@ -1818,15 +2942,17 @@ function createMessengerServer({
           ...link
         })));
         await persist();
-        const safeMessage = visibleMessage(targetMessage, currentStore);
         const { conversation } = findConversation(currentStore, targetMessage.conversationId, user.id);
-        for (const recipientId of conversation.memberIds) broadcast(recipientId, "message-updated", safeMessage);
+        for (const recipientId of conversation.memberIds) {
+          broadcast(recipientId, "message-updated", visibleMessage(targetMessage, currentStore, recipientId));
+        }
+        const safeMessage = visibleMessage(targetMessage, currentStore, user.id);
         sendJson(response, 200, safeMessage);
         return;
       }
 
       if (request.method === "DELETE" && /^\/api\/messages\/[^/]+$/.test(url.pathname)) {
-        const id = decodeURIComponent(url.pathname.split("/")[3]);
+        const id = decodePathComponent(url.pathname.split("/")[3]);
         const message = currentStore.messages.find((item) => item.id === Number(id));
         if (!message || !canReadMessage(currentStore, message, user.id)) throw new HttpError(404, "Message not found.");
         if (message.deleted) {
@@ -1848,22 +2974,15 @@ function createMessengerServer({
         message.deleted = true;
         message.deletedAt = new Date().toISOString();
         message.attachmentIds = [];
-        currentStore.attachments = currentStore.attachments.filter((attachment) =>
-          !removedAttachments.some((removed) => removed.id === attachment.id)
-        );
-        currentStore.links = currentStore.links.filter((link) => link.messageId !== message.id);
+        message.reactions = {};
         const uploadsRoot = path.resolve(dataDirectory, "uploads");
-        for (const attachment of removedAttachments) {
-          const filePath = path.resolve(uploadsRoot, attachment.chatId, attachment.id);
-          if (!filePath.startsWith(`${uploadsRoot}${path.sep}`)) throw new Error("Unsafe attachment path.");
-          await fs.rm(filePath, { force: true });
-          if (attachment.thumbnailId) {
-            await fs.rm(path.resolve(uploadsRoot, attachment.chatId, attachment.thumbnailId), { force: true });
-          }
-        }
+        await removeUnreferencedAttachmentFiles(currentStore, removedAttachments, uploadsRoot);
+        currentStore.links = currentStore.links.filter((link) => link.messageId !== message.id);
         await persist();
-        const payload = visibleMessage(message, currentStore);
-        for (const recipientId of conversation.memberIds) broadcast(recipientId, "message-deleted", payload);
+        for (const recipientId of conversation.memberIds) {
+          broadcast(recipientId, "message-deleted", visibleMessage(message, currentStore, recipientId));
+        }
+        const payload = visibleMessage(message, currentStore, user.id);
         sendJson(response, 200, payload);
         return;
       }
@@ -1876,6 +2995,23 @@ function createMessengerServer({
           "X-Accel-Buffering": "no"
         });
         response.write("retry: 3000\n");
+        const lastEventId = /^\d+$/.test(request.headers["last-event-id"] || "")
+          ? Number(request.headers["last-event-id"])
+          : null;
+        const sequence = eventSequences.get(user.id) || 0;
+        const history = recentEvents.get(user.id) || [];
+        if (lastEventId !== null) {
+          const oldestId = history[0]?.id ?? sequence + 1;
+          if (!Number.isSafeInteger(lastEventId) || lastEventId > sequence || lastEventId < oldestId - 1) {
+            response.write(`id: ${sequence}\nevent: resync\ndata: {}\n\n`);
+          } else {
+            for (const item of history) {
+              if (item.id > lastEventId) {
+                response.write(`id: ${item.id}\nevent: ${item.event}\ndata: ${item.data}\n\n`);
+              }
+            }
+          }
+        }
         if (!connectedUsers.has(user.id)) connectedUsers.set(user.id, new Set());
         connectedUsers.get(user.id).add(response);
         const heartbeat = setInterval(() => response.write(": keep-alive\n\n"), 25000);
@@ -1904,7 +3040,9 @@ function createMessengerServer({
         } catch {
           throw new HttpError(400, "Invalid push endpoint.");
         }
-        const trustedPushHosts = ["fcm.googleapis.com", "push.services.mozilla.com", "push.apple.com"];
+        const trustedPushHosts = [
+          "fcm.googleapis.com", "push.services.mozilla.com", "push.apple.com", "notify.windows.com"
+        ];
         if (endpoint.protocol !== "https:" || !trustedPushHosts.some((host) =>
           endpoint.hostname === host || endpoint.hostname.endsWith(`.${host}`)
         )) {
@@ -1950,7 +3088,12 @@ function createMessengerServer({
     }
   });
 
-  server.on("close", () => clearInterval(presenceCleanupTimer));
+  const server = http.createServer(app);
+  server.on("close", () => {
+    clearInterval(presenceCleanupTimer);
+    clearInterval(registrationAttemptsCleanupTimer);
+    if (maintenanceTimer) clearInterval(maintenanceTimer);
+  });
   return server;
 }
 
@@ -2040,15 +3183,23 @@ function createStoreWriter(filePath, options) {
 }
 
 async function start() {
-  await fs.mkdir(path.dirname(DATA_FILE), { recursive: true });
-  const store = await loadStore(DATA_FILE);
+  await fs.mkdir(DATA_DIRECTORY, { recursive: true });
+  const { database, store } = await loadSqliteStore(DATABASE_FILE, LEGACY_DATA_FILE);
   if (!store.vapidKeys) store.vapidKeys = webpush.generateVAPIDKeys();
   const contact = process.env.POLUS_PUSH_CONTACT || "mailto:admin@example.com";
   webpush.setVapidDetails(contact, store.vapidKeys.publicKey, store.vapidKeys.privateKey);
 
-  const saveStore = createStoreWriter(DATA_FILE);
+  const saveStore = createSqliteStoreWriter(database, store);
+  await cleanupExpiredData(store, DATA_DIRECTORY, saveStore);
   await saveStore(store);
-  const server = createMessengerServer({ store, saveStore });
+  const server = createMessengerServer({
+    store,
+    saveStore,
+    queryUnreadCount: saveStore.countUnreadMessages,
+    queryLastMessage: saveStore.lastMessageForChat,
+    maintenanceEnabled: true
+  });
+  server.on("close", () => database.close());
   server.listen(PORT, HOST, () => {
     const port = server.address().port;
     console.log(`Полюс запущен: http://localhost:${port}`);
@@ -2082,12 +3233,15 @@ if (require.main === module) {
 module.exports = {
   createMessengerServer,
   createEmptyStore,
+  cleanupExpiredData,
   createPushPayload,
+  createSqliteStoreWriter,
   createStoreWriter,
   getLanAddresses,
   migrateLegacyChannelData,
   normalizeStore,
   loadStore,
+  loadSqliteStore,
   writeStoreAtomically,
   sendPushToUser,
   PRIVACY_VERSION
