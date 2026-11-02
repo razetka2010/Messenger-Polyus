@@ -11,3 +11,7 @@ backups/
 Thumbs.db
 /Caddyfile
 /caddy.exe
+android/.gradle/
+android/local.properties
+android/**/build/
+android/android.keystore

@@ -1,3 +1,4 @@
 * text=auto eol=crlf
 LICENSE text eol=lf
 public/logo.svg text eol=lf
+android/gradlew text eol=lf
