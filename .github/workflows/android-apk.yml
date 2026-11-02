@@ -32,7 +32,14 @@ jobs:
       - name: Build debug APK
         run: |
           chmod +x android/gradlew
-          android/gradlew --no-daemon -p android assembleDebug
+          log_file="$RUNNER_TEMP/android-gradle.log"
+          if android/gradlew --stacktrace --no-daemon -p android assembleDebug >"$log_file" 2>&1; then
+            cat "$log_file"
+          else
+            status=$?
+            tail -n 30 "$log_file" | sed 's/^/::error title=Android Gradle build::/'
+            exit "$status"
+          fi
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
