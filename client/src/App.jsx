@@ -5,6 +5,14 @@ import { createImageThumbnail, uploadAttachment, uploadAttachmentThumbnail } fro
 import { cropAvatar } from "./avatar.mjs";
 import { getConversationHeaderControls, orderConversations } from "./conversationList.mjs";
 import { clearClientDiagnostics, createClientId, getClientDiagnostics, logClientDiagnostic } from "./diagnostics.mjs";
+import { initializeMessenger } from "./messengerController.js";
+
+const MESSAGE_REACTION_EMOJIS = [
+  "👍", "❤️", "😂", "😮", "😢", "👏", "🔥", "🎉", "😍", "🤔", "🙏", "💯",
+  "✅", "👎", "😎", "🥳", "😭", "😡", "🤯", "🥰", "🤩", "🤗", "😴", "🙌",
+  "💪", "👀", "🌹", "🎂", "💔", "✨", "🤝", "🫡", "😱", "😅", "😊", "😇",
+  "🤮", "😷", "💩", "🐱", "🐶", "🍕", "☕", "⚡", "🚀", "🎈", "🌟", "💡"
+];
 
 const translations = {
   ru: {
@@ -28,6 +36,8 @@ const translations = {
     privacyNote: "Твои разговоры — только для участников.",
     discover: "ОТКРЫТЫЕ КАНАЛЫ",
     join: "Вступить",
+    openChannel: "Открыть",
+    joinChannelPrompt: "Это открытый канал. Вступите, чтобы участвовать в обсуждении.",
     findPeopleFor: "Найти людей:",
     noChats: "Здесь пока пусто. Нажмите на карандаш, чтобы найти людей.",
     noMessagesYet: "Нет сообщений",
@@ -58,7 +68,29 @@ const translations = {
     replyTo: "Ответ на сообщение",
     cancelReply: "Отменить ответ",
     messageUnavailable: "Сообщение удалено",
-    messageActions: "Действия с сообщением"
+    messageActions: "Действия с сообщением",
+    pinChat: "Закрепить чат",
+    unpinChat: "Открепить чат",
+    pinnedChat: "Чат закреплён",
+    deleteChatAction: "Удалить чат",
+    deleteChatTitle: "Удаление чата",
+    deleteForMe: "Удалить у меня",
+    deleteForEveryone: "Удалить у всех",
+    cancel: "Отмена",
+    channelPrivacy: "Канал",
+    publicChannel: "Публичный — отображается в списке каналов",
+    privateChannel: "Частный — доступен только по ссылке",
+    inviteLink: "Пригласительная ссылка",
+    createInviteLink: "Создать ссылку",
+    copyInviteLink: "Скопировать ссылку",
+    revokeInviteLink: "Отозвать ссылку",
+    linkCopied: "Ссылка скопирована",
+    channelProfile: "Профиль канала",
+    channelSettings: "Настройки канала",
+    memberCount: "участников",
+    openChat: "Открыть чат",
+    joinByInvite: "Вступить по приглашению",
+    inviteNotFound: "Приглашение недействительно или отозвано."
   },
   en: {
     welcome: "YOUR CONNECTION POINT",
@@ -81,6 +113,8 @@ const translations = {
     privacyNote: "Your conversations are only for participants.",
     discover: "OPEN CHANNELS",
     join: "Join",
+    openChannel: "Open",
+    joinChannelPrompt: "This is a public channel. Join to participate in the conversation.",
     findPeopleFor: "Find people:",
     noChats: "Nothing here yet. Click the pencil to find people.",
     noMessagesYet: "No messages yet",
@@ -111,7 +145,29 @@ const translations = {
     replyTo: "Replying to",
     cancelReply: "Cancel reply",
     messageUnavailable: "Message deleted",
-    messageActions: "Message actions"
+    messageActions: "Message actions",
+    pinChat: "Pin chat",
+    unpinChat: "Unpin chat",
+    pinnedChat: "Pinned chat",
+    deleteChatAction: "Delete chat",
+    deleteChatTitle: "Delete chat",
+    deleteForMe: "Delete for me",
+    deleteForEveryone: "Delete for everyone",
+    cancel: "Cancel",
+    channelPrivacy: "Channel privacy",
+    publicChannel: "Public — shown in the channel list",
+    privateChannel: "Private — available only by invite link",
+    inviteLink: "Invite link",
+    createInviteLink: "Create link",
+    copyInviteLink: "Copy link",
+    revokeInviteLink: "Revoke link",
+    linkCopied: "Link copied",
+    channelProfile: "Channel profile",
+    channelSettings: "Channel settings",
+    memberCount: "members",
+    openChat: "Open chat",
+    joinByInvite: "Join by invite",
+    inviteNotFound: "This invitation is invalid or has been revoked."
   }
 };
 
@@ -276,6 +332,8 @@ function conversationPreview(conversation, userId, text) {
 }
 
 function ReactConversationRow({ conversation, selected, discover, userId, language, onOpen }) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const wrapperRef = useRef(null);
   const text = translations[language];
   const saved = conversation.type === "saved";
   const lastTime = conversation.lastMessage?.sentAt;
@@ -283,12 +341,45 @@ function ReactConversationRow({ conversation, selected, discover, userId, langua
     ? conversation.description || String(conversation.memberIds?.length || 0)
     : saved ? text.savedMessagesCaption : conversationPreview(conversation, userId, text);
 
+  useEffect(() => {
+    if (!menuOpen) return undefined;
+    const closeOutside = (event) => {
+      const target = event.target;
+      if (target instanceof Element
+        && (target.closest(".chat-row-menu") || target.closest(".chat-row-menu-trigger"))) return;
+      setMenuOpen(false);
+    };
+    const closeOnEscape = (event) => {
+      if (event.key === "Escape") setMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOutside);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOutside);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [menuOpen]);
+
+  const fireAction = (action) => {
+    setMenuOpen(false);
+    document.dispatchEvent(new CustomEvent(action === "delete"
+      ? "polus:chat-delete-request" : "polus:chat-row-action", {
+      detail: { action, conversation }
+    }));
+  };
+
   return (
+    <div ref={wrapperRef} className="conversation-row-wrapper">
     <button
       type="button"
       className="chat-row"
       data-conversation-id={conversation.id}
       aria-current={selected ? "page" : undefined}
+      onContextMenu={(event) => {
+        if (discover || saved) return;
+        event.preventDefault();
+        setMenuOpen(true);
+      }}
       onClick={() => onOpen(conversation)}
     >
       <span className={`chat-avatar avatar-tone-${avatarTone(conversation.id)}${saved ? " saved-chat-avatar" : ""}`} aria-hidden="true">
@@ -300,7 +391,16 @@ function ReactConversationRow({ conversation, selected, discover, userId, langua
       </span>
       <span className="chat-row-body">
         <span className="chat-row-top">
-          <span className="chat-row-name">{saved ? text.savedMessages : conversation.name}</span>
+          <span className="chat-row-name">
+            <span className="chat-row-name-text">{saved ? text.savedMessages : conversation.name}</span>
+            {conversation.pinned && !saved && !discover && (
+              <span className="chat-row-pinned" title={text.pinnedChat} aria-label={text.pinnedChat}>
+                <svg viewBox="0 0 16 16" aria-hidden="true">
+                  <path d="M5 2.5h6l-.8 3.2 1.8 1.8v1H8.5v4.8l-.5.9-.5-.9V8.5H4v-1l1.8-1.8L5 2.5Z" />
+                </svg>
+              </span>
+            )}
+          </span>
           {lastTime && !discover && <span className="chat-row-time">{listTime(lastTime, language)}</span>}
         </span>
         <span className="chat-row-bottom">
@@ -310,10 +410,34 @@ function ReactConversationRow({ conversation, selected, discover, userId, langua
               {conversation.unreadCount > 99 ? "99+" : conversation.unreadCount}
             </span>
           )}
-          {discover && <span className="join-channel">{text.join}</span>}
+          {discover && <span className="join-channel">{text.openChannel}</span>}
         </span>
       </span>
     </button>
+    {!discover && !saved && (
+      <>
+        <button
+          type="button"
+          className="chat-row-menu-trigger"
+          aria-label={language === "ru" ? "Действия с чатом" : "Chat actions"}
+          title={language === "ru" ? "Действия с чатом" : "Chat actions"}
+          aria-haspopup="menu"
+          aria-expanded={menuOpen}
+          onClick={() => setMenuOpen((open) => !open)}
+        >⋯</button>
+        {menuOpen && (
+          <div className="chat-row-menu" role="menu">
+            <button type="button" role="menuitem" onClick={() => fireAction("pin")}>
+              {conversation.pinned ? text.unpinChat : text.pinChat}
+            </button>
+            <button type="button" role="menuitem" onClick={() => fireAction("delete")}>
+              {text.deleteChatAction}
+            </button>
+          </div>
+        )}
+      </>
+    )}
+    </div>
   );
 }
 
@@ -767,6 +891,7 @@ function MessageRow({ message, conversation, currentUserId, previousMessage, lan
                 type="button"
                 className={`message-reaction${reaction.reactedByMe ? " is-selected" : ""}`}
                 aria-pressed={reaction.reactedByMe}
+                disabled={conversation?.joined === false}
                 onClick={() => document.dispatchEvent(new CustomEvent("polus:message-react", {
                   detail: { messageId: message.id, emoji: reaction.emoji }
                 }))}
@@ -847,7 +972,15 @@ function ConversationHeader() {
       document.dispatchEvent(new CustomEvent("polus:open-profile", {
         detail: { username: conversation.username }
       }));
-    } else if (conversation.type === "channel" || conversation.type === "group") {
+    } else if (conversation.type === "channel") {
+      if (conversation.joined !== false) {
+        document.dispatchEvent(new CustomEvent("polus:chat-info"));
+      } else {
+        document.dispatchEvent(new CustomEvent("polus:open-channel-profile", {
+          detail: { channelId: conversation.id }
+        }));
+      }
+    } else if (conversation.type === "group") {
       document.dispatchEvent(new CustomEvent("polus:chat-info"));
     }
   };
@@ -941,6 +1074,84 @@ function HeaderActions() {
         <span id="notification-indicator" hidden={!pushEnabled} />
       </button>}
     </div>
+  );
+}
+
+function PushOnboardingDialog({ user }) {
+  const dialogRef = useRef(null);
+  const language = useCurrentLanguage();
+  const key = `polus-push-onboarding-dismissed:${user.id}`;
+
+  useEffect(() => {
+    let active = true;
+    const markDismissedForSession = () => {
+      try {
+        sessionStorage.setItem(key, "done");
+      } catch {
+        // Continue showing the prompt when browser storage is unavailable.
+      }
+    };
+    const showIfNeeded = async () => {
+      if (!window.isSecureContext || !("serviceWorker" in navigator)
+        || !("PushManager" in window) || !("Notification" in window)) return;
+      try {
+        const registration = await navigator.serviceWorker.ready;
+        const subscription = await registration.pushManager.getSubscription();
+        if (!active) return;
+        document.dispatchEvent(new CustomEvent("polus:push-state-changed", {
+          detail: { enabled: Boolean(subscription) }
+        }));
+        if (subscription || Notification.permission === "denied") return;
+        let dismissed = false;
+        try {
+          dismissed = sessionStorage.getItem(key) === "done";
+        } catch {
+          // Show the prompt if browser storage is unavailable.
+        }
+        if (!dismissed && !dialogRef.current?.open) dialogRef.current?.showModal();
+      } catch (error) {
+        console.error("Unable to check push notification setup:", error);
+      }
+    };
+    void showIfNeeded();
+    dialogRef.current?.addEventListener("close", markDismissedForSession);
+    return () => {
+      active = false;
+      dialogRef.current?.removeEventListener("close", markDismissedForSession);
+    };
+  }, [key, user.id]);
+
+  const enable = () => {
+    try {
+      sessionStorage.setItem(key, "done");
+    } catch {
+      // The subscription action should still work without browser storage.
+    }
+    document.dispatchEvent(new CustomEvent("polus:toggle-push"));
+    dialogRef.current?.close();
+  };
+
+  const russian = language === "ru";
+  return (
+    <dialog ref={dialogRef} id="push-onboarding-dialog" className="dialog push-onboarding-dialog">
+      <div className="push-onboarding-content">
+        <svg className="push-onboarding-icon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M18 9a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" />
+        </svg>
+        <h2>{russian ? "Не пропускай сообщения" : "Stay up to date"}</h2>
+        <p>{russian
+          ? "Разреши уведомления, чтобы получать новые сообщения, даже когда Полюс закрыт."
+          : "Allow notifications to receive new messages when Polus is closed."}</p>
+        <div className="push-onboarding-actions">
+          <button className="text-button" type="button" onClick={() => dialogRef.current?.close()}>
+            {russian ? "Не сейчас" : "Not now"}
+          </button>
+          <button className="primary-button" type="button" onClick={enable}>
+            {russian ? "Включить уведомления" : "Enable notifications"}
+          </button>
+        </div>
+      </div>
+    </dialog>
   );
 }
 
@@ -1050,6 +1261,10 @@ function MessageContextMenu() {
   useLayoutEffect(() => {
     const open = (event) => setMenu(event.detail);
     const close = () => setMenu(null);
+    const onScroll = (event) => {
+      if (menuRef.current?.contains(event.target)) return;
+      close();
+    };
     const messageList = document.getElementById("message-list");
     const onContextMenu = (event) => document.dispatchEvent(new CustomEvent("polus:message-context-menu-request", {
       detail: { event }
@@ -1064,7 +1279,7 @@ function MessageContextMenu() {
     document.addEventListener("polus:message-context-menu-close", close);
     document.addEventListener("pointerdown", onPointerDown);
     document.addEventListener("keydown", onKeyDown);
-    document.addEventListener("scroll", close, true);
+    document.addEventListener("scroll", onScroll, true);
     window.addEventListener("resize", close);
     messageList?.addEventListener("contextmenu", onContextMenu);
     return () => {
@@ -1072,7 +1287,7 @@ function MessageContextMenu() {
       document.removeEventListener("polus:message-context-menu-close", close);
       document.removeEventListener("pointerdown", onPointerDown);
       document.removeEventListener("keydown", onKeyDown);
-      document.removeEventListener("scroll", close, true);
+      document.removeEventListener("scroll", onScroll, true);
       window.removeEventListener("resize", close);
       messageList?.removeEventListener("contextmenu", onContextMenu);
     };
@@ -1098,7 +1313,7 @@ function MessageContextMenu() {
     <div ref={menuRef} id="message-context-menu" className="message-context-menu" role="menu" hidden={!menu}>
       {menu?.canReact && (
         <div className="context-reaction-picker" role="group" aria-label={language === "ru" ? "Добавить реакцию" : "Add reaction"}>
-          {["👍", "❤️", "😂", "😮", "😢", "👏"].map((emoji) => (
+          {MESSAGE_REACTION_EMOJIS.map((emoji) => (
             <button
               key={emoji}
               type="button"
@@ -1662,8 +1877,22 @@ function ChatInfoDialogContent() {
         <div className="chat-info-identity-copy">
           <strong>{snapshot?.chatName || ""}</strong>
           {snapshot?.description && <span>{snapshot.description}</span>}
+          {snapshot?.chatType === "channel" && (
+            <small>{snapshot.memberCount} {snapshot.labels.memberCountUnit}</small>
+          )}
         </div>
       </section>
+      {snapshot?.canManageChannel && (
+        <button
+          className="primary-button channel-settings-link"
+          type="button"
+          onClick={() => document.dispatchEvent(new CustomEvent("polus:open-channel-settings", {
+            detail: { channelId: snapshot.conversationId }
+          }))}
+        >
+          {snapshot.labels.channelSettings}
+        </button>
+      )}
       <nav id="chat-info-tabs" className="chat-info-tabs">
         {snapshot?.tabs.map((item) => (
           <button
@@ -1772,6 +2001,8 @@ function ChatManagementContent() {
   const [snapshot, setSnapshot] = useState(null);
   const [username, setUsername] = useState("");
   const [ownerUsername, setOwnerUsername] = useState("");
+  const [channelName, setChannelName] = useState("");
+  const [channelDescription, setChannelDescription] = useState("");
   const [busy, setBusy] = useState(false);
 
   useLayoutEffect(() => {
@@ -1780,12 +2011,16 @@ function ChatManagementContent() {
         setSnapshot(null);
         setUsername("");
         setOwnerUsername("");
+        setChannelName("");
+        setChannelDescription("");
         setBusy(false);
         return;
       }
       setSnapshot(event.detail);
       setUsername("");
       setOwnerUsername(event.detail.members.find((member) => member.id !== event.detail.chat.ownerId)?.username || "");
+      setChannelName(event.detail.chat.name || "");
+      setChannelDescription(event.detail.chat.description || "");
       setBusy(false);
     };
     document.addEventListener("polus:chat-management-changed", onManagement);
@@ -1800,90 +2035,193 @@ function ChatManagementContent() {
   };
   if (!snapshot) return null;
   const { chat, members, labels } = snapshot;
+  const currentRole = members.find((member) => member.id === snapshot.currentUserId)?.role || "member";
+  const isChannel = chat.type === "channel";
+  const canManage = ["owner", "admin"].includes(currentRole);
 
   return (
     <section id="chat-management-content" className="chat-profile-management">
-      <h3 className="management-heading">{labels.chatMembers} ({members.length})</h3>
-      <div className="management-members">
-        {members.map((member) => (
-          <div className="management-member" key={member.id}>
-            <span className="management-member-copy">
-              <button
-                className="profile-inline-button management-member-name"
-                type="button"
-                onClick={() => document.dispatchEvent(new CustomEvent("polus:open-profile", {
-                  detail: { username: member.username }
-                }))}
-              >
-                {member.fullName}
-              </button>
-              <small>@{member.username} · {member.roleLabel}</small>
-            </span>
-            {chat.role === "owner" && member.id !== chat.ownerId && (
-              <button
-                className="text-button"
-                type="button"
-                disabled={busy}
-                onClick={() => void act("toggle-admin", { memberId: member.id, makeAdmin: member.role !== "admin" })}
-              >
-                {member.role === "admin" ? labels.removeAdmin : labels.makeAdmin}
-              </button>
-            )}
-            {["owner", "admin"].includes(chat.role) && member.id !== snapshot.currentUserId && member.role === "member" && (
-              <button
-                className="text-button"
-                type="button"
-                disabled={busy}
-                onClick={() => void act("remove-member", { memberId: member.id })}
-              >
-                {labels.remove}
-              </button>
-            )}
-          </div>
-        ))}
-      </div>
-      {chat.type === "channel" && chat.role === "owner" && (
-        <div className="management-form">
-          <label className="field-label" htmlFor="channel-post-identity">{labels.channelPostIdentity}</label>
-          <select
-            id="channel-post-identity"
-            className="text-field"
-            value={chat.postAs === "channel" ? "channel" : "person"}
-            disabled={busy}
-            onChange={(event) => void act("set-post-identity", { postAs: event.target.value })}
+      {isChannel && (
+        <section className="channel-settings-section">
+          <h3 className="management-heading">{labels.channelDetails}</h3>
+          <form
+            method="post"
+            className="channel-details-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void act("save-channel-details", {
+                name: channelName.trim(),
+                description: channelDescription.trim()
+              });
+            }}
           >
-            <option value="person">{labels.postAsPerson}</option>
-            <option value="channel">{labels.postAsChannel}</option>
-          </select>
+            <label className="field-label" htmlFor="channel-settings-name">{labels.channelName}</label>
+            <input
+              id="channel-settings-name"
+              className="text-field"
+              value={channelName}
+              maxLength={50}
+              minLength={2}
+              required
+              disabled={currentRole !== "owner" || busy}
+              onChange={(event) => setChannelName(event.target.value)}
+            />
+            <label className="field-label" htmlFor="channel-settings-description">{labels.channelDescription}</label>
+            <textarea
+              id="channel-settings-description"
+              className="text-field channel-description-field"
+              value={channelDescription}
+              maxLength={160}
+              disabled={currentRole !== "owner" || busy}
+              onChange={(event) => setChannelDescription(event.target.value)}
+            />
+            {currentRole === "owner" && <button className="primary-button" type="submit" disabled={busy}>{labels.saveChannelDetails}</button>}
+          </form>
+          {currentRole === "owner" && (
+            <div className="channel-settings-options">
+              <label className="field-label" htmlFor="channel-post-identity">{labels.channelPostIdentity}</label>
+              <select
+                id="channel-post-identity"
+                className="text-field"
+                value={chat.postAs === "channel" ? "channel" : "person"}
+                disabled={busy}
+                onChange={(event) => void act("set-post-identity", { postAs: event.target.value })}
+              >
+                <option value="person">{labels.postAsPerson}</option>
+                <option value="channel">{labels.postAsChannel}</option>
+              </select>
+              <label className="field-label" htmlFor="channel-privacy">{labels.channelPrivacy}</label>
+              <select
+                id="channel-privacy"
+                className="text-field"
+                value={chat.isPrivate ? "private" : "public"}
+                disabled={busy}
+                onChange={(event) => void act("set-channel-privacy", { isPrivate: event.target.value === "private" })}
+              >
+                <option value="public">{labels.publicChannel}</option>
+                <option value="private">{labels.privateChannel}</option>
+              </select>
+            </div>
+          )}
+        </section>
+      )}
+      <section className="channel-settings-section">
+        <h3 className="management-heading">{labels.invitationSettings}</h3>
+        <p className="channel-settings-help">{labels.invitationHelp}</p>
+        {canManage && (
+          <div className="invite-link-management">
+            {chat.inviteUrl
+              ? <input
+                className="text-field"
+                aria-label={labels.inviteLink}
+                readOnly
+                value={`${window.location.origin}${chat.inviteUrl}`}
+                onFocus={(event) => event.currentTarget.select()}
+              />
+              : <span className="management-hint">{labels.noInviteLink}</span>}
+            <div className="invite-link-actions">
+              {chat.inviteUrl && (
+                <button
+                  className="text-button"
+                  type="button"
+                  disabled={busy}
+                  onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(`${window.location.origin}${chat.inviteUrl}`);
+                      document.dispatchEvent(new CustomEvent("polus:notify", { detail: labels.linkCopied }));
+                    } catch (error) {
+                      document.dispatchEvent(new CustomEvent("polus:notify", { detail: error.message }));
+                    }
+                  }}
+                >{labels.copyInviteLink}</button>
+              )}
+              <button
+                className="text-button"
+                type="button"
+                disabled={busy}
+                onClick={() => void act("create-invite-link")}
+              >{chat.inviteUrl ? labels.rotateInviteLink : labels.createInviteLink}</button>
+              {chat.inviteUrl && (
+                <button
+                  className="text-button"
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void act("revoke-invite-link")}
+                >{labels.revokeInviteLink}</button>
+              )}
+            </div>
+          </div>
+        )}
+        {canManage && (
+          <form
+            method="post"
+            className="management-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (username.trim()) void act("invite-member", { username: username.trim().replace(/^@/, "") });
+            }}
+          >
+            <input
+              className="text-field"
+              placeholder={labels.usernamePlaceholder}
+              maxLength={33}
+              required
+              value={username}
+              disabled={busy}
+              onChange={(event) => setUsername(event.target.value)}
+            />
+            <button className="primary-button" type="submit" disabled={busy}>{labels.inviteMember}</button>
+          </form>
+        )}
+      </section>
+      <section className="channel-settings-section">
+        <h3 className="management-heading">{labels.chatMembers} ({members.length})</h3>
+        <div className="management-members">
+          {members.map((member) => (
+            <div className="management-member" key={member.id}>
+              <span className="management-member-copy">
+                <button
+                  className="profile-inline-button management-member-name"
+                  type="button"
+                  onClick={() => document.dispatchEvent(new CustomEvent("polus:open-profile", {
+                    detail: { username: member.username }
+                  }))}
+                >
+                  {member.fullName}
+                </button>
+                <small>@{member.username} · {member.roleLabel}</small>
+              </span>
+              {currentRole === "owner" && member.id !== chat.ownerId && (
+                <button
+                  className="text-button"
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void act("toggle-admin", { memberId: member.id, makeAdmin: member.role !== "admin" })}
+                >
+                  {member.role === "admin" ? labels.removeAdmin : labels.makeAdmin}
+                </button>
+              )}
+              {canManage && member.id !== snapshot.currentUserId && member.role === "member" && (
+                <button
+                  className="text-button"
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void act("remove-member", { memberId: member.id })}
+                >
+                  {labels.remove}
+                </button>
+              )}
+            </div>
+          ))}
         </div>
-      )}
-      {["owner", "admin"].includes(chat.role) && (
-        <form
-          method="post"
-          className="management-form"
-          onSubmit={(event) => {
-            event.preventDefault();
-            if (username.trim()) void act("invite-member", { username: username.trim().replace(/^@/, "") });
-          }}
-        >
-          <input
-            className="text-field"
-            placeholder={labels.usernamePlaceholder}
-            maxLength={33}
-            required
-            value={username}
-            disabled={busy}
-            onChange={(event) => setUsername(event.target.value)}
-          />
-          <button className="primary-button" type="submit" disabled={busy}>{labels.inviteMember}</button>
-        </form>
-      )}
-      <div className="management-actions">
-        {chat.role === "owner"
-          ? <>
+      </section>
+      <section className="channel-settings-section channel-settings-danger">
+        <h3 className="management-heading">{labels.administration}</h3>
+        {currentRole === "owner" && (
+          <>
             <form
               method="post"
-              className="management-form"
+              className="management-form ownership-transfer-form"
               onSubmit={(event) => {
                 event.preventDefault();
                 if (ownerUsername) void act("transfer-ownership", { username: ownerUsername });
@@ -1905,10 +2243,13 @@ function ChatManagementContent() {
               {labels.deleteChat}
             </button>
           </>
-          : <button className="danger-button" type="button" disabled={busy} onClick={() => void act("leave-chat")}>
+        )}
+        {currentRole !== "owner" && (
+          <button className="danger-button" type="button" disabled={busy} onClick={() => void act("leave-chat")}>
             {labels.leaveChat}
-          </button>}
-      </div>
+          </button>
+        )}
+      </section>
     </section>
   );
 }
@@ -1928,6 +2269,7 @@ function Composer() {
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [pendingRecording, setPendingRecording] = useState(null);
   const attachmentInput = useRef(null);
+  const voiceFileInput = useRef(null);
   const textAreaRef = useRef(null);
   const attachmentsRef = useRef([]);
   const uploadControllerRef = useRef(null);
@@ -1945,6 +2287,8 @@ function Composer() {
     ? {
       write: "Написать сообщение", attach: "Прикрепить файлы", placeholder: "Напиши сообщение…",
       send: "Отправить", maxAttachments: "К одному сообщению можно прикрепить не более 10 файлов.",
+      joinChannelPrompt: "Это открытый канал. Вступите, чтобы участвовать в обсуждении.",
+      joinChannel: "Вступить в канал",
       maxFileSize: "Размер файла не должен превышать 100 МБ.", thumbnailFailed: "Не удалось создать миниатюру; оригинал сохранён.",
       replyTo: "Ответ на сообщение", cancelReply: "Отменить ответ", messageUnavailable: "Сообщение удалено",
       recordVoice: "Записать голосовое сообщение",
@@ -1952,13 +2296,17 @@ function Composer() {
       stopRecording: "Остановить запись", cancelRecording: "Отменить запись",
       recordingReady: "Запись готова", sendRecording: "Отправить запись",
       recordingUnavailable: "Запись голоса не поддерживается этим браузером.",
-      recordingSecureContext: "Для записи голоса откройте Полюс по HTTPS. Браузер блокирует микрофон по обычному HTTP-адресу в локальной сети.",
+      recordVoiceHttp: "Записать голосовое сообщение (системная запись или аудиофайл)",
+      audioSelected: "Аудио готово к отправке",
+      audioFileInvalid: "Выберите аудиофайл или запишите голосовое сообщение в диктофоне.",
       recordingPermission: "Нет доступа к микрофону. Проверьте разрешения браузера.",
       recordingEmpty: "Запись не содержит данных."
     }
     : {
       write: "Write a message", attach: "Attach files", placeholder: "Write a message…",
       send: "Send", maxAttachments: "A message can have up to 10 attachments.",
+      joinChannelPrompt: "This is a public channel. Join to participate in the conversation.",
+      joinChannel: "Join channel",
       maxFileSize: "Files cannot exceed 100 MB.", thumbnailFailed: "Unable to create a preview; the original was kept.",
       replyTo: "Replying to", cancelReply: "Cancel reply", messageUnavailable: "Message deleted",
       recordVoice: "Record voice message",
@@ -1966,7 +2314,9 @@ function Composer() {
       stopRecording: "Stop recording", cancelRecording: "Cancel recording",
       recordingReady: "Recording ready", sendRecording: "Send recording",
       recordingUnavailable: "Voice recording is not supported by this browser.",
-      recordingSecureContext: "Open Polus over HTTPS to record voice messages. Browsers block microphone access over regular HTTP on a local network.",
+      recordVoiceHttp: "Record voice message (system recorder or audio file)",
+      audioSelected: "Audio ready to send",
+      audioFileInvalid: "Choose an audio file or record a voice message in your device's recorder.",
       recordingPermission: "Microphone access was denied. Check your browser permissions.",
       recordingEmpty: "The recording is empty."
     };
@@ -2102,6 +2452,36 @@ function Composer() {
     window.setTimeout(() => document.getElementById("composer")?.requestSubmit(), 0);
   }
 
+  function selectVoiceAudio(file) {
+    if (!file) return;
+    const mimeByExtension = {
+      aac: "audio/aac",
+      caf: "audio/x-caf",
+      m4a: "audio/mp4",
+      mp3: "audio/mpeg",
+      oga: "audio/ogg",
+      ogg: "audio/ogg",
+      opus: "audio/ogg",
+      wav: "audio/wav",
+      weba: "audio/webm",
+      webm: "audio/webm",
+      wma: "audio/x-ms-wma",
+      "3gp": "audio/3gpp"
+    };
+    const extension = file.name.split(".").pop()?.toLowerCase() || "";
+    const mimeType = file.type.startsWith("audio/")
+      ? file.type
+      : mimeByExtension[extension];
+    if (!mimeType) {
+      document.dispatchEvent(new CustomEvent("polus:notify", { detail: labels.audioFileInvalid }));
+      return;
+    }
+    const audioFile = file.type === mimeType
+      ? file
+      : new File([file], file.name, { type: mimeType });
+    setPendingRecording({ file: audioFile, duration: 0, fromFile: true });
+  }
+
   function cancelRecording() {
     recordingCancelledRef.current = true;
     setPendingRecording(null);
@@ -2120,12 +2500,8 @@ function Composer() {
   async function startRecording() {
     if (!enabled || submitting || upload.active || recording
       || pendingRecording || attachmentsRef.current.length > 0) return;
-    if (!window.isSecureContext) {
-      document.dispatchEvent(new CustomEvent("polus:notify", { detail: labels.recordingSecureContext }));
-      return;
-    }
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
-      document.dispatchEvent(new CustomEvent("polus:notify", { detail: labels.recordingUnavailable }));
+      voiceFileInput.current?.click();
       return;
     }
     try {
@@ -2188,7 +2564,8 @@ function Composer() {
       recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
       recordingStreamRef.current = null;
       setRecording(false);
-      document.dispatchEvent(new CustomEvent("polus:notify", { detail: labels.recordingPermission }));
+      if (!window.isSecureContext) voiceFileInput.current?.click();
+      else document.dispatchEvent(new CustomEvent("polus:notify", { detail: labels.recordingPermission }));
     }
   }
 
@@ -2397,6 +2774,19 @@ function Composer() {
       hidden={!visible}
       onSubmit={(event) => void submit(event)}
     >
+      {conversation?.type === "channel" && conversation.joined === false && (
+        <div className="channel-preview-join">
+          <p>{labels.joinChannelPrompt}</p>
+          <button
+            type="button"
+            className="primary-button"
+            onClick={() => document.dispatchEvent(new CustomEvent("polus:join-channel", {
+              detail: { channelId: conversation.id }
+            }))}
+          >{labels.joinChannel}</button>
+        </div>
+      )}
+      <div hidden={conversation?.type === "channel" && conversation.joined === false}>
       <AttachmentPreview
         attachments={attachments}
         language={language}
@@ -2412,11 +2802,11 @@ function Composer() {
           </div>
           <div className="recording-copy">
             <strong>{pendingRecording
-              ? labels.recordingReady
+              ? pendingRecording.fromFile ? labels.audioSelected : labels.recordingReady
               : labels.recordingVoice}</strong>
-            <span className="recording-timer">
+            {!pendingRecording?.fromFile && <span className="recording-timer">
               {formatMediaTime(pendingRecording ? pendingRecording.duration : recordingSeconds)}
-            </span>
+            </span>}
           </div>
           <button type="button" className="recording-cancel" onClick={cancelRecording}>
             {labels.cancelRecording}
@@ -2472,11 +2862,23 @@ function Composer() {
             disabled={!enabled || submitting || upload.active || recording || Boolean(pendingRecording)}
             onChange={(event) => void uploadFiles([...(event.currentTarget.files || [])])}
           />
+          <input
+            ref={voiceFileInput}
+            type="file"
+            accept="audio/*"
+            capture="user"
+            hidden
+            disabled={!enabled || submitting || upload.active || recording || Boolean(pendingRecording)}
+            onChange={(event) => {
+              selectVoiceAudio(event.currentTarget.files?.[0]);
+              event.currentTarget.value = "";
+            }}
+          />
           <button
             type="button"
             className="icon-button record-message-button"
             aria-label={labels.recordVoice}
-            title={labels.recordVoice}
+            title={window.isSecureContext ? labels.recordVoice : labels.recordVoiceHttp}
             disabled={!enabled || submitting || upload.active || recording || Boolean(pendingRecording) || attachments.length > 0}
             onClick={() => void startRecording()}
           >
@@ -2530,6 +2932,7 @@ function Composer() {
           </svg>
           <span className="visually-hidden">{labels.send}</span>
         </button>
+      </div>
       </div>
     </form>
   );
@@ -3021,6 +3424,227 @@ function ProfileSettingsPage({ user, onBack, onUserUpdate }) {
   );
 }
 
+function ChannelProfilePage({ channelId, onBack, onOpenChat }) {
+  const language = useCurrentLanguage();
+  const russian = language === "ru";
+  const [profile, setProfile] = useState(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    requestJson(`/api/channels/${encodeURIComponent(channelId)}/profile`)
+      .then((response) => {
+        if (!active) return;
+        if (response.chat.joined) {
+          onOpenChat(response.chat, { replaceHistory: true });
+          return;
+        }
+        setProfile(response);
+      })
+      .catch((cause) => { if (active) setError(cause.message); });
+    return () => { active = false; };
+  }, [channelId, onOpenChat]);
+
+  const openOrJoin = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const conversation = await requestJson(`/api/channels/${encodeURIComponent(channelId)}/join`, {
+        method: "POST"
+      });
+      onOpenChat(conversation);
+    } catch (cause) {
+      setError(cause.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <main className="community-page">
+      <header className="community-page-header">
+        <button className="icon-button profile-page-back" type="button" onClick={onBack}>
+          <span aria-hidden="true">←</span>{russian ? "Назад" : "Back"}
+        </button>
+        <h1>{russian ? "Профиль канала" : "Channel profile"}</h1>
+      </header>
+      {error && <div className="form-error" role="alert">{error}</div>}
+      {!profile && !error && <p className="community-page-loading">{russian ? "Загрузка…" : "Loading…"}</p>}
+      {profile && (
+        <section className="community-profile-card">
+          <span className="community-profile-icon" aria-hidden="true">#</span>
+          <h2>{profile.chat.name}</h2>
+          <p className="community-member-count">
+            {profile.memberCount} {russian ? "участников" : "members"}
+          </p>
+          {profile.chat.description && <p className="community-description">{profile.chat.description}</p>}
+          <button className="primary-button" type="button" disabled={busy} onClick={() => void openOrJoin()}>
+            {russian ? "Вступить в канал" : "Join channel"}
+          </button>
+        </section>
+      )}
+    </main>
+  );
+}
+
+function ChannelSettingsPage({ channelId, onBack, onProfile }) {
+  const language = useCurrentLanguage();
+  const russian = language === "ru";
+  const [chat, setChat] = useState(null);
+  const [loadError, setLoadError] = useState("");
+
+  useEffect(() => {
+    const onManagement = (event) => {
+      const detail = event.detail;
+      const currentRole = detail?.members?.find((member) => member.id === detail.currentUserId)?.role;
+      setChat(detail?.chat ? { ...detail.chat, role: currentRole || "member" } : null);
+    };
+    setLoadError("");
+    document.addEventListener("polus:chat-management-changed", onManagement);
+    let active = true;
+    Promise.all([
+      requestJson(`/api/chats/${encodeURIComponent(channelId)}`),
+      requestJson("/api/auth/me")
+    ]).then(([management, { user: currentUser }]) => {
+      if (!active) return;
+      const roleLabels = {
+        owner: russian ? "Владелец" : "Owner",
+        admin: russian ? "Администратор" : "Administrator",
+        member: russian ? "Участник" : "Member"
+      };
+      const currentRole = management.members.find((member) => member.id === currentUser.id)?.role || "member";
+      document.dispatchEvent(new CustomEvent("polus:chat-management-changed", {
+        detail: {
+          ...management,
+          chat: { ...management.chat, role: currentRole, inviteUrl: management.inviteUrl },
+          members: management.members.map((member) => ({
+            ...member,
+            roleLabel: roleLabels[member.role] || member.role
+          })),
+          currentUserId: currentUser.id,
+          labels: {
+            chatMembers: russian ? "Участники чата" : "Chat members",
+            makeAdmin: russian ? "Назначить администратором" : "Make administrator",
+            removeAdmin: russian ? "Снять администратора" : "Remove administrator",
+            remove: russian ? "Удалить" : "Remove",
+            channelPostIdentity: russian ? "Публиковать сообщения от имени" : "Post messages as",
+            channelPrivacy: russian ? "Приватность канала" : "Channel privacy",
+            channelDetails: russian ? "Основная информация" : "Channel details",
+            channelName: russian ? "Название канала" : "Channel name",
+            channelDescription: russian ? "Описание канала" : "Channel description",
+            saveChannelDetails: russian ? "Сохранить изменения" : "Save changes",
+            invitationSettings: russian ? "Приглашения" : "Invitations",
+            invitationHelp: russian
+              ? "Создайте ссылку или добавьте участника по имени пользователя."
+              : "Create an invite link or add a member by username.",
+            noInviteLink: russian ? "Пригласительная ссылка ещё не создана." : "No invite link has been created yet.",
+            rotateInviteLink: russian ? "Обновить ссылку" : "Refresh link",
+            administration: russian ? "Управление каналом" : "Channel administration",
+            publicChannel: russian ? "Публичный — отображается в списке каналов" : "Public — shown in the channel list",
+            privateChannel: russian ? "Частный — доступен только по ссылке" : "Private — available only by invite link",
+            inviteLink: russian ? "Пригласительная ссылка" : "Invite link",
+            createInviteLink: russian ? "Создать ссылку" : "Create link",
+            copyInviteLink: russian ? "Скопировать ссылку" : "Copy link",
+            revokeInviteLink: russian ? "Отозвать ссылку" : "Revoke link",
+            postAsPerson: russian ? "Автора" : "Author",
+            postAsChannel: russian ? "Канала" : "Channel",
+            usernamePlaceholder: "@username",
+            inviteMember: russian ? "Добавить участника" : "Add member",
+            transferOwnership: russian ? "Передать владение" : "Transfer ownership",
+            deleteChat: russian ? "Удалить чат" : "Delete chat",
+            leaveChat: russian ? "Покинуть чат" : "Leave chat"
+          }
+        }
+      }));
+    }).catch((error) => {
+      if (active) setLoadError(error.message);
+    });
+    return () => {
+      active = false;
+      document.removeEventListener("polus:chat-management-changed", onManagement);
+    };
+  }, [channelId, russian]);
+
+  return (
+    <main className="community-page channel-settings-page">
+      <header className="community-page-header">
+        <button className="icon-button profile-page-back" type="button" onClick={onBack}>
+          <span aria-hidden="true">←</span>{russian ? "Назад" : "Back"}
+        </button>
+        <h1>{russian ? "Настройки канала" : "Channel settings"}</h1>
+        <button className="text-button" type="button" onClick={onProfile}>
+          {russian ? "Профиль канала" : "Channel profile"}
+        </button>
+      </header>
+      <div className="channel-settings-content">
+        {loadError && <div className="form-error" role="alert">{loadError}</div>}
+        {chat && (
+          <div className="channel-settings-identity">
+            <span className="community-profile-icon" aria-hidden="true">#</span>
+            <div>
+              <h2>{chat.name}</h2>
+              <p>{chat.description || (russian ? "Управление каналом и участниками." : "Manage your channel and members.")}</p>
+              {!["owner", "admin"].includes(chat.role) && (
+                <p className="channel-settings-permission-note">
+                  {russian
+                    ? "Изменять настройки могут только владелец и администраторы канала."
+                    : "Only the channel owner and administrators can change settings."}
+                </p>
+              )}
+            </div>
+          </div>
+        )}
+        <ChatManagementContent />
+      </div>
+    </main>
+  );
+}
+
+function InviteLandingPage({ token, onBack, onOpenChat }) {
+  const language = useCurrentLanguage();
+  const russian = language === "ru";
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const join = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const conversation = await requestJson(`/api/invites/${encodeURIComponent(token)}/join`, { method: "POST" });
+      onOpenChat(conversation);
+    } catch (cause) {
+      setError(cause.status === 404
+        ? translations[language].inviteNotFound
+        : cause.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <main className="community-page">
+      <header className="community-page-header">
+        <button className="icon-button profile-page-back" type="button" onClick={onBack}>
+          <span aria-hidden="true">←</span>{russian ? "Назад" : "Back"}
+        </button>
+        <h1>{russian ? "Приглашение в Полюс" : "Polus invitation"}</h1>
+      </header>
+      <section className="community-profile-card invite-landing-card">
+        <span className="community-profile-icon" aria-hidden="true">↗</span>
+        <h2>{russian ? "Вас пригласили в чат" : "You’ve been invited to a chat"}</h2>
+        <p className="community-description">
+          {russian ? "Присоединитесь, чтобы открыть переписку." : "Join to open the conversation."}
+        </p>
+        {error && <div className="form-error" role="alert">{error}</div>}
+        <button className="primary-button" type="button" disabled={busy} onClick={() => void join()}>
+          {russian ? "Присоединиться" : "Join"}
+        </button>
+      </section>
+    </main>
+  );
+}
+
 function MediaViewer() {
   const [snapshot, setSnapshot] = useState({ items: [], index: 0 });
   const language = useCurrentLanguage();
@@ -3123,7 +3747,8 @@ function CreateChannelForm() {
         const data = new FormData(event.currentTarget);
         void request.submit(event, {
           name: String(data.get("name") || "").trim(),
-          description: String(data.get("description") || "").trim()
+          description: String(data.get("description") || "").trim(),
+          isPrivate: data.get("isPrivate") === "on"
         });
       }}
     >
@@ -3131,11 +3756,67 @@ function CreateChannelForm() {
       <input id="channel-name" name="name" className="text-field" maxLength={50} required disabled={request.submitting} />
       <label className="field-label" htmlFor="channel-description">{language === "ru" ? "Описание" : "Description"}</label>
       <input id="channel-description" name="description" className="text-field" maxLength={160} disabled={request.submitting} />
+      <label className="channel-privacy-choice">
+        <input type="checkbox" name="isPrivate" disabled={request.submitting} />
+        <span>{language === "ru" ? "Частный канал — виден только по пригласительной ссылке" : "Private channel — visible only by invite link"}</span>
+      </label>
       <FormError id="channel-error" />
       <button className="primary-button" type="submit" disabled={request.submitting}>
         {language === "ru" ? "Создать" : "Create"}
       </button>
     </form>
+  );
+}
+
+function ChatDeleteDialog() {
+  const [conversation, setConversation] = useState(null);
+  const language = useCurrentLanguage();
+  const text = translations[language];
+  const dialogRef = useRef(null);
+
+  useLayoutEffect(() => {
+    const show = (event) => {
+      setConversation(event.detail.conversation);
+      if (!dialogRef.current?.open) dialogRef.current?.showModal();
+    };
+    const onClose = () => setConversation(null);
+    document.addEventListener("polus:chat-delete-request", show);
+    dialogRef.current?.addEventListener("close", onClose);
+    return () => {
+      document.removeEventListener("polus:chat-delete-request", show);
+      dialogRef.current?.removeEventListener("close", onClose);
+    };
+  }, []);
+
+  const confirmDelete = (scope) => {
+    if (!conversation) return;
+    document.dispatchEvent(new CustomEvent("polus:chat-delete", {
+      detail: { conversationId: conversation.id, scope }
+    }));
+    dialogRef.current?.close();
+  };
+  const canDeleteForEveryone = conversation?.type === "direct" || conversation?.role === "owner";
+
+  return (
+    <dialog ref={dialogRef} id="chat-delete-dialog" className="dialog chat-delete-dialog">
+      <form method="dialog" className="dialog-top">
+        <h2>{text.deleteChatTitle}</h2>
+        <button className="icon-button dialog-close" value="cancel" aria-label={text.cancel}>×</button>
+      </form>
+      <div className="chat-delete-actions">
+        <button className="primary-button" type="button" onClick={() => confirmDelete("me")}>
+          {text.deleteForMe}
+        </button>
+        {canDeleteForEveryone && (
+          <button className="danger-button" type="button" onClick={() => confirmDelete("everyone")}>
+            {text.deleteForEveryone}
+          </button>
+        )}
+        <button className="text-button" type="button" onClick={() => dialogRef.current?.close()}>
+          {text.cancel}
+        </button>
+      </div>
+    </dialog>
   );
 }
 
@@ -3171,7 +3852,7 @@ function CreateGroupForm() {
   );
 }
 
-function ReactDialogs() {
+function ReactDialogs({ user }) {
   const language = useCurrentLanguage();
   useLayoutEffect(() => {
     const show = (id) => {
@@ -3246,6 +3927,7 @@ function ReactDialogs() {
       </dialog>
 
       <SettingsDialog />
+      <PushOnboardingDialog user={user} />
     </>
   );
 }
@@ -3257,6 +3939,12 @@ function MessengerShell({ user, onSignOut }) {
   const mobileSwipeStartRef = useRef(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [profilePage, setProfilePage] = useState(() => window.location.pathname === "/profile");
+  const [channelProfileId, setChannelProfileId] = useState(() =>
+    /^\/channels\/([^/]+)$/.exec(window.location.pathname)?.[1] || null);
+  const [channelSettingsId, setChannelSettingsId] = useState(() =>
+    /^\/channels\/([^/]+)\/settings$/.exec(window.location.pathname)?.[1] || null);
+  const [inviteToken, setInviteToken] = useState(() =>
+    /^\/join\/([^/]+)$/.exec(window.location.pathname)?.[1] || null);
   const [profileUser, setProfileUser] = useState(user);
   const updateProfileUser = useCallback((updatedUser) => setProfileUser(updatedUser), []);
   const closeMobileChat = () => document.getElementById("messenger-view")?.classList.remove("chat-open");
@@ -3292,6 +3980,7 @@ function MessengerShell({ user, onSignOut }) {
     let eventStream = null;
     let presenceTimer = null;
     let currentConversation = null;
+    let activeChannelSettingsId = /^\/channels\/([^/]+)\/settings$/.exec(window.location.pathname)?.[1] || null;
     const viewingClientId = (() => {
       try {
         let clientId = sessionStorage.getItem("polus-viewing-client");
@@ -3331,23 +4020,114 @@ function MessengerShell({ user, onSignOut }) {
     const handleOpenProfilePage = () => {
       setMenuOpen(false);
       if (window.location.pathname !== "/profile") {
-        window.history.pushState({ polusProfilePage: true }, "", "/profile");
+        window.history.pushState({ polusPage: true, polusProfilePage: true }, "", "/profile");
       }
       setProfilePage(true);
+      setChannelProfileId(null);
+      setInviteToken(null);
       window.setTimeout(() => void reportChatViewingState(), 0);
     };
-    const handleProfileBack = () => {
-      if (window.history.state?.polusProfilePage) {
+    const handleOpenChannelProfile = (event) => {
+      const channelId = event.detail?.channelId;
+      if (!channelId) return;
+      window.history.pushState({ polusPage: true }, "", `/channels/${encodeURIComponent(channelId)}`);
+      setProfilePage(false);
+      setChannelProfileId(channelId);
+      setChannelSettingsId(null);
+      setInviteToken(null);
+      window.setTimeout(() => void reportChatViewingState(), 0);
+    };
+    const handleOpenChannelSettings = (event) => {
+      const channelId = event.detail?.channelId;
+      if (!channelId) return;
+      activeChannelSettingsId = channelId;
+      document.dispatchEvent(new CustomEvent("polus:close-dialog", {
+        detail: { id: "chat-info-dialog" }
+      }));
+      window.history.pushState({ polusPage: true }, "", `/channels/${encodeURIComponent(channelId)}/settings`);
+      setProfilePage(false);
+      setChannelProfileId(null);
+      setChannelSettingsId(channelId);
+      setInviteToken(null);
+      window.setTimeout(() => void reportChatViewingState(), 0);
+    };
+    const openChannelChat = async (channelId, openInfo = false) => {
+      try {
+        let conversation = currentConversation?.id === channelId && currentConversation.joined !== false
+          ? currentConversation
+          : null;
+        if (!conversation) {
+          const bootstrap = await requestJson("/api/bootstrap");
+          conversation = bootstrap.channels.find((channel) =>
+            channel.id === channelId && channel.joined !== false
+          );
+        }
+        if (!conversation) throw new Error("Channel not found.");
+        activeChannelSettingsId = null;
+        window.history.replaceState({}, "", "/");
+        setProfilePage(false);
+        setChannelProfileId(null);
+        setChannelSettingsId(null);
+        setInviteToken(null);
+        document.dispatchEvent(new CustomEvent("polus:open-conversation", { detail: { conversation } }));
+        if (openInfo) document.dispatchEvent(new CustomEvent("polus:chat-info"));
+        window.setTimeout(() => void reportChatViewingState(), 0);
+      } catch (cause) {
+        document.dispatchEvent(new CustomEvent("polus:notify", { detail: cause.message }));
+      }
+    };
+    const handleChannelSettingsProfile = (event) => {
+      const channelId = event.detail?.channelId || activeChannelSettingsId;
+      if (channelId) void openChannelChat(channelId, true);
+    };
+    const handleProfileBack = (event) => {
+      const channelId = event.detail?.channelId || activeChannelSettingsId;
+      if (channelId) {
+        if (window.history.state?.polusPage
+          && window.location.pathname === `/channels/${encodeURIComponent(channelId)}/settings`) {
+          window.history.back();
+        } else {
+          void openChannelChat(channelId);
+        }
+        return;
+      }
+      if (window.history.state?.polusPage || window.history.state?.polusProfilePage) {
         window.history.back();
       } else {
         window.history.replaceState({}, "", "/");
         setProfilePage(false);
+        setChannelProfileId(null);
+        setChannelSettingsId(null);
+        setInviteToken(null);
       }
     };
+    const handleOpenPageChat = (event) => {
+      const conversation = event.detail?.conversation;
+      if (!conversation) return;
+      activeChannelSettingsId = null;
+      if (event.detail.replaceHistory) {
+        window.history.replaceState({}, "", "/");
+      } else {
+        window.history.pushState({}, "", "/");
+      }
+      setProfilePage(false);
+      setChannelProfileId(null);
+      setChannelSettingsId(null);
+      setInviteToken(null);
+      document.dispatchEvent(new CustomEvent("polus:open-conversation", { detail: { conversation } }));
+    };
     const handlePopState = () => {
-      const showingProfile = window.location.pathname === "/profile";
-      setProfilePage(showingProfile);
-      if (!showingProfile) {
+      const pathname = window.location.pathname;
+      const settingsChannelId = activeChannelSettingsId;
+      setProfilePage(pathname === "/profile");
+      setChannelProfileId(/^\/channels\/([^/]+)$/.exec(pathname)?.[1] || null);
+      setChannelSettingsId(/^\/channels\/([^/]+)\/settings$/.exec(pathname)?.[1] || null);
+      setInviteToken(/^\/join\/([^/]+)$/.exec(pathname)?.[1] || null);
+      if (!/^\/channels\/[^/]+\/settings$/.test(pathname)) activeChannelSettingsId = null;
+      if (pathname === "/") {
+        if (settingsChannelId && currentConversation?.id !== settingsChannelId) {
+          void openChannelChat(settingsChannelId);
+        }
         window.setTimeout(() => void reportChatViewingState(), 0);
       }
     };
@@ -3450,6 +4230,11 @@ function MessengerShell({ user, onSignOut }) {
         const conversation = await requestJson(endpoint, {
           method: "POST",
           body: JSON.stringify(event.detail.values)
+        });
+        await new Promise((resolve, reject) => {
+          document.dispatchEvent(new CustomEvent("polus:refresh-messenger-state", {
+            detail: { resolve, reject }
+          }));
         });
         document.dispatchEvent(new CustomEvent("polus:open-conversation", { detail: { conversation } }));
         document.dispatchEvent(new CustomEvent("polus:notify", {
@@ -3563,6 +4348,10 @@ function MessengerShell({ user, onSignOut }) {
     document.addEventListener("polus:open-profile-settings", handleOpenProfilePage);
     document.addEventListener("polus:open-own-profile", handleOpenProfilePage);
     document.addEventListener("polus:profile-page-back", handleProfileBack);
+    document.addEventListener("polus:channel-settings-profile", handleChannelSettingsProfile);
+    document.addEventListener("polus:open-channel-profile", handleOpenChannelProfile);
+    document.addEventListener("polus:open-channel-settings", handleOpenChannelSettings);
+    document.addEventListener("polus:page-open-chat", handleOpenPageChat);
     document.addEventListener("polus:realtime-message", handleRealtimeMessageSound);
     window.addEventListener("popstate", handlePopState);
     document.addEventListener("polus:composer-state", handlePresenceConversation);
@@ -3577,12 +4366,7 @@ function MessengerShell({ user, onSignOut }) {
     document.addEventListener("polus:save-profile", handleSaveProfile);
     document.addEventListener("polus:edit-message", handleEditMessage);
     document.addEventListener("polus:delete-message", handleDeleteMessage);
-    import("./messengerController.js")
-      .then(({ initializeMessenger }) => {
-        if (!active) return;
-        disposeController = initializeMessenger();
-      })
-      .catch((cause) => onSignOut(cause.message));
+    disposeController = initializeMessenger();
     return () => {
       active = false;
       clearInterval(presenceTimer);
@@ -3594,6 +4378,10 @@ function MessengerShell({ user, onSignOut }) {
       document.removeEventListener("polus:open-profile-settings", handleOpenProfilePage);
       document.removeEventListener("polus:open-own-profile", handleOpenProfilePage);
       document.removeEventListener("polus:profile-page-back", handleProfileBack);
+      document.removeEventListener("polus:channel-settings-profile", handleChannelSettingsProfile);
+      document.removeEventListener("polus:open-channel-profile", handleOpenChannelProfile);
+      document.removeEventListener("polus:open-channel-settings", handleOpenChannelSettings);
+      document.removeEventListener("polus:page-open-chat", handleOpenPageChat);
       document.removeEventListener("polus:realtime-message", handleRealtimeMessageSound);
       window.removeEventListener("popstate", handlePopState);
       document.removeEventListener("polus:composer-state", handlePresenceConversation);
@@ -3619,7 +4407,9 @@ function MessengerShell({ user, onSignOut }) {
 
   return (
     <>
-    <main id="messenger-view" className="messenger-shell" hidden={profilePage}>
+    <main id="messenger-view" className="messenger-shell" hidden={
+      profilePage || Boolean(channelProfileId) || Boolean(channelSettingsId) || Boolean(inviteToken)
+    }>
       <aside id="chat-sidebar" className="sidebar">
         <header className="sidebar-header">
           <button
@@ -3681,7 +4471,8 @@ function MessengerShell({ user, onSignOut }) {
         <MessageContextMenu />
         <ToastNotice />
         <Composer />
-        <ReactDialogs />
+        <ReactDialogs user={user} />
+        <ChatDeleteDialog />
       </section>
     </main>
     {profilePage && (
@@ -3689,6 +4480,35 @@ function MessengerShell({ user, onSignOut }) {
         user={profileUser}
         onBack={() => document.dispatchEvent(new CustomEvent("polus:profile-page-back"))}
         onUserUpdate={updateProfileUser}
+      />
+    )}
+    {channelProfileId && (
+      <ChannelProfilePage
+        channelId={channelProfileId}
+        onBack={() => document.dispatchEvent(new CustomEvent("polus:profile-page-back"))}
+        onOpenChat={(conversation, options = {}) => document.dispatchEvent(new CustomEvent("polus:page-open-chat", {
+          detail: { conversation, ...options }
+        }))}
+      />
+    )}
+    {channelSettingsId && (
+      <ChannelSettingsPage
+        channelId={channelSettingsId}
+        onBack={() => document.dispatchEvent(new CustomEvent("polus:profile-page-back", {
+          detail: { channelId: channelSettingsId }
+        }))}
+        onProfile={() => document.dispatchEvent(new CustomEvent("polus:channel-settings-profile", {
+          detail: { channelId: channelSettingsId }
+        }))}
+      />
+    )}
+    {inviteToken && (
+      <InviteLandingPage
+        token={inviteToken}
+        onBack={() => document.dispatchEvent(new CustomEvent("polus:profile-page-back"))}
+        onOpenChat={(conversation) => document.dispatchEvent(new CustomEvent("polus:page-open-chat", {
+          detail: { conversation }
+        }))}
       />
     )}
     </>

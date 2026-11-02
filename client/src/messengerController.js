@@ -80,6 +80,15 @@ const translations = {
     manageChat: "Управление чатом", chatMembers: "Участники чата", inviteMember: "Добавить участника",
     channelPostIdentity: "Публиковать сообщения от имени",
     postAsChannel: "Канала", postAsPerson: "Автора", postIdentitySaved: "Режим публикации обновлён.",
+    channelPrivacy: "Приватность канала", publicChannel: "Публичный — отображается в списке каналов",
+    privateChannel: "Частный — доступен только по ссылке", inviteLink: "Пригласительная ссылка",
+    channelDetails: "Основная информация", channelName: "Название канала",
+    channelDescription: "Описание канала", saveChannelDetails: "Сохранить изменения",
+    invitationSettings: "Приглашения", invitationHelp: "Создайте ссылку или добавьте участника по имени пользователя.",
+    noInviteLink: "Пригласительная ссылка ещё не создана.",
+    rotateInviteLink: "Обновить ссылку", administration: "Управление каналом",
+    createInviteLink: "Создать ссылку", copyInviteLink: "Скопировать ссылку",
+    revokeInviteLink: "Отозвать ссылку", linkCopied: "Ссылка скопирована",
     usernamePlaceholder: "@username", makeAdmin: "Назначить администратором", removeAdmin: "Снять администратора",
     transferOwnership: "Передать владение", leaveChat: "Покинуть чат", deleteChat: "Удалить чат",
     roleOwner: "Владелец", roleAdmin: "Администратор", roleMember: "Участник",
@@ -99,6 +108,7 @@ const translations = {
     unmuted: "Уведомления включены", blockUser: "Заблокировать", unblockUser: "Разблокировать",
     writeToUser: "Написать", muteChat: "Отключить уведомления", unmuteChat: "Включить уведомления",
     sharedChats: "Общие группы и каналы", sharedMedia: "Общие медиа",
+    channelSettings: "Настройки канала",
     tabMembers: "Участники", tabMedia: "Медиа", tabFiles: "Файлы", tabLinks: "Ссылки", preview: "Миниатюра",
     openMessage: "Перейти к сообщению", searchPromptChat: "Введите текст для поиска",
     noResults: "Ничего не найдено", download: "Скачать", cancelUpload: "Отменить загрузку",
@@ -164,6 +174,15 @@ const translations = {
     manageChat: "Manage chat", chatMembers: "Chat members", inviteMember: "Add member",
     channelPostIdentity: "Post messages as",
     postAsChannel: "Channel", postAsPerson: "Author", postIdentitySaved: "Posting identity updated.",
+    channelPrivacy: "Channel privacy", publicChannel: "Public — shown in the channel list",
+    privateChannel: "Private — available only by invite link", inviteLink: "Invite link",
+    channelDetails: "Channel details", channelName: "Channel name",
+    channelDescription: "Channel description", saveChannelDetails: "Save changes",
+    invitationSettings: "Invitations", invitationHelp: "Create an invite link or add a member by username.",
+    noInviteLink: "No invite link has been created yet.",
+    rotateInviteLink: "Refresh link", administration: "Channel administration",
+    createInviteLink: "Create link", copyInviteLink: "Copy link",
+    revokeInviteLink: "Revoke link", linkCopied: "Link copied",
     usernamePlaceholder: "@username", makeAdmin: "Make administrator", removeAdmin: "Remove administrator",
     transferOwnership: "Transfer ownership", leaveChat: "Leave chat", deleteChat: "Delete chat",
     roleOwner: "Owner", roleAdmin: "Administrator", roleMember: "Member",
@@ -183,6 +202,7 @@ const translations = {
     unmuted: "Notifications enabled", blockUser: "Block", unblockUser: "Unblock",
     writeToUser: "Message", muteChat: "Mute notifications", unmuteChat: "Unmute notifications",
     sharedChats: "Shared groups and channels", sharedMedia: "Shared media",
+    channelSettings: "Channel settings",
     tabMembers: "Members", tabMedia: "Media", tabFiles: "Files", tabLinks: "Links", preview: "Preview",
     openMessage: "Go to message", searchPromptChat: "Enter text to search",
     noResults: "No results found", download: "Download", cancelUpload: "Cancel upload",
@@ -191,8 +211,8 @@ const translations = {
   }
 };
 
-const messengerView = document.querySelector("#messenger-view");
-const messageList = document.querySelector("#message-list");
+let messengerView = null;
+let messageList = null;
 const openDialogIds = new Set();
 const controllerListeners = [];
 let controllerInitialized = false;
@@ -400,15 +420,17 @@ function handleMessageContextMenu(event) {
   const ownMessage = message.authorId === currentUser.id || message.author?.id === currentUser.id;
   const canModerate = ["channel", "group"].includes(currentConversation.type)
     && ["owner", "admin"].includes(currentConversation.role);
-  const canEdit = ownMessage && Date.now() - Date.parse(message.createdAt || message.sentAt) <= 48 * 60 * 60 * 1000;
-  const canDelete = ownMessage || canModerate;
+  const canEdit = currentConversation.joined !== false && ownMessage
+    && Date.now() - Date.parse(message.createdAt || message.sentAt) <= 48 * 60 * 60 * 1000;
+  const canDelete = currentConversation.joined !== false && (ownMessage || canModerate);
   const canSave = currentConversation.type !== "saved";
-  const canReply = true;
+  const canReply = currentConversation.joined !== false
+    && (currentConversation.type !== "channel" || canModerate);
   const canForward = true;
   if (!canEdit && !canDelete && !canSave && !canReply && !canForward) return;
   event.preventDefault();
   openMessageContextMenu(event.clientX, event.clientY, message, {
-    canEdit, canDelete, canSave, canReply, canForward, canReact: true
+    canEdit, canDelete, canSave, canReply, canForward, canReact: currentConversation.joined !== false
   });
 }
 
@@ -450,10 +472,21 @@ function updateConversationHeader(conversation) {
   window.dispatchEvent(new CustomEvent("polus:conversation-header-changed", {
     detail: { conversation, language }
   }));
+  if (!conversation) {
+    document.dispatchEvent(new CustomEvent("polus:composer-state", {
+      detail: { visible: true, enabled: false, conversation: null }
+    }));
+    return;
+  }
   const canPost = conversation.type !== "channel"
-    || ["owner", "admin"].includes(conversation.role);
+    || conversation.joined !== false && ["owner", "admin"].includes(conversation.role);
+  const isChannelPreview = conversation.type === "channel" && conversation.joined === false;
   document.dispatchEvent(new CustomEvent("polus:composer-state", {
-    detail: { visible: canPost, enabled: canPost, conversation }
+    detail: {
+      visible: canPost || isChannelPreview,
+      enabled: canPost,
+      conversation
+    }
   }));
 }
 
@@ -464,7 +497,7 @@ async function openChatInfo(tab = currentInfoTab) {
   const conversation = currentConversation;
   const tabs = [
     "media",
-    ...(conversation.joined ? ["files"] : []),
+    ...(conversation.joined !== false ? ["files"] : []),
     "links"
   ];
   const selectedTab = tabs.includes(tab) ? tab : tabs[0];
@@ -481,7 +514,11 @@ async function openChatInfo(tab = currentInfoTab) {
     return;
   }
   if (requestId !== chatInfoRequestId || currentConversation?.id !== conversation.id) return;
-  await openChatManagement();
+  if (conversation.type === "channel") {
+    document.dispatchEvent(new CustomEvent("polus:chat-management-changed", { detail: null }));
+  } else {
+    await openChatManagement();
+  }
   if (requestId !== chatInfoRequestId || currentConversation?.id !== conversation.id) return;
   chatInfoState = { conversation, tabs, responses: tabResponses, selectedTab, loadingMore: false };
   publishChatInfo();
@@ -511,6 +548,11 @@ function publishChatInfo() {
       avatarUrl: conversation.avatarUrl || null,
       description: conversation.description || "",
       memberCount: conversation.memberIds?.length || 0,
+      canManageChannel: conversation.type === "channel"
+        && (["owner", "admin"].includes(conversation.role)
+          || conversation.ownerId === currentUser?.id
+          || conversation.createdBy === currentUser?.id
+          || conversation.adminIds?.includes(currentUser?.id)),
       selectedTab,
       tabs: tabs.map((kind) => ({
         kind,
@@ -524,6 +566,8 @@ function publishChatInfo() {
       loadingMore,
       labels: {
         members: t("tabMembers"),
+        memberCountUnit: t("members"),
+        channelSettings: t("channelSettings"),
         media: t("tabMedia"),
         files: t("tabFiles"),
         links: t("tabLinks"),
@@ -660,6 +704,7 @@ async function openUserProfile(username) {
 
 async function markConversationRead(conversation) {
   if (conversation.type === "saved" || conversation.pending || document.visibilityState !== "visible"
+    || conversation.type === "channel" && conversation.joined === false
     || currentConversation?.id !== conversation.id || !isMessageListAtBottom()) return;
   const latestDisplayedId = messages.at(-1)?.id || 0;
   if (!conversation.unreadCount && latestDisplayedId <= (conversation.lastReadMessageId || 0)) return;
@@ -681,15 +726,6 @@ function isMessageListAtBottom() {
 
 async function openConversation(conversation) {
   messengerView.classList.add("chat-open");
-  if (!conversation.joined && conversation.type === "channel") {
-    try {
-      conversation = await api(`/api/channels/${encodeURIComponent(conversation.id)}/join`, { method: "POST" });
-      channels = channels.map((channel) => channel.id === conversation.id ? conversation : channel);
-    } catch (error) {
-      notify(localizeError(error.message));
-      return;
-    }
-  }
   currentConversation = conversation;
   messages = [];
   olderMessagesCursor = null;
@@ -846,16 +882,17 @@ async function receiveMessage(message) {
     renderMessages(wasAtBottom ? {} : { keepScrollTop: true, previousTop, previousHeight });
     if (wasAtBottom) {
       void markConversationRead(conversation);
-    } else if (conversation.type !== "saved" && message.authorId !== currentUser.id) {
+    } else if (conversation.type !== "saved" && conversation.joined !== false
+      && message.authorId !== currentUser.id) {
       conversation.unreadCount = (conversation.unreadCount || 0) + 1;
       renderConversations();
     }
   } else {
     const incoming = message.authorId !== currentUser.id;
-    if (conversation.type !== "saved" && incoming && !fetchedConversation) {
+    if (conversation.type !== "saved" && conversation.joined !== false && incoming && !fetchedConversation) {
       conversation.unreadCount = (conversation.unreadCount || 0) + 1;
     }
-    if (conversation.type !== "saved" && incoming) {
+    if (conversation.type !== "saved" && conversation.joined !== false && incoming) {
       notify(`${t("messageArrived")} @${message.author.username}`);
     }
     renderConversations();
@@ -881,9 +918,7 @@ async function refreshMessengerState() {
     currentConversation = null;
     messengerView.classList.remove("chat-open");
     messages = [];
-    document.dispatchEvent(new CustomEvent("polus:composer-state", {
-      detail: { visible: true, enabled: false, conversation: null }
-    }));
+    updateConversationHeader(null);
     closeDialog("chat-info-dialog");
     const target = new URL(window.location.href);
     target.searchParams.delete("conversation");
@@ -972,18 +1007,19 @@ function applyMessageMutation(message) {
   }
 }
 
-async function openChatManagement() {
-  const selectedChat = currentConversation;
-  if (!selectedChat || !["channel", "group"].includes(selectedChat.type) || selectedChat.pending) {
+async function openChatManagement(chatId = currentConversation?.id, requireCurrent = true) {
+  const selectedChat = getConversation(chatId);
+  if (!chatId || (requireCurrent
+    && (!selectedChat || !["channel", "group"].includes(selectedChat.type) || selectedChat.pending))) {
     document.dispatchEvent(new CustomEvent("polus:chat-management-changed", { detail: null }));
     return;
   }
   try {
-    const { chat, members: chatMembers } = await api(`/api/chats/${encodeURIComponent(selectedChat.id)}`);
-    if (currentConversation?.id !== selectedChat.id) return;
+    const { chat, inviteUrl, members: chatMembers } = await api(`/api/chats/${encodeURIComponent(chatId)}`);
+    if (requireCurrent && currentConversation?.id !== chatId) return;
     document.dispatchEvent(new CustomEvent("polus:chat-management-changed", {
       detail: {
-        chat,
+        chat: { ...chat, inviteUrl },
         members: chatMembers.map((member) => ({
           ...member,
           roleLabel: t(`role${member.role[0].toUpperCase()}${member.role.slice(1)}`)
@@ -995,10 +1031,26 @@ async function openChatManagement() {
           removeAdmin: t("removeAdmin"),
           remove: t("remove"),
           channelPostIdentity: t("channelPostIdentity"),
+          channelPrivacy: t("channelPrivacy"),
+          publicChannel: t("publicChannel"),
+          privateChannel: t("privateChannel"),
+          inviteLink: t("inviteLink"),
+          createInviteLink: t("createInviteLink"),
+          copyInviteLink: t("copyInviteLink"),
+          revokeInviteLink: t("revokeInviteLink"),
           postAsPerson: t("postAsPerson"),
           postAsChannel: t("postAsChannel"),
           usernamePlaceholder: t("usernamePlaceholder"),
           inviteMember: t("inviteMember"),
+          channelDetails: t("channelDetails"),
+          channelName: t("channelName"),
+          channelDescription: t("channelDescription"),
+          saveChannelDetails: t("saveChannelDetails"),
+          invitationSettings: t("invitationSettings"),
+          invitationHelp: t("invitationHelp"),
+          noInviteLink: t("noInviteLink"),
+          rotateInviteLink: t("rotateInviteLink"),
+          administration: t("administration"),
           transferOwnership: t("transferOwnership"),
           deleteChat: t("deleteChat"),
           leaveChat: t("leaveChat")
@@ -1011,15 +1063,19 @@ async function openChatManagement() {
   }
 }
 
-async function handleChatManagementAction({ action, chatId, memberId, makeAdmin, postAs, username }) {
+async function handleChatManagementAction({ action, chatId, memberId, makeAdmin, postAs, isPrivate, username, name, description }) {
   const selectedChat = currentConversation;
-  if (!selectedChat || selectedChat.id !== chatId || !["channel", "group"].includes(selectedChat.type)) {
+  const settingsPageOpen = window.location.pathname === `/channels/${encodeURIComponent(chatId)}/settings`;
+  if ((!selectedChat || selectedChat.id !== chatId || !["channel", "group"].includes(selectedChat.type))
+    && !settingsPageOpen) {
     closeDialog("chat-info-dialog");
     return;
   }
   const refreshDialog = async () => {
     await refreshMessengerState();
-    if (currentConversation?.id === chatId) await openChatInfo(currentInfoTab);
+    if (window.location.pathname === `/channels/${encodeURIComponent(chatId)}/settings`) {
+      await openChatManagement(chatId, false);
+    } else if (currentConversation?.id === chatId) await openChatInfo(currentInfoTab);
     else closeDialog("chat-info-dialog");
   };
   try {
@@ -1035,6 +1091,18 @@ async function handleChatManagementAction({ action, chatId, memberId, makeAdmin,
       await api(`/api/chats/${encodeURIComponent(chatId)}/settings`, jsonOptions("PUT", { postAs }));
       await refreshDialog();
       notify(t("postIdentitySaved"));
+    } else if (action === "set-channel-privacy") {
+      await api(`/api/chats/${encodeURIComponent(chatId)}/settings`, jsonOptions("PUT", { isPrivate }));
+      await refreshDialog();
+    } else if (action === "save-channel-details") {
+      await api(`/api/chats/${encodeURIComponent(chatId)}/settings`, jsonOptions("PUT", { name, description }));
+      await refreshDialog();
+    } else if (action === "create-invite-link") {
+      await api(`/api/chats/${encodeURIComponent(chatId)}/invite`, { method: "POST" });
+      await refreshDialog();
+    } else if (action === "revoke-invite-link") {
+      await api(`/api/chats/${encodeURIComponent(chatId)}/invite`, { method: "DELETE" });
+      await refreshDialog();
     } else if (action === "invite-member") {
       await api(`/api/chats/${encodeURIComponent(chatId)}/members`, jsonOptions("POST", { username }));
       await refreshDialog();
@@ -1050,15 +1118,18 @@ async function handleChatManagementAction({ action, chatId, memberId, makeAdmin,
       await api(`/api/chats/${encodeURIComponent(chatId)}`, { method: "DELETE" });
       closeDialog("chat-info-dialog");
       await refreshMessengerState();
+      if (settingsPageOpen) document.dispatchEvent(new CustomEvent("polus:profile-page-back"));
       notify(t("chatDeleted"));
     } else if (action === "leave-chat") {
       await api(`/api/chats/${encodeURIComponent(chatId)}/leave`, { method: "POST" });
       closeDialog("chat-info-dialog");
       await refreshMessengerState();
+      if (settingsPageOpen) document.dispatchEvent(new CustomEvent("polus:profile-page-back"));
     }
   } catch (error) {
     notify(localizeError(error.message));
-    if (currentConversation?.id === chatId) await openChatInfo(currentInfoTab);
+    if (settingsPageOpen) await openChatManagement(chatId, false);
+    else if (currentConversation?.id === chatId) await openChatInfo(currentInfoTab);
   }
 }
 
@@ -1103,6 +1174,9 @@ async function togglePushNotifications() {
     return;
   }
   try {
+    const permissionPromise = Notification.permission === "default"
+      ? Notification.requestPermission()
+      : Promise.resolve(Notification.permission);
     const registration = await navigator.serviceWorker.ready;
     const current = await registration.pushManager.getSubscription();
     if (current) {
@@ -1116,9 +1190,7 @@ async function togglePushNotifications() {
       notify(t("permissionDenied"));
       return;
     }
-    const permission = Notification.permission === "granted"
-      ? "granted"
-      : await Notification.requestPermission();
+    const permission = await permissionPromise;
     if (permission !== "granted") {
       notify(t("permissionDenied"));
       return;
@@ -1140,10 +1212,12 @@ async function togglePushNotifications() {
 }
 
 async function checkPushSubscription() {
-  if (!("serviceWorker" in navigator) || !window.isSecureContext) return;
+  if (!("serviceWorker" in navigator) || !("PushManager" in window)
+    || !("Notification" in window) || !window.isSecureContext) return;
   try {
     const registration = await navigator.serviceWorker.ready;
-    setPushEnabled(Boolean(await registration.pushManager.getSubscription()));
+    const enabled = Boolean(await registration.pushManager.getSubscription());
+    setPushEnabled(enabled);
   } catch (error) {
     console.error("Unable to read push subscription:", error);
   }
@@ -1212,6 +1286,23 @@ function registerControllerListeners() {
   listen(document, "polus:chat-management-action", (event) => {
     void handleChatManagementAction(event.detail || {});
   });
+  listen(document, "polus:chat-row-action", (event) => {
+    const { action, conversation } = event.detail || {};
+    if (action !== "pin" || !conversation?.id) return;
+    void api(`/api/chats/${encodeURIComponent(conversation.id)}/pin`, {
+      method: conversation.pinned ? "DELETE" : "PUT"
+    }).then(refreshMessengerState).catch((error) => notify(localizeError(error.message)));
+  });
+  listen(document, "polus:chat-delete", (event) => {
+    const { conversationId, scope } = event.detail || {};
+    if (!conversationId || !["me", "everyone"].includes(scope)) return;
+    void (async () => {
+      await api(`/api/chats/${encodeURIComponent(conversationId)}?scope=${scope}`, { method: "DELETE" });
+      closeDialog("chat-delete-dialog");
+      await refreshMessengerState();
+      notify(t("chatDeleted"));
+    })().catch((error) => notify(localizeError(error.message)));
+  });
   listen(document, "polus:open-searched-message", (event) => {
     document.dispatchEvent(new CustomEvent("polus:close-chat-search"));
     void jumpToMessage(event.detail.messageId).catch((error) => notify(localizeError(error.message)));
@@ -1275,6 +1366,11 @@ function registerControllerListeners() {
   });
   listen(document, "polus:realtime-resync", () => {
     void resyncRealtimeState().catch((error) => notify(localizeError(error.message)));
+  });
+  listen(document, "polus:refresh-messenger-state", (event) => {
+    const { resolve, reject } = event.detail || {};
+    if (typeof resolve !== "function" || typeof reject !== "function") return;
+    void refreshMessengerState().then(resolve, reject);
   });
   listen(document, "polus:message-edited", (event) => applyMessageMutation(event.detail?.message));
   listen(document, "polus:message-deleted", (event) => applyMessageMutation(event.detail?.message));
@@ -1384,6 +1480,17 @@ function registerControllerListeners() {
     renderConversations();
     void openConversation(conversation);
   });
+  listen(document, "polus:join-channel", (event) => {
+    const channelId = event.detail?.channelId;
+    if (typeof channelId !== "string" || !channelId) return;
+    void api(`/api/channels/${encodeURIComponent(channelId)}/join`, { method: "POST" })
+      .then((conversation) => {
+        channels = channels.map((channel) => channel.id === conversation.id ? conversation : channel);
+        renderConversations();
+        return openConversation(conversation);
+      })
+      .catch((error) => notify(localizeError(error.message)));
+  });
 }
 
 async function start(session) {
@@ -1399,6 +1506,11 @@ async function start(session) {
 
 export function initializeMessenger() {
   if (controllerInitialized) return () => {};
+  messengerView = document.querySelector("#messenger-view");
+  messageList = document.querySelector("#message-list");
+  if (!messengerView || !messageList) {
+    throw new Error("Messenger controller requires the mounted messenger view and message list.");
+  }
   controllerInitialized = true;
   const session = ++controllerSession;
   registerControllerListeners();

@@ -4,7 +4,8 @@ export function orderConversations(conversations, getActivity) {
   for (const conversation of conversations) {
     (conversation.type === "saved" ? saved : others).push(conversation);
   }
-  others.sort((left, right) => getActivity(right) - getActivity(left));
+  others.sort((left, right) => Number(right.pinned === true) - Number(left.pinned === true)
+    || getActivity(right) - getActivity(left));
   return [...saved, ...others];
 }
 
@@ -14,6 +15,6 @@ export function getConversationHeaderControls(conversation) {
   }
   return {
     search: conversation.joined !== false,
-    push: conversation.type !== "saved"
+    push: conversation.type !== "saved" && conversation.joined !== false
   };
 }

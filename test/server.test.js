@@ -8,11 +8,13 @@ const Database = require("better-sqlite3");
 const {
   createEmptyStore,
   createPushPayload,
+  cleanupExpiredEventHistory,
   cleanupExpiredData,
   createSqliteStoreWriter,
   createStoreWriter,
   createMessengerServer,
   getLanAddresses,
+  closeExpiredSessionStreams,
   PRIVACY_VERSION,
   loadSqliteStore,
   loadStore,
@@ -64,6 +66,41 @@ test("cleans expired sessions and orphaned attachment files", async () => {
   } finally {
     await fs.rm(directory, { recursive: true, force: true });
   }
+});
+
+test("cleans expired event history for disconnected users", () => {
+  const recentEvents = new Map([
+    ["expired", [{ id: 1, createdAt: 100 }]],
+    ["recent", [{ id: 1, createdAt: 900 }]],
+    ["connected", [{ id: 1, createdAt: 100 }]]
+  ]);
+  const eventSequences = new Map([
+    ["expired", 1],
+    ["recent", 1],
+    ["connected", 1],
+    ["orphaned", 4]
+  ]);
+  const connectedUsers = new Map([["connected", new Set()]]);
+
+  assert.equal(cleanupExpiredEventHistory(recentEvents, eventSequences, connectedUsers, 500), 1);
+  assert.deepEqual([...recentEvents.keys()], ["recent", "connected"]);
+  assert.deepEqual([...eventSequences.keys()], ["recent", "connected"]);
+});
+
+test("closes streams whose sessions are missing or expired", () => {
+  const closed = [];
+  const sessionStreams = new Map([
+    ["active", new Set([{ end() { closed.push("active"); } }])],
+    ["expired", new Set([{ end() { closed.push("expired"); } }])],
+    ["revoked", new Set([{ end() { closed.push("revoked"); } }])]
+  ]);
+  const sessions = [
+    { id: "active", expiresAt: 200 }
+  ];
+
+  assert.equal(closeExpiredSessionStreams(sessionStreams, sessions, 100), 2);
+  assert.deepEqual(closed.sort(), ["expired", "revoked"]);
+  assert.deepEqual([...sessionStreams.keys()], ["active"]);
 });
 
 test("persists expired-session cleanup through the SQLite store writer", async () => {
@@ -232,6 +269,7 @@ test("protects saved chats and preserves shared files until the last message ref
 
       for (const [pathName, method, body] of [
         [`/api/chats/${savedId}`, "DELETE", undefined],
+        [`/api/chats/${savedId}/hide`, "PUT", undefined],
         [`/api/chats/${savedId}/leave`, "POST", undefined],
         [`/api/chats/${savedId}/members`, "POST", { username: "saved_bob" }],
         [`/api/chats/${savedId}/owner`, "PUT", { username: "saved_bob" }]
@@ -454,6 +492,15 @@ test("replies to messages, toggles private reactions, and forwards messages with
       assert.deepEqual(bobSource.reactions, [{ emoji: "👍", count: 1, reactedByMe: false }]);
       const bobReaction = await react(bob.cookie, sourceWithFile.id, "👍");
       assert.equal((await bobReaction.json()).reactions[0].count, 2);
+      const aliceSwitchedReaction = await react(alice.cookie, sourceWithFile.id, "🚀");
+      assert.deepEqual((await aliceSwitchedReaction.json()).reactions, [
+        { emoji: "👍", count: 1, reactedByMe: false },
+        { emoji: "🚀", count: 1, reactedByMe: true }
+      ]);
+      const aliceSwitchedBack = await react(alice.cookie, sourceWithFile.id, "👍");
+      assert.deepEqual((await aliceSwitchedBack.json()).reactions, [
+        { emoji: "👍", count: 2, reactedByMe: true }
+      ]);
       const aliceRemoval = await react(alice.cookie, sourceWithFile.id, "👍");
       assert.deepEqual((await aliceRemoval.json()).reactions, [
         { emoji: "👍", count: 1, reactedByMe: false }
@@ -1056,6 +1103,37 @@ test("enables HSTS when secure cookies are explicitly enabled", async () => {
   }
 });
 
+test("rejects cross-origin API mutations and sends browser hardening headers", async () => {
+  await withServer({ store: createEmptyStore() }, async (baseUrl) => {
+    const account = await register(baseUrl, "origin_guard", "Origin Guard");
+    const response = await fetch(`${baseUrl}/api/account`, authenticatedRequest(account.cookie, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "https://attacker.example",
+        "Sec-Fetch-Site": "cross-site"
+      },
+      body: JSON.stringify({ fullName: "Changed", about: "" })
+    }));
+    await assertApiError(response, 403, "FORBIDDEN");
+    const sameOriginResponse = await fetch(`${baseUrl}/api/account`, authenticatedRequest(account.cookie, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: baseUrl,
+        "Sec-Fetch-Site": "same-origin"
+      },
+      body: JSON.stringify({ fullName: "Origin Guard Updated", about: "" })
+    }));
+    assert.equal(sameOriginResponse.status, 200);
+    const me = await fetch(`${baseUrl}/api/auth/me`, authenticatedRequest(account.cookie));
+    assert.equal((await me.json()).user.fullName, "Origin Guard Updated");
+    assert.equal(me.headers.get("x-frame-options"), "DENY");
+    assert.equal(me.headers.get("cross-origin-resource-policy"), "same-origin");
+    assert.match(me.headers.get("permissions-policy"), /microphone=\(self\)/);
+  });
+});
+
 test("accepts Edge push subscription endpoints", async () => {
   await withServer({ store: createEmptyStore() }, async (baseUrl) => {
     const account = await register(baseUrl, "edge_push", "Edge Push");
@@ -1070,6 +1148,45 @@ test("accepts Edge push subscription endpoints", async () => {
       })
     }));
     assert.equal(response.status, 201);
+  });
+});
+
+test("removes the specified push subscription on chunked logout requests", async () => {
+  let persistedStore;
+  await withServer({
+    store: createEmptyStore(),
+    saveStore: async (store) => { persistedStore = structuredClone(store); }
+  }, async (baseUrl) => {
+    const account = await register(baseUrl, "chunked_logout", "Chunked Logout");
+    const endpoint = "https://notify.windows.com/?token=logout-test";
+    const subscription = await fetch(`${baseUrl}/api/push/subscribe`, authenticatedRequest(account.cookie, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        subscription: { endpoint, keys: { p256dh: "public-key", auth: "auth-key" } }
+      })
+    }));
+    assert.equal(subscription.status, 201);
+    assert.equal(persistedStore.pushSubscriptions.length, 1);
+
+    const logout = await new Promise((resolve, reject) => {
+      const request = http.request(baseUrl + "/api/auth/logout", {
+        method: "POST",
+        headers: {
+          Cookie: account.cookie,
+          "Content-Type": "application/json",
+          "Transfer-Encoding": "chunked"
+        }
+      }, (response) => {
+        response.resume();
+        response.on("end", () => resolve(response));
+      });
+      request.on("error", reject);
+      request.end(JSON.stringify({ pushEndpoint: endpoint }));
+    });
+
+    assert.equal(logout.statusCode, 200);
+    assert.deepEqual(persistedStore.pushSubscriptions, []);
   });
 });
 
@@ -1281,7 +1398,7 @@ test("enforces account limits, permits an 8-character password, and edits profil
   });
 });
 
-test("limits failed logins to ten per IP and case-insensitive username in fifteen minutes", async () => {
+test("limits failed logins to ten per IP and username and across IPs per username", async () => {
   await withServer({ store: createEmptyStore() }, async (baseUrl) => {
     await register(baseUrl, "limit_pair_user", "Rate Limit User");
     const attemptLogin = (username) => fetch(`${baseUrl}/api/auth/login`, {
@@ -1300,6 +1417,100 @@ test("limits failed logins to ten per IP and case-insensitive username in fiftee
 
     const separateUsername = await attemptLogin("a_different_user");
     assert.equal(separateUsername.status, 401);
+
+    await register(baseUrl, "cross_ip_user", "Cross IP User");
+    const port = Number(new URL(baseUrl).port);
+    const attemptFromAddress = (localAddress) => new Promise((resolve, reject) => {
+      const request = http.request({
+        hostname: "127.0.0.1",
+        port,
+        path: "/api/auth/login",
+        method: "POST",
+        localAddress,
+        headers: { "Content-Type": "application/json" }
+      }, (response) => {
+        response.resume();
+        response.on("end", () => resolve(response.statusCode));
+      });
+      request.on("error", reject);
+      request.end(JSON.stringify({ username: "cross_ip_user", password: "wrong-password" }));
+    });
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const localAddress = attempt % 2 === 0 ? "127.0.0.1" : "127.0.0.2";
+      assert.equal(await attemptFromAddress(localAddress), 401);
+    }
+    assert.equal(await attemptLogin("cross_ip_user").then((response) => response.status), 429);
+  });
+});
+
+test("closes only the logged-out session's event streams", async () => {
+  await withServer({ store: createEmptyStore() }, async (baseUrl) => {
+    const account = await register(baseUrl, "stream_logout", "Stream Logout");
+    const secondLogin = await fetch(`${baseUrl}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "stream_logout", password: "a-secure-test-password" })
+    });
+    assert.equal(secondLogin.status, 200);
+    const secondCookie = secondLogin.headers.get("set-cookie").split(";")[0];
+    const controllers = [new AbortController(), new AbortController()];
+    const readers = [];
+    try {
+      for (const [cookie, index] of [[account.cookie, 0], [secondCookie, 1]]) {
+        const response = await fetch(`${baseUrl}/api/stream`, {
+          headers: { Cookie: cookie },
+          signal: controllers[index].signal
+        });
+        const reader = response.body.getReader();
+        readers.push(reader);
+        assert.match(new TextDecoder().decode((await reader.read()).value), /retry: 3000/);
+      }
+
+      const logout = await fetch(`${baseUrl}/api/auth/logout`,
+        authenticatedRequest(account.cookie, { method: "POST" }));
+      assert.equal(logout.status, 200);
+      assert.deepEqual(await readers[0].read(), { value: undefined, done: true });
+      assert.equal((await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(secondCookie))).status, 200);
+    } finally {
+      controllers.forEach((controller) => controller.abort());
+    }
+  });
+});
+
+test("closes streams when a password change revokes other sessions", async () => {
+  await withServer({ store: createEmptyStore() }, async (baseUrl) => {
+    const account = await register(baseUrl, "stream_password", "Stream Password");
+    const secondLogin = await fetch(`${baseUrl}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "stream_password", password: "a-secure-test-password" })
+    });
+    const secondCookie = secondLogin.headers.get("set-cookie").split(";")[0];
+    const controller = new AbortController();
+    try {
+      const stream = await fetch(`${baseUrl}/api/stream`, {
+        headers: { Cookie: secondCookie },
+        signal: controller.signal
+      });
+      const reader = stream.body.getReader();
+      assert.match(new TextDecoder().decode((await reader.read()).value), /retry: 3000/);
+
+      const changed = await fetch(`${baseUrl}/api/account`, authenticatedRequest(account.cookie, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fullName: "Stream Password",
+          about: "",
+          currentPassword: "a-secure-test-password",
+          newPassword: "a-new-secure-password"
+        })
+      }));
+      assert.equal(changed.status, 200);
+      assert.deepEqual(await reader.read(), { value: undefined, done: true });
+      assert.equal((await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(secondCookie))).status, 401);
+    } finally {
+      controller.abort();
+    }
   });
 });
 
@@ -1802,6 +2013,11 @@ test("streams, authorizes, indexes, searches and deletes chat attachments", asyn
         body: png
       }));
       const publicAttachment = await channelUpload.json();
+      const unpublishedFile = await fetch(
+        `${baseUrl}/api/attachments/${publicAttachment.id}`,
+        authenticatedRequest(outsider.cookie)
+      );
+      assert.equal(unpublishedFile.status, 404);
       const channelMessage = await fetch(`${baseUrl}/api/messages`, authenticatedRequest(owner.cookie, {
         method: "POST",
         ...json({
@@ -1939,7 +2155,7 @@ test("exposes profile controls, online visibility, blocks and per-chat mute sett
   }
 });
 
-test("creates public channels and multi-member groups", async () => {
+test("previews public channels without joining and creates multi-member groups", async () => {
   await withServer({ store: createEmptyStore() }, async (baseUrl) => {
     const alice = await register(baseUrl, "group_alice", "Alice");
     const bob = await register(baseUrl, "group_bobby", "Bobby");
@@ -1961,11 +2177,25 @@ test("creates public channels and multi-member groups", async () => {
     }));
     assert.equal(channelMessage.status, 201);
 
-    const privateHistory = await fetch(
+    const previewHistory = await fetch(
       `${baseUrl}/api/messages?conversationId=${encodeURIComponent(channel.id)}`,
       authenticatedRequest(bob.cookie)
     );
-    assert.equal(privateHistory.status, 404);
+    assert.equal(previewHistory.status, 200);
+    const previewMessages = await previewHistory.json();
+    assert.equal(previewMessages.messages.length, 1);
+    assert.equal(previewMessages.messages[0].text, "Posted before joining");
+    const previewBootstrap = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(bob.cookie));
+    const previewChannel = (await previewBootstrap.json()).channels.find((item) => item.id === channel.id);
+    assert.equal(previewChannel.joined, false);
+    assert.equal(previewChannel.unreadCount, 0);
+
+    const blockedPost = await fetch(`${baseUrl}/api/messages`, authenticatedRequest(bob.cookie, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ conversationId: channel.id, text: "Not joined yet" })
+    }));
+    assert.equal(blockedPost.status, 404);
 
     const join = await fetch(`${baseUrl}/api/channels/${channel.id}/join`, authenticatedRequest(bob.cookie, {
       method: "POST"
@@ -2015,6 +2245,133 @@ test("creates public channels and multi-member groups", async () => {
   });
 });
 
+test("supports private channels, rotatable invite links, pinned chats, and scoped deletion", async () => {
+  await withServer({ store: createEmptyStore() }, async (baseUrl) => {
+    const owner = await register(baseUrl, "invite_owner", "Owner");
+    const member = await register(baseUrl, "invite_member", "Member");
+    const outsider = await register(baseUrl, "invite_outsider", "Outsider");
+    const privateChannelResponse = await fetch(`${baseUrl}/api/channels`, authenticatedRequest(owner.cookie, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "Private room", isPrivate: true })
+    }));
+    assert.equal(privateChannelResponse.status, 201);
+    const privateChannel = await privateChannelResponse.json();
+    assert.equal(privateChannel.isPrivate, true);
+
+    const outsiderBootstrap = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(outsider.cookie));
+    assert.equal((await outsiderBootstrap.json()).channels.some((chat) => chat.id === privateChannel.id), false);
+    await assertApiError(
+      await fetch(`${baseUrl}/api/channels/${privateChannel.id}/profile`, authenticatedRequest(outsider.cookie)),
+      404,
+      "NOT_FOUND"
+    );
+    await assertApiError(
+      await fetch(`${baseUrl}/api/channels/${privateChannel.id}/join`, authenticatedRequest(outsider.cookie, { method: "POST" })),
+      404,
+      "NOT_FOUND"
+    );
+
+    const inviteResponse = await fetch(`${baseUrl}/api/chats/${privateChannel.id}/invite`,
+      authenticatedRequest(owner.cookie, { method: "POST" }));
+    assert.equal(inviteResponse.status, 200);
+    const invite = await inviteResponse.json();
+    assert.match(invite.inviteUrl, /^\/join\/[A-Za-z0-9_-]+$/);
+    const token = invite.inviteUrl.split("/").at(-1);
+    const joinResponse = await fetch(`${baseUrl}/api/invites/${token}/join`,
+      authenticatedRequest(member.cookie, { method: "POST" }));
+    assert.equal(joinResponse.status, 200);
+    assert.equal((await joinResponse.json()).joined, true);
+
+    const memberBootstrap = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(member.cookie));
+    assert.ok((await memberBootstrap.json()).channels.some((chat) => chat.id === privateChannel.id));
+    const makePublic = await fetch(`${baseUrl}/api/chats/${privateChannel.id}/settings`,
+      authenticatedRequest(owner.cookie, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ isPrivate: false })
+      }));
+    assert.equal(makePublic.status, 200);
+    const publicBootstrap = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(outsider.cookie));
+    assert.ok((await publicBootstrap.json()).channels.some((chat) => chat.id === privateChannel.id));
+    const makePrivate = await fetch(`${baseUrl}/api/chats/${privateChannel.id}/settings`,
+      authenticatedRequest(owner.cookie, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ isPrivate: true })
+      }));
+    assert.equal(makePrivate.status, 200);
+    const privateAgainBootstrap = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(outsider.cookie));
+    assert.equal((await privateAgainBootstrap.json()).channels.some((chat) => chat.id === privateChannel.id), false);
+
+    const pin = await fetch(`${baseUrl}/api/chats/${privateChannel.id}/pin`,
+      authenticatedRequest(member.cookie, { method: "PUT" }));
+    assert.equal(pin.status, 200);
+    const pinnedBootstrap = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(member.cookie));
+    assert.equal((await pinnedBootstrap.json()).channels.find((chat) => chat.id === privateChannel.id).pinned, true);
+
+    const hide = await fetch(`${baseUrl}/api/chats/${privateChannel.id}/hide`,
+      authenticatedRequest(member.cookie, { method: "PUT" }));
+    assert.equal(hide.status, 200);
+    const hiddenBootstrap = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(member.cookie));
+    assert.equal((await hiddenBootstrap.json()).channels.some((chat) => chat.id === privateChannel.id), false);
+    await fetch(`${baseUrl}/api/chats/${privateChannel.id}/hide`,
+      authenticatedRequest(member.cookie, { method: "DELETE" }));
+
+    const revoke = await fetch(`${baseUrl}/api/chats/${privateChannel.id}/invite`,
+      authenticatedRequest(owner.cookie, { method: "DELETE" }));
+    assert.equal(revoke.status, 200);
+    await assertApiError(
+      await fetch(`${baseUrl}/api/invites/${token}/join`, authenticatedRequest(outsider.cookie, { method: "POST" })),
+      404,
+      "NOT_FOUND"
+    );
+
+    const groupResponse = await fetch(`${baseUrl}/api/groups`, authenticatedRequest(owner.cookie, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "Temporary group", usernames: ["invite_member"] })
+    }));
+    const group = await groupResponse.json();
+    const groupInviteResponse = await fetch(`${baseUrl}/api/chats/${group.id}/invite`,
+      authenticatedRequest(owner.cookie, { method: "POST" }));
+    const groupInvite = await groupInviteResponse.json();
+    const groupToken = groupInvite.inviteUrl.split("/").at(-1);
+    const groupJoin = await fetch(`${baseUrl}/api/invites/${groupToken}/join`,
+      authenticatedRequest(outsider.cookie, { method: "POST" }));
+    assert.equal(groupJoin.status, 200);
+    assert.equal((await groupJoin.json()).type, "group");
+    const hideForMember = await fetch(`${baseUrl}/api/chats/${group.id}?scope=me`,
+      authenticatedRequest(member.cookie, { method: "DELETE" }));
+    assert.equal(hideForMember.status, 200);
+    const memberChats = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(member.cookie));
+    assert.equal((await memberChats.json()).directs.some((chat) => chat.id === group.id), false);
+    const newMessage = await fetch(`${baseUrl}/api/messages`, authenticatedRequest(owner.cookie, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ conversationId: group.id, text: "A new message restores the chat" })
+    }));
+    assert.equal(newMessage.status, 201);
+    const restoredChats = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(member.cookie));
+    assert.equal((await restoredChats.json()).directs.some((chat) => chat.id === group.id), true);
+    await fetch(`${baseUrl}/api/chats/${group.id}?scope=me`,
+      authenticatedRequest(member.cookie, { method: "DELETE" }));
+    const deleteForEveryone = await fetch(`${baseUrl}/api/chats/${group.id}?scope=everyone`,
+      authenticatedRequest(owner.cookie, { method: "DELETE" }));
+    assert.equal(deleteForEveryone.status, 200);
+
+    for (const route of [
+      `/channels/${privateChannel.id}`,
+      `/channels/${privateChannel.id}/settings`,
+      `/join/${token}`
+    ]) {
+      const page = await fetch(`${baseUrl}${route}`);
+      assert.equal(page.status, 200);
+      assert.match(page.headers.get("content-type"), /text\/html/);
+    }
+  });
+});
+
 test("creates exactly one direct chat when the first messages race", async () => {
   await withServer({ store: createEmptyStore() }, async (baseUrl) => {
     const alice = await register(baseUrl, "race_alice", "Alice");
@@ -2035,6 +2392,41 @@ test("creates exactly one direct chat when the first messages race", async () =>
     const bobDirects = (await bootstrap.json()).directs.filter((chat) => chat.type === "direct");
     assert.equal(bobDirects.length, 1);
     assert.equal(bobDirects[0].unreadCount, 2);
+  });
+});
+
+test("does not create a direct chat when message validation fails", async () => {
+  await withServer({ store: createEmptyStore() }, async (baseUrl) => {
+    const alice = await register(baseUrl, "validation_alice", "Alice");
+    const bob = await register(baseUrl, "validation_bobby", "Bobby");
+    const json = (value) => ({ "Content-Type": "application/json", body: JSON.stringify(value) });
+    const assertNoDirectChats = async () => {
+      for (const account of [alice, bob]) {
+        const response = await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(account.cookie));
+        assert.equal(response.status, 200);
+        assert.equal((await response.json()).directs.some((chat) => chat.type === "direct"), false);
+      }
+    };
+    const send = (payload) => fetch(`${baseUrl}/api/messages`, authenticatedRequest(alice.cookie, {
+      method: "POST",
+      ...json({ recipientUsername: "validation_bobby", text: "Hello", ...payload })
+    }));
+
+    const invalidReply = await send({ replyToId: 999 });
+    assert.equal(invalidReply.status, 404);
+    await assertNoDirectChats();
+
+    const invalidAttachment = await send({ attachmentIds: ["missing-attachment"] });
+    assert.equal(invalidAttachment.status, 400);
+    await assertNoDirectChats();
+
+    const blocked = await fetch(`${baseUrl}/api/users/validation_alice/block`, authenticatedRequest(bob.cookie, {
+      method: "POST"
+    }));
+    assert.equal(blocked.status, 200);
+    const blockedMessage = await send({});
+    assert.equal(blockedMessage.status, 403);
+    await assertNoDirectChats();
   });
 });
 
@@ -2170,6 +2562,23 @@ test("lets only channel owners choose whether messages are displayed as the chan
     const personHistory = await fetch(`${baseUrl}/api/messages?conversationId=${encodeURIComponent(channel.id)}`,
       authenticatedRequest(member.cookie));
     assert.equal((await personHistory.json()).messages.every((message) => !message.displayAuthor), true);
+
+    const updatedDetails = await fetch(`${baseUrl}/api/chats/${channel.id}/settings`, authenticatedRequest(owner.cookie, {
+      method: "PUT",
+      ...json({ name: "Updated channel", description: "Updated description" })
+    }));
+    assert.equal(updatedDetails.status, 200);
+    const updatedChat = (await updatedDetails.json()).chat;
+    assert.equal(updatedChat.name, "Updated channel");
+    assert.equal(updatedChat.description, "Updated description");
+
+    const invalidDetails = await fetch(`${baseUrl}/api/chats/${channel.id}/settings`, authenticatedRequest(owner.cookie, {
+      method: "PUT",
+      ...json({ name: " ", description: 123 })
+    }));
+    assert.equal(invalidDetails.status, 400);
+    const unchanged = await fetch(`${baseUrl}/api/chats/${channel.id}`, authenticatedRequest(owner.cookie));
+    assert.equal((await unchanged.json()).chat.name, "Updated channel");
   });
 });
 
@@ -2201,16 +2610,31 @@ test("enforces channel and group owner/admin/member permissions and ownership tr
       `${baseUrl}/api/messages?conversationId=${encodeURIComponent(channel.id)}`,
       authenticatedRequest(member.cookie)
     );
-    assert.equal(leftChannelHistory.status, 404);
+    assert.equal(leftChannelHistory.status, 200);
     const rejoin = await fetch(`${baseUrl}/api/channels/${channel.id}/join`, authenticatedRequest(member.cookie, {
       method: "POST"
     }));
     assert.equal(rejoin.status, 200);
+    const ownerMessage = await fetch(`${baseUrl}/api/messages`, authenticatedRequest(owner.cookie, {
+      method: "POST",
+      ...json({ conversationId: channel.id, text: "Owner message" })
+    }));
+    assert.equal(ownerMessage.status, 201);
+    const ownerMessageBody = await ownerMessage.json();
     const memberPost = await fetch(`${baseUrl}/api/messages`, authenticatedRequest(member.cookie, {
       method: "POST",
       ...json({ conversationId: channel.id, text: "not allowed" })
     }));
     assert.equal(memberPost.status, 403);
+    const memberReply = await fetch(`${baseUrl}/api/messages`, authenticatedRequest(member.cookie, {
+      method: "POST",
+      ...json({
+        conversationId: channel.id,
+        text: "reply not allowed",
+        replyToId: ownerMessageBody.id
+      })
+    }));
+    assert.equal(memberReply.status, 403);
 
     const addAdmin = await fetch(`${baseUrl}/api/chats/${channel.id}/members`, authenticatedRequest(owner.cookie, {
       method: "POST",
@@ -2227,11 +2651,29 @@ test("enforces channel and group owner/admin/member permissions and ownership tr
       ...json({ conversationId: channel.id, text: "Admin post" })
     }));
     assert.equal(adminPost.status, 201);
+    const adminPostMessage = await adminPost.json();
     const outsiderHistory = await fetch(
       `${baseUrl}/api/messages?conversationId=${encodeURIComponent(channel.id)}`,
       authenticatedRequest(outsider.cookie)
     );
-    assert.equal(outsiderHistory.status, 404);
+    assert.equal(outsiderHistory.status, 200);
+    const leaveAsAdmin = await fetch(`${baseUrl}/api/chats/${channel.id}/leave`,
+      authenticatedRequest(admin.cookie, { method: "POST" }));
+    assert.equal(leaveAsAdmin.status, 200);
+    const editAfterLeaving = await fetch(`${baseUrl}/api/messages/${adminPostMessage.id}`,
+      authenticatedRequest(admin.cookie, {
+        method: "PATCH",
+        ...json({ text: "Tampered after leaving" })
+      }));
+    assert.equal(editAfterLeaving.status, 404);
+    const deleteAfterLeaving = await fetch(`${baseUrl}/api/messages/${adminPostMessage.id}`,
+      authenticatedRequest(admin.cookie, { method: "DELETE" }));
+    assert.equal(deleteAfterLeaving.status, 404);
+    const ownerHistory = await fetch(
+      `${baseUrl}/api/messages?conversationId=${encodeURIComponent(channel.id)}`,
+      authenticatedRequest(owner.cookie)
+    );
+    assert.equal((await ownerHistory.json()).messages[0].text, "Admin post");
 
     const groupResponse = await fetch(`${baseUrl}/api/groups`, authenticatedRequest(owner.cookie, {
       method: "POST",

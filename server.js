@@ -34,12 +34,15 @@ const FORMS_DISABLED_PATH = "/api/forms-disabled";
 const SENSITIVE_QUERY_PARAMS = ["password", "confirmPassword", "currentPassword", "newPassword"];
 const FORM_QUERY_PARAMS = ["username", "fullName", "about"];
 const loginAttempts = new Map();
+const loginAttemptsByUsername = new Map();
 const loginAttemptsCleanup = setInterval(() => {
   const cutoff = Date.now() - 15 * 60 * 1000;
-  for (const [key, attempts] of loginAttempts) {
-    const recent = attempts.filter((time) => time > cutoff);
-    if (recent.length) loginAttempts.set(key, recent);
-    else loginAttempts.delete(key);
+  for (const attemptsByKey of [loginAttempts, loginAttemptsByUsername]) {
+    for (const [key, attempts] of attemptsByKey) {
+      const recent = attempts.filter((time) => time > cutoff);
+      if (recent.length) attemptsByKey.set(key, recent);
+      else attemptsByKey.delete(key);
+    }
   }
 }, 60 * 1000);
 loginAttemptsCleanup.unref();
@@ -51,7 +54,13 @@ const MAX_MESSAGES_PER_MINUTE = 20;
 const MESSAGE_RATE_WINDOW_MS = 60 * 1000;
 const MESSAGE_EDIT_WINDOW_MS = 48 * 60 * 60 * 1000;
 const MESSAGE_PAGE_SIZE = 50;
-const MESSAGE_REACTIONS = new Set(["👍", "❤️", "😂", "😮", "😢", "👏"]);
+const EVENT_HISTORY_TTL_MS = 24 * 60 * 60 * 1000;
+const MESSAGE_REACTIONS = new Set([
+  "👍", "❤️", "😂", "😮", "😢", "👏", "🔥", "🎉", "😍", "🤔", "🙏", "💯",
+  "✅", "👎", "😎", "🥳", "😭", "😡", "🤯", "🥰", "🤩", "🤗", "😴", "🙌",
+  "💪", "👀", "🌹", "🎂", "💔", "✨", "🤝", "🫡", "😱", "😅", "😊", "😇",
+  "🤮", "😷", "💩", "🐱", "🐶", "🍕", "☕", "⚡", "🚀", "🎈", "🌟", "💡"
+]);
 const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
 const MAX_THUMBNAIL_BYTES = 2 * 1024 * 1024;
 const MAX_ATTACHMENTS_PER_MESSAGE = 10;
@@ -143,14 +152,19 @@ function cookieValue(request, name) {
   return "";
 }
 
-async function readJsonBody(request) {
-  let body = "";
+async function readJsonBody(request, { allowEmpty = false } = {}) {
+  const parts = [];
+  let size = 0;
   for await (const chunk of request) {
-    body += chunk;
-    if (Buffer.byteLength(body) > MAX_BODY_BYTES) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += buffer.length;
+    if (size > MAX_BODY_BYTES) {
       throw new HttpError(413, "Request body is too large.");
     }
+    parts.push(buffer);
   }
+  const body = Buffer.concat(parts).toString("utf8");
+  if (!body && allowEmpty) return {};
   try {
     const parsed = JSON.parse(body);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -231,6 +245,10 @@ function normalizeStore(input) {
     "attachments", "links", "pushSubscriptions"]) {
     base[key] = Array.isArray(store[key]) ? store[key] : base[key];
   }
+  for (const user of base.users) {
+    user.pinnedChatIds = Array.isArray(user.pinnedChatIds) ? user.pinnedChatIds : [];
+    user.hiddenChatIds = Array.isArray(user.hiddenChatIds) ? user.hiddenChatIds : [];
+  }
   base.uploadUsage = Array.isArray(store.uploadUsage) ? store.uploadUsage : [];
   base.vapidKeys = store.vapidKeys && typeof store.vapidKeys.publicKey === "string"
     ? store.vapidKeys
@@ -250,6 +268,7 @@ function normalizeStore(input) {
   );
   for (const channel of base.channels) {
     channel.type = "channel";
+    channel.isPrivate = channel.isPrivate === true;
     channel.memberIds = Array.isArray(channel.memberIds) ? channel.memberIds : [];
     channel.adminIds = Array.isArray(channel.adminIds) ? channel.adminIds : [];
     channel.postAs = channel.postAs === "channel" ? "channel" : "person";
@@ -918,6 +937,12 @@ function findConversation(store, id, userId) {
   };
 }
 
+function findReadableConversation(store, id, userId) {
+  const channel = store.channels.find((item) => item.id === id);
+  if (channel && !channel.isPrivate) return { type: "channel", conversation: channel };
+  return findConversation(store, id, userId);
+}
+
 function getChatRecord(store, id) {
   return store.channels.find((item) => item.id === id)
     || store.conversations.find((item) => item.id === id)
@@ -928,6 +953,11 @@ function getChatRole(chat, userId) {
   if (chat.ownerId === userId || (!chat.ownerId && chat.createdBy === userId)) return "owner";
   if ((chat.adminIds || []).includes(userId)) return "admin";
   return chat.memberIds.includes(userId) ? "member" : null;
+}
+
+function canAccessChat(store, chatId, userId) {
+  const chat = getChatRecord(store, chatId);
+  return Boolean(chat && getChatRole(chat, userId));
 }
 
 function requireChatRole(chat, userId, allowedRoles) {
@@ -944,6 +974,43 @@ function findDirectConversation(store, firstUserId, secondUserId) {
     && conversation.memberIds.length === 2
     && conversation.memberIds.every((memberId, index) => memberId === memberIds[index])
   ) || null;
+}
+
+function cleanupExpiredEventHistory(recentEvents, eventSequences, connectedUsers, cutoff) {
+  let removed = 0;
+  for (const [userId, history] of recentEvents) {
+    if (connectedUsers.has(userId) || history.at(-1)?.createdAt > cutoff) continue;
+    recentEvents.delete(userId);
+    eventSequences.delete(userId);
+    removed += 1;
+  }
+  for (const userId of eventSequences.keys()) {
+    if (!connectedUsers.has(userId) && !recentEvents.has(userId)) {
+      eventSequences.delete(userId);
+    }
+  }
+  return removed;
+}
+
+function closeSessionStreams(sessionStreams, sessionId) {
+  const responses = sessionStreams.get(sessionId);
+  if (!responses) return 0;
+  sessionStreams.delete(sessionId);
+  for (const response of responses) response.end();
+  return responses.size;
+}
+
+function closeExpiredSessionStreams(sessionStreams, sessions, now = Date.now()) {
+  const activeSessionIds = new Set(sessions
+    .filter((session) => session.expiresAt > now)
+    .map((session) => session.id));
+  let closed = 0;
+  for (const sessionId of sessionStreams.keys()) {
+    if (!activeSessionIds.has(sessionId)) {
+      closed += closeSessionStreams(sessionStreams, sessionId);
+    }
+  }
+  return closed;
 }
 
 function broadcastChatMembers(chat, event, payload, broadcast) {
@@ -969,6 +1036,15 @@ function removeChatData(store, chatId) {
   store.channels = store.channels.filter((chat) => chat.id !== chatId);
   store.conversations = store.conversations.filter((chat) => chat.id !== chatId);
   return { messageIds, attachmentIds, removedAttachments };
+}
+
+function unhideChatForMembers(store, chat) {
+  for (const memberId of chat.memberIds) {
+    const member = store.users.find((candidate) => candidate.id === memberId);
+    if (member?.hiddenChatIds?.includes(chat.id)) {
+      member.hiddenChatIds = member.hiddenChatIds.filter((id) => id !== chat.id);
+    }
+  }
 }
 
 function attachmentAssetLocations(attachment) {
@@ -1018,7 +1094,7 @@ async function removeUnreferencedAttachmentFiles(store, removedAttachments, uplo
 function canReadMessage(store, message, userId) {
   const conversationId = message.conversationId || message.room;
   try {
-    return Boolean(findConversation(store, conversationId, userId));
+    return Boolean(findReadableConversation(store, conversationId, userId));
   } catch {
     return false;
   }
@@ -1223,6 +1299,7 @@ function conversationSummary(
     : conversation.memberIds?.length === 2
       ? "direct"
       : conversation.memberIds?.length === 1 ? "saved" : "group");
+  const joined = conversation.memberIds?.includes(userId) || false;
   return {
     id: conversation.id,
     type,
@@ -1235,8 +1312,8 @@ function conversationSummary(
       : type === "channel" ? conversation.avatarUrl || null : null,
     description: conversation.description || "",
     memberIds: conversation.memberIds || [],
-    joined: conversation.memberIds?.includes(userId) || false,
-    unreadCount: type === "saved" ? 0 : indexedSummary
+    joined,
+    unreadCount: type === "saved" || !joined ? 0 : indexedSummary
       ? indexedSummary.unreadCount
       : queryUnreadCount
         ? queryUnreadCount(conversation.id, conversation.lastReadMessageIds?.[userId] || 0, userId)
@@ -1247,8 +1324,12 @@ function conversationSummary(
     ownerId: conversation.ownerId || conversation.createdBy || null,
     adminIds: conversation.adminIds || [],
     muted: (conversation.mutedUserIds || []).includes(userId),
+    pinned: (store.users.find((user) => user.id === userId)?.pinnedChatIds || []).includes(conversation.id),
     role: getChatRole(conversation, userId),
-    ...(type === "channel" ? { postAs: conversation.postAs === "channel" ? "channel" : "person" } : {})
+    ...(type === "channel" ? {
+      postAs: conversation.postAs === "channel" ? "channel" : "person",
+      isPrivate: conversation.isPrivate === true
+    } : {})
   };
 }
 
@@ -1295,6 +1376,7 @@ function createMessengerServer({
   maintenanceEnabled = false
 } = {}) {
   const connectedUsers = new Map();
+  const sessionStreams = new Map();
   const recentEvents = new Map();
   const eventSequences = new Map();
   const viewingClients = new Map();
@@ -1327,6 +1409,19 @@ function createMessengerServer({
     }
   }, 30_000);
   presenceCleanupTimer.unref();
+  const sessionStreamsCleanupTimer = setInterval(() => {
+    closeExpiredSessionStreams(sessionStreams, currentStore.sessions);
+  }, 15_000);
+  sessionStreamsCleanupTimer.unref();
+  const eventHistoryCleanupTimer = setInterval(() => {
+    cleanupExpiredEventHistory(
+      recentEvents,
+      eventSequences,
+      connectedUsers,
+      Date.now() - EVENT_HISTORY_TTL_MS
+    );
+  }, 60 * 60 * 1000);
+  eventHistoryCleanupTimer.unref();
   const registrationAttemptsCleanupTimer = setInterval(() => {
     const cutoff = Date.now() - 60 * 60 * 1000;
     for (const [address, attempts] of registrationAttempts) {
@@ -1365,7 +1460,7 @@ function createMessengerServer({
   function broadcast(userId, event, payload) {
     const sequence = (eventSequences.get(userId) || 0) + 1;
     eventSequences.set(userId, sequence);
-    const item = { id: sequence, event, data: JSON.stringify(payload) };
+    const item = { id: sequence, event, data: JSON.stringify(payload), createdAt: Date.now() };
     const history = recentEvents.get(userId) || [];
     history.push(item);
     if (history.length > 100) history.shift();
@@ -1381,6 +1476,9 @@ function createMessengerServer({
   app.use((request, response, next) => {
     response.setHeader("Referrer-Policy", "no-referrer");
     response.setHeader("X-Content-Type-Options", "nosniff");
+    response.setHeader("X-Frame-Options", "DENY");
+    response.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+    response.setHeader("Permissions-Policy", "camera=(), microphone=(self), geolocation=()");
     response.setHeader("Content-Security-Policy", "default-src 'self'; connect-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'");
     if (request.socket.encrypted || process.env.POLUS_COOKIE_SECURE === "true") {
       response.setHeader("Strict-Transport-Security", "max-age=31536000");
@@ -1393,6 +1491,29 @@ function createMessengerServer({
     try {
       const url = new URL(request.url, "http://localhost");
       const ip = getClientAddress(request);
+      if (url.pathname.startsWith("/api/")
+        && ["POST", "PUT", "PATCH", "DELETE"].includes(request.method)) {
+        const origin = request.headers.origin;
+        const fetchSite = request.headers["sec-fetch-site"];
+        if (typeof origin === "string") {
+          let originHost = "";
+          let requestHost = "";
+          try {
+            originHost = new URL(origin).host;
+            if (typeof request.headers.host === "string") {
+              requestHost = new URL(`http://${request.headers.host}`).host;
+            }
+          } catch {
+            throw new HttpError(403, "Cross-origin request rejected.");
+          }
+          if (!originHost || !requestHost || originHost.toLowerCase() !== requestHost.toLowerCase()) {
+            throw new HttpError(403, "Cross-origin request rejected.");
+          }
+        }
+        if (typeof fetchSite === "string" && !["same-origin", "none"].includes(fetchSite)) {
+          throw new HttpError(403, "Cross-origin request rejected.");
+        }
+      }
 
       if (request.method === "GET" && url.pathname === "/") {
         // Если форму когда-то отправили обычным GET-запросом, убираем личные данные из адреса.
@@ -1416,8 +1537,11 @@ function createMessengerServer({
         throw new HttpError(400, "JavaScript is required. Reload the page and try again.");
       }
 
-      if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/profile" || PUBLIC_FILES.has(url.pathname))) {
-        const isAppPage = url.pathname === "/" || url.pathname === "/profile";
+      if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/profile"
+        || /^\/channels\/[^/]+(?:\/settings)?$/.test(url.pathname) || /^\/join\/[^/]+$/.test(url.pathname)
+        || PUBLIC_FILES.has(url.pathname))) {
+        const isAppPage = url.pathname === "/" || url.pathname === "/profile"
+          || /^\/channels\/[^/]+(?:\/settings)?$/.test(url.pathname) || /^\/join\/[^/]+$/.test(url.pathname);
         const [fallbackFileName, contentType] = isAppPage
           ? [path.join(__dirname, "client", "index.html"), "text/html; charset=utf-8"]
           : PUBLIC_FILES.get(url.pathname);
@@ -1495,12 +1619,16 @@ function createMessengerServer({
           if (currentStore.users.some((user) => user.username === username)) {
             throw new HttpError(409, "That username is already taken.");
           }
+          const hashedPassword = await passwordHash(password);
+          if (currentStore.users.some((existing) => existing.username === username)) {
+            throw new HttpError(409, "That username is already taken.");
+          }
           const user = {
             id: randomId(),
             username,
             fullName,
             about,
-            passwordHash: await passwordHash(password),
+            passwordHash: hashedPassword,
             privacyAcceptedAt: new Date().toISOString(),
             privacyVersion: PRIVACY_VERSION,
             createdAt: new Date().toISOString()
@@ -1517,8 +1645,12 @@ function createMessengerServer({
         const now = Date.now();
         const recentAttempts = (loginAttempts.get(attemptKey) || [])
           .filter((time) => now - time < LOGIN_WINDOW_MS);
-        if (recentAttempts.length >= MAX_LOGIN_FAILURES) {
-          loginAttempts.set(attemptKey, recentAttempts);
+        const recentUsernameAttempts = (loginAttemptsByUsername.get(username) || [])
+          .filter((time) => now - time < LOGIN_WINDOW_MS);
+        loginAttempts.set(attemptKey, recentAttempts);
+        loginAttemptsByUsername.set(username, recentUsernameAttempts);
+        if (recentAttempts.length >= MAX_LOGIN_FAILURES
+          || recentUsernameAttempts.length >= MAX_LOGIN_FAILURES) {
           throw new HttpError(429, "Too many failed sign-in attempts. Try again in 15 minutes.");
         }
         const user = currentStore.users.find((item) => item.username === username);
@@ -1527,9 +1659,11 @@ function createMessengerServer({
           : (await passwordHash("invalid-login-attempt", "polus-dummy-salt"), false);
         if (!valid) {
           loginAttempts.set(attemptKey, [...recentAttempts, now]);
+          loginAttemptsByUsername.set(username, [...recentUsernameAttempts, now]);
           throw new HttpError(401, "Incorrect username or password.");
         }
         loginAttempts.delete(attemptKey);
+        loginAttemptsByUsername.delete(username);
         const { cookie } = makeSession(request, currentStore, user);
         await persist();
         sendJson(response, 200, { user: publicUser(user) }, { "Set-Cookie": cookie });
@@ -1538,9 +1672,7 @@ function createMessengerServer({
 
       if (request.method === "POST" && url.pathname === "/api/auth/logout") {
         const auth = requireAuth(request, currentStore);
-        const body = Number(request.headers["content-length"] || 0) > 0
-          ? await readJsonBody(request)
-          : {};
+        const body = await readJsonBody(request, { allowEmpty: true });
         const pushEndpoint = typeof body.pushEndpoint === "string" ? body.pushEndpoint : "";
         if (pushEndpoint) {
           currentStore.pushSubscriptions = currentStore.pushSubscriptions.filter(
@@ -1549,6 +1681,7 @@ function createMessengerServer({
         }
         currentStore.sessions = currentStore.sessions.filter((item) => item.id !== auth.session.id);
         await persist();
+        closeSessionStreams(sessionStreams, auth.session.id);
         sendJson(response, 200, { ok: true }, {
           "Set-Cookie": "polus_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
         });
@@ -1567,7 +1700,7 @@ function createMessengerServer({
         }
         let chatId = null;
         if (input.visible && input.conversationId) {
-          const { conversation } = findConversation(currentStore, input.conversationId, user.id);
+          const { conversation } = findReadableConversation(currentStore, input.conversationId, user.id);
           chatId = conversation.id;
         }
         if (!viewingClients.has(user.id)) viewingClients.set(user.id, new Map());
@@ -1767,8 +1900,13 @@ function createMessengerServer({
       if (["GET", "HEAD"].includes(request.method) && attachmentRoute) {
         const attachment = currentStore.attachments.find((item) => item.id === decodePathComponent(attachmentRoute[1]));
         const attachmentChat = attachment ? getChatRecord(currentStore, attachment.chatId) : null;
-        const publicMedia = attachmentChat && currentStore.channels.includes(attachmentChat)
-          && /^(image|video)\//.test(attachment?.mimeType || "");
+        const publishedMessage = attachment?.messageId
+          ? currentStore.messages.find((message) => message.id === attachment.messageId
+            && (message.conversationId || message.room) === attachment.chatId
+            && !message.deleted && (message.attachmentIds || []).includes(attachment.id))
+          : null;
+        const publicMedia = publishedMessage && attachmentChat && currentStore.channels.includes(attachmentChat)
+          && !attachmentChat.isPrivate;
         if (!attachment || !attachmentChat || (!getChatRole(attachmentChat, user.id) && !publicMedia)) {
           throw new HttpError(404, "File not found.");
         }
@@ -1832,6 +1970,7 @@ function createMessengerServer({
         }
         const fileStream = fileHandle.createReadStream(range ? { start, end } : {});
         fileStream.on("close", () => { void fileHandle.close().catch((error) => console.error("Attachment close failed:", error)); });
+        response.on("close", () => fileStream.destroy());
         fileStream.pipe(response);
         return;
       }
@@ -1862,6 +2001,7 @@ function createMessengerServer({
         });
         const avatarStream = fileHandle.createReadStream();
         avatarStream.on("close", () => { void fileHandle.close().catch((error) => console.error("Avatar close failed:", error)); });
+        response.on("close", () => avatarStream.destroy());
         avatarStream.pipe(response);
         return;
       }
@@ -1997,7 +2137,7 @@ function createMessengerServer({
         const chatId = decodePathComponent(url.pathname.split("/")[3]);
         const chat = getChatRecord(currentStore, chatId);
         const role = chat ? getChatRole(chat, user.id) : null;
-        const isPublicChannel = Boolean(chat && currentStore.channels.includes(chat));
+        const isPublicChannel = Boolean(chat && currentStore.channels.includes(chat) && !chat.isPrivate);
         const kind = url.searchParams.get("kind") || "";
         if (!chat || (!role && !(isPublicChannel && ["media", "links"].includes(kind)))) {
           throw new HttpError(404, "Chat not found.");
@@ -2084,7 +2224,7 @@ function createMessengerServer({
       const searchRoute = /^\/api\/chats\/([^/]+)\/search$/.exec(url.pathname);
       if (request.method === "GET" && searchRoute) {
         const chatId = decodePathComponent(searchRoute[1]);
-        const { conversation } = findConversation(currentStore, chatId, user.id);
+        const { conversation } = findReadableConversation(currentStore, chatId, user.id);
         const query = cleanText(url.searchParams.get("q") || "", 200).toLocaleLowerCase();
         if (!query) {
           sendJson(response, 200, { results: [] });
@@ -2115,16 +2255,24 @@ function createMessengerServer({
 
       if (request.method === "GET" && url.pathname === "/api/bootstrap") {
         const userConversations = [
-          ...currentStore.channels,
-          ...currentStore.conversations.filter((conversation) => conversation.memberIds.includes(user.id))
-        ];
+            ...currentStore.channels.filter((channel) =>
+              channel.memberIds.includes(user.id) || !channel.isPrivate
+            ),
+            ...currentStore.conversations.filter((conversation) =>
+              conversation.memberIds.includes(user.id)
+                && !(user.hiddenChatIds || []).includes(conversation.id)
+            )
+          ];
         const summaryIndex = buildConversationSummaryIndex(
           currentStore, userConversations, user.id, queryUnreadCount, queryLastMessage
         );
         const channels = currentStore.channels
+          .filter((channel) => (channel.memberIds.includes(user.id) || !channel.isPrivate)
+            && !(user.hiddenChatIds || []).includes(channel.id))
           .map((channel) => chatSummary(channel, user.id, summaryIndex));
         const directs = currentStore.conversations
-          .filter((conversation) => conversation.memberIds.includes(user.id))
+          .filter((conversation) => conversation.memberIds.includes(user.id)
+            && !(user.hiddenChatIds || []).includes(conversation.id))
           .map((conversation) => chatSummary(conversation, user.id, summaryIndex));
         sendJson(response, 200, {
           user: { ...publicUser(user), hideNotificationContent: user.hideNotificationContent === true },
@@ -2136,7 +2284,71 @@ function createMessengerServer({
         return;
       }
 
-      const chatRoute = /^\/api\/chats\/([^/]+)(?:\/(members|admins|owner|leave|settings))?(?:\/([^/]+))?$/.exec(url.pathname);
+      const userChatRoute = /^\/api\/chats\/([^/]+)\/(pin|hide)$/.exec(url.pathname);
+      if (userChatRoute && (request.method === "PUT" || request.method === "DELETE")) {
+        const chatId = decodePathComponent(userChatRoute[1]);
+        const chat = getChatRecord(currentStore, chatId);
+        if (!chat || !getChatRole(chat, user.id)) throw new HttpError(404, "Chat not found.");
+        const preference = userChatRoute[2] === "pin" ? "pinnedChatIds" : "hiddenChatIds";
+        const chatType = currentStore.channels.includes(chat) ? "channel" : chat.type || "group";
+        if (preference === "hiddenChatIds" && chatType === "saved") {
+          throw new HttpError(400, "Saved Messages cannot be deleted.");
+        }
+        user[preference] = Array.isArray(user[preference]) ? user[preference] : [];
+        if (request.method === "PUT" && !user[preference].includes(chatId)) {
+          user[preference].push(chatId);
+        } else if (request.method === "DELETE") {
+          user[preference] = user[preference].filter((id) => id !== chatId);
+        }
+        await persist();
+        broadcast(user.id, "chat-updated", {
+          chatId,
+          action: preference === "pinnedChatIds" ? "pin-changed" : "visibility-changed",
+          pinned: user.pinnedChatIds.includes(chatId),
+          hidden: user.hiddenChatIds.includes(chatId)
+        });
+        sendJson(response, 200, { ok: true, pinned: user.pinnedChatIds.includes(chatId) });
+        return;
+      }
+
+      const channelProfileRoute = /^\/api\/channels\/([^/]+)\/profile$/.exec(url.pathname);
+      if (request.method === "GET" && channelProfileRoute) {
+        const channelId = decodePathComponent(channelProfileRoute[1]);
+        const channel = currentStore.channels.find((item) => item.id === channelId);
+        if (!channel || (channel.isPrivate && !channel.memberIds.includes(user.id))) {
+          throw new HttpError(404, "Chat not found.");
+        }
+        sendJson(response, 200, {
+          chat: chatSummary(channel, user.id),
+          memberCount: channel.memberIds.length
+        });
+        return;
+      }
+
+      const inviteJoinRoute = /^\/api\/invites\/([^/]+)\/join$/.exec(url.pathname);
+      if (request.method === "POST" && inviteJoinRoute) {
+        const token = decodePathComponent(inviteJoinRoute[1]);
+        const chat = [...currentStore.channels, ...currentStore.conversations]
+          .find((item) => item.inviteToken === token);
+        if (!chat || !["channel", "group"].includes(chat.type)) throw new HttpError(404, "Invite link not found.");
+        if (!chat.memberIds.includes(user.id)) {
+          if (chat.type === "group" && chat.memberIds.length >= 200) {
+            throw new HttpError(409, "Groups cannot have more than 200 participants.");
+          }
+          chat.memberIds.push(user.id);
+          chat.unreadCounts = chat.unreadCounts || {};
+          chat.unreadCounts[user.id] = 0;
+          chat.lastReadMessageIds = chat.lastReadMessageIds || {};
+          chat.lastReadMessageIds[user.id] = latestMessageId(currentStore, chat.id);
+          user.hiddenChatIds = (user.hiddenChatIds || []).filter((id) => id !== chat.id);
+          await persist();
+          broadcastChatMembers(chat, "chat-updated", { chatId: chat.id, action: "member-added", userId: user.id }, broadcast);
+        }
+        sendJson(response, 200, chatSummary(chat, user.id));
+        return;
+      }
+
+      const chatRoute = /^\/api\/chats\/([^/]+)(?:\/(members|admins|owner|leave|settings|invite))?(?:\/([^/]+))?$/.exec(url.pathname);
       if (chatRoute) {
         const chatId = decodePathComponent(chatRoute[1]);
         const section = chatRoute[2] || "";
@@ -2145,12 +2357,33 @@ function createMessengerServer({
         const role = chat ? getChatRole(chat, user.id) : null;
         if (!chat || !role) throw new HttpError(404, "Chat not found.");
         const chatType = currentStore.channels.includes(chat) ? "channel" : chat.type || "group";
-        if (chatType === "saved") throw new HttpError(400, "Saved Messages cannot be managed.");
-        if (chatType === "direct") throw new HttpError(400, "Direct chats cannot be managed.");
+        if (chatType === "saved" && !(request.method === "DELETE" && !section)) {
+          throw new HttpError(400, "Saved Messages cannot be managed.");
+        }
+        if (chatType === "direct" && !(request.method === "DELETE" && !section)) {
+          throw new HttpError(400, "Direct chats cannot be managed.");
+        }
+
+        if (section === "invite" && !targetId && request.method === "POST") {
+          requireChatRole(chat, user.id, ["owner", "admin"]);
+          chat.inviteToken = crypto.randomBytes(32).toString("base64url");
+          await persist();
+          sendJson(response, 200, { inviteUrl: `/join/${chat.inviteToken}` });
+          return;
+        }
+        if (section === "invite" && !targetId && request.method === "DELETE") {
+          requireChatRole(chat, user.id, ["owner", "admin"]);
+          delete chat.inviteToken;
+          await persist();
+          sendJson(response, 200, { ok: true });
+          return;
+        }
 
         if (request.method === "GET" && !section) {
           sendJson(response, 200, {
             chat: chatSummary(chat, user.id),
+            inviteUrl: ["owner", "admin"].includes(role) && chat.inviteToken
+              ? `/join/${chat.inviteToken}` : null,
             members: chat.memberIds.map((memberId) => {
               const member = currentStore.users.find((candidate) => candidate.id === memberId);
               return member ? { ...publicUser(member), role: getChatRole(chat, memberId) } : null;
@@ -2163,10 +2396,20 @@ function createMessengerServer({
           requireChatRole(chat, user.id, ["owner"]);
           if (chatType !== "channel") throw new HttpError(400, "Only channel settings can be changed here.");
           const input = await readJsonBody(request);
-          if (input.postAs !== "channel" && input.postAs !== "person") {
+          if (input.postAs !== undefined && input.postAs !== "channel" && input.postAs !== "person") {
             throw new HttpError(400, "Post identity must be channel or person.");
           }
-          chat.postAs = input.postAs;
+          const name = input.name === undefined ? undefined : cleanText(input.name, 50);
+          if (name !== undefined && Array.from(name).length < 2) {
+            throw new HttpError(400, "Channel name is too short.");
+          }
+          if (input.description !== undefined && typeof input.description !== "string") {
+            throw new HttpError(400, "Channel description must be text.");
+          }
+          if (name !== undefined) chat.name = name;
+          if (input.description !== undefined) chat.description = cleanText(input.description, 160);
+          if (input.postAs !== undefined) chat.postAs = input.postAs;
+          if (typeof input.isPrivate === "boolean") chat.isPrivate = input.isPrivate;
           await persist();
           broadcastChatMembers(chat, "chat-updated", { chatId, action: "settings-changed" }, broadcast);
           sendJson(response, 200, { chat: chatSummary(chat, user.id) });
@@ -2271,12 +2514,34 @@ function createMessengerServer({
         }
 
         if (request.method === "DELETE" && !section) {
-          requireChatRole(chat, user.id, ["owner"]);
-          const removed = removeChatData(currentStore, chatId);
-          const uploadsRoot = path.resolve(dataDirectory, "uploads");
-          await removeUnreferencedAttachmentFiles(currentStore, removed.removedAttachments, uploadsRoot);
+          const deletionScope = url.searchParams.get("scope") || "everyone";
+          if (deletionScope !== "me" && deletionScope !== "everyone") {
+            throw new HttpError(400, "Deletion scope must be me or everyone.");
+          }
+          if (deletionScope === "everyone") {
+            if (chatType === "saved") throw new HttpError(400, "Saved Messages cannot be deleted.");
+            requireChatRole(chat, user.id, chatType === "direct" ? ["member", "owner"] : ["owner"]);
+            const removed = removeChatData(currentStore, chatId);
+            const uploadsRoot = path.resolve(dataDirectory, "uploads");
+            await removeUnreferencedAttachmentFiles(currentStore, removed.removedAttachments, uploadsRoot);
+            for (const memberId of chat.memberIds) {
+              const member = currentStore.users.find((candidate) => candidate.id === memberId);
+              if (member) {
+                member.hiddenChatIds = (member.hiddenChatIds || []).filter((id) => id !== chatId);
+                member.pinnedChatIds = (member.pinnedChatIds || []).filter((id) => id !== chatId);
+              }
+            }
+            await persist();
+            broadcastChatMembers(chat, "chat-updated", { chatId, action: "chat-deleted" }, broadcast);
+            sendJson(response, 200, { ok: true });
+            return;
+          }
+          if (chatType === "saved") throw new HttpError(400, "Saved Messages cannot be deleted.");
+          user.hiddenChatIds = user.hiddenChatIds || [];
+          if (!user.hiddenChatIds.includes(chatId)) user.hiddenChatIds.push(chatId);
+          user.pinnedChatIds = (user.pinnedChatIds || []).filter((id) => id !== chatId);
           await persist();
-          broadcastChatMembers(chat, "chat-updated", { chatId, action: "chat-deleted" }, broadcast);
+          broadcast(user.id, "chat-updated", { chatId, action: "chat-hidden", userId: user.id });
           sendJson(response, 200, { ok: true });
           return;
         }
@@ -2294,6 +2559,7 @@ function createMessengerServer({
         if (Array.from(about).length > 200) {
           throw new HttpError(400, "About must be at most 200 characters.");
         }
+        const revokedSessionIds = [];
         if (input.newPassword) {
           if (typeof input.newPassword !== "string"
             || Array.from(input.newPassword).length < 8 || Array.from(input.newPassword).length > 128) {
@@ -2304,6 +2570,9 @@ function createMessengerServer({
             throw new HttpError(401, "Current password is incorrect.");
           }
           user.passwordHash = await passwordHash(input.newPassword);
+          revokedSessionIds.push(...currentStore.sessions
+            .filter((session) => session.userId === user.id && session.id !== auth.session.id)
+            .map((session) => session.id));
           currentStore.sessions = currentStore.sessions.filter((session) =>
             session.userId !== user.id || session.id === auth.session.id
           );
@@ -2315,6 +2584,9 @@ function createMessengerServer({
           user.hideNotificationContent = input.hideNotificationContent;
         }
         await persist();
+        for (const sessionId of revokedSessionIds) {
+          closeSessionStreams(sessionStreams, sessionId);
+        }
         sendJson(response, 200, {
           user: {
             ...publicUser(user),
@@ -2347,6 +2619,7 @@ function createMessengerServer({
           type: "channel",
           name,
           description,
+          isPrivate: input.isPrivate === true,
           createdBy: user.id,
           ownerId: user.id,
           adminIds: [],
@@ -2398,7 +2671,9 @@ function createMessengerServer({
       if (request.method === "POST" && /^\/api\/channels\/[^/]+\/join$/.test(url.pathname)) {
         const id = decodePathComponent(url.pathname.split("/")[3]);
         const channel = currentStore.channels.find((item) => item.id === id);
-        if (!channel) throw new HttpError(404, "Channel not found.");
+        if (!channel || (channel.isPrivate && !channel.memberIds.includes(user.id))) {
+          throw new HttpError(404, "Channel not found.");
+        }
         if (!channel.memberIds.includes(user.id)) {
           channel.memberIds.push(user.id);
           channel.unreadCounts = channel.unreadCounts || {};
@@ -2469,7 +2744,7 @@ function createMessengerServer({
 
       if (request.method === "GET" && url.pathname === "/api/messages") {
         const conversationId = url.searchParams.get("conversationId") || "";
-        findConversation(currentStore, conversationId, user.id);
+        findReadableConversation(currentStore, conversationId, user.id);
         const allMessages = currentStore.messages
           .filter((message) => (message.conversationId || message.room) === conversationId
             && canReadMessage(currentStore, message, user.id))
@@ -2532,11 +2807,12 @@ function createMessengerServer({
           throw new HttpError(429, "You can send at most 20 messages per minute.");
         }
         let chatId = conversationId;
+        let pendingDirect = null;
         if (recipient) {
           let direct = findDirectConversation(currentStore, user.id, recipient.id);
           if (!direct) {
             const memberIds = [user.id, recipient.id].sort();
-            direct = {
+            pendingDirect = {
               id: `dm_${memberIds.join("_")}`,
               type: "direct",
               memberIds,
@@ -2546,11 +2822,18 @@ function createMessengerServer({
               lastReadMessageIds: {},
               createdAt: new Date().toISOString()
             };
-            currentStore.conversations.push(direct);
+            direct = pendingDirect;
           }
           chatId = direct.id;
         }
-        const { type, conversation } = findConversation(currentStore, chatId, user.id);
+        let type;
+        let conversation;
+        if (pendingDirect) {
+          type = "direct";
+          conversation = pendingDirect;
+        } else {
+          ({ type, conversation } = findConversation(currentStore, chatId, user.id));
+        }
         const replyToId = input.replyToId === undefined || input.replyToId === null
           ? null
           : Number(input.replyToId);
@@ -2585,6 +2868,7 @@ function createMessengerServer({
           || !attachments[0].mimeType.startsWith("audio/"))) {
           throw new HttpError(400, "A voice message must contain one audio file.");
         }
+        if (pendingDirect) currentStore.conversations.push(pendingDirect);
         messageAttempts.set(user.id, [...recentAttempts, now]);
         const createdAt = new Date(now).toISOString();
         const message = {
@@ -2610,6 +2894,7 @@ function createMessengerServer({
           ...link
         })));
         currentStore.messages.push(message);
+        unhideChatForMembers(currentStore, conversation);
         for (const recipientId of conversation.memberIds) {
           conversation.unreadCounts = conversation.unreadCounts || {};
           conversation.lastReadMessageIds = conversation.lastReadMessageIds || {};
@@ -2633,6 +2918,14 @@ function createMessengerServer({
             );
           }
         }
+        if (type === "channel" && !conversation.isPrivate) {
+          for (const [viewerId, viewerClients] of viewingClients) {
+            if (conversation.memberIds.includes(viewerId) || !connectedUsers.has(viewerId)) continue;
+            const isViewingChannel = [...viewerClients.values()].some((view) =>
+              view.visible && view.chatId === conversation.id);
+            if (isViewingChannel) broadcast(viewerId, "message", safeMessage);
+          }
+        }
         sendJson(response, 201, {
           ...safeMessage,
           conversation: chatSummary(conversation, user.id)
@@ -2645,7 +2938,7 @@ function createMessengerServer({
         const sourceMessage = currentStore.messages.find((item) => item.id === Number(decodePathComponent(saveMessageRoute[1])));
         if (!sourceMessage || sourceMessage.deleted) throw new HttpError(404, "Message not found.");
         const sourceChatId = sourceMessage.conversationId || sourceMessage.room;
-        const { type: sourceType, conversation: sourceChat } = findConversation(currentStore, sourceChatId, user.id);
+        const { type: sourceType, conversation: sourceChat } = findReadableConversation(currentStore, sourceChatId, user.id);
         if (sourceType === "saved") throw new HttpError(400, "Messages already in Saved Messages cannot be saved again.");
 
         const now = Date.now();
@@ -2851,6 +3144,7 @@ function createMessengerServer({
             createdAt
           })));
         currentStore.messages.push(message);
+        unhideChatForMembers(currentStore, targetChat);
         for (const recipientId of targetChat.memberIds) {
           targetChat.unreadCounts = targetChat.unreadCounts || {};
           targetChat.lastReadMessageIds = targetChat.lastReadMessageIds || {};
@@ -2887,18 +3181,33 @@ function createMessengerServer({
           throw new HttpError(404, "Message not found.");
         }
         const input = await readJsonBody(request);
+        const reactionChatId = message.conversationId || message.room;
+        const reactionChat = getChatRecord(currentStore, reactionChatId);
+        if (!reactionChat || !getChatRole(reactionChat, user.id)) {
+          throw new HttpError(404, "Message not found.");
+        }
         if (typeof input.emoji !== "string" || !MESSAGE_REACTIONS.has(input.emoji)) {
           throw new HttpError(400, "Unsupported reaction.");
         }
         const reactions = message.reactions && typeof message.reactions === "object"
           ? message.reactions
           : {};
-        const userIds = Array.isArray(reactions[input.emoji]) ? reactions[input.emoji] : [];
         message.reactions = { ...reactions };
-        if (userIds.includes(user.id)) {
-          message.reactions[input.emoji] = userIds.filter((userId) => userId !== user.id);
-          if (message.reactions[input.emoji].length === 0) delete message.reactions[input.emoji];
+        const selectedEmoji = Object.entries(message.reactions)
+          .find(([, userIds]) => Array.isArray(userIds) && userIds.includes(user.id))?.[0];
+        if (selectedEmoji === input.emoji) {
+          for (const [emoji, userIds] of Object.entries(message.reactions)) {
+            if (!Array.isArray(userIds) || !userIds.includes(user.id)) continue;
+            message.reactions[emoji] = userIds.filter((userId) => userId !== user.id);
+            if (message.reactions[emoji].length === 0) delete message.reactions[emoji];
+          }
         } else {
+          for (const [emoji, userIds] of Object.entries(message.reactions)) {
+            if (!Array.isArray(userIds) || !userIds.includes(user.id)) continue;
+            message.reactions[emoji] = userIds.filter((userId) => userId !== user.id);
+            if (message.reactions[emoji].length === 0) delete message.reactions[emoji];
+          }
+          const userIds = Array.isArray(message.reactions[input.emoji]) ? message.reactions[input.emoji] : [];
           message.reactions[input.emoji] = [...userIds, user.id];
         }
         await persist();
@@ -2915,7 +3224,9 @@ function createMessengerServer({
         const id = decodePathComponent(url.pathname.split("/")[3]);
         const numericId = Number(id);
         const targetMessage = currentStore.messages.find((item) => item.id === numericId);
-        if (!targetMessage || !canReadMessage(currentStore, targetMessage, user.id)) {
+        const targetChatId = targetMessage?.conversationId || targetMessage?.room;
+        if (!targetMessage || !canReadMessage(currentStore, targetMessage, user.id)
+          || !canAccessChat(currentStore, targetChatId, user.id)) {
           throw new HttpError(404, "Message not found.");
         }
         if (targetMessage.deleted) throw new HttpError(400, "Deleted messages cannot be edited.");
@@ -2954,7 +3265,11 @@ function createMessengerServer({
       if (request.method === "DELETE" && /^\/api\/messages\/[^/]+$/.test(url.pathname)) {
         const id = decodePathComponent(url.pathname.split("/")[3]);
         const message = currentStore.messages.find((item) => item.id === Number(id));
-        if (!message || !canReadMessage(currentStore, message, user.id)) throw new HttpError(404, "Message not found.");
+        const chatId = message?.conversationId || message?.room;
+        if (!message || !canReadMessage(currentStore, message, user.id)
+          || !canAccessChat(currentStore, chatId, user.id)) {
+          throw new HttpError(404, "Message not found.");
+        }
         if (message.deleted) {
           sendJson(response, 200, { ok: true });
           return;
@@ -3014,10 +3329,15 @@ function createMessengerServer({
         }
         if (!connectedUsers.has(user.id)) connectedUsers.set(user.id, new Set());
         connectedUsers.get(user.id).add(response);
+        if (!sessionStreams.has(auth.session.id)) sessionStreams.set(auth.session.id, new Set());
+        sessionStreams.get(auth.session.id).add(response);
         const heartbeat = setInterval(() => response.write(": keep-alive\n\n"), 25000);
         response.on("close", () => {
           clearInterval(heartbeat);
           connectedUsers.get(user.id)?.delete(response);
+          const streams = sessionStreams.get(auth.session.id);
+          streams?.delete(response);
+          if (streams?.size === 0) sessionStreams.delete(auth.session.id);
           if (connectedUsers.get(user.id)?.size === 0) {
             connectedUsers.delete(user.id);
             user.lastSeenAt = new Date().toISOString();
@@ -3078,6 +3398,10 @@ function createMessengerServer({
         });
         return;
       }
+      if (request.aborted && error.code === "ECONNRESET") {
+        console.warn("Client disconnected before request completed:", request.method, request.url.split("?")[0]);
+        return;
+      }
       console.error("Request failed:", error);
       if (!response.headersSent) {
         sendJson(response, 500, {
@@ -3091,6 +3415,8 @@ function createMessengerServer({
   const server = http.createServer(app);
   server.on("close", () => {
     clearInterval(presenceCleanupTimer);
+    clearInterval(sessionStreamsCleanupTimer);
+    clearInterval(eventHistoryCleanupTimer);
     clearInterval(registrationAttemptsCleanupTimer);
     if (maintenanceTimer) clearInterval(maintenanceTimer);
   });
@@ -3233,6 +3559,8 @@ if (require.main === module) {
 module.exports = {
   createMessengerServer,
   createEmptyStore,
+  cleanupExpiredEventHistory,
+  closeExpiredSessionStreams,
   cleanupExpiredData,
   createPushPayload,
   createSqliteStoreWriter,
