@@ -1,6 +1,7 @@
 import { createRoot } from "react-dom/client";
 import { Component, createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { requestJson } from "./apiClient.mjs";
+import { accountApiUrl, getActiveAccountKey, requestJson, setActiveAccountKey } from "./apiClient.mjs";
+import { createAccountKey, getRequestedAccountUserId, getStoredAccounts, saveAccounts } from "./accounts.mjs";
 import { createImageThumbnail, uploadAttachment, uploadAttachmentThumbnail } from "./attachmentUploads.mjs";
 import { cropAvatar } from "./avatar.mjs";
 import { getConversationHeaderControls, orderConversations } from "./conversationList.mjs";
@@ -392,7 +393,9 @@ function ReactConversationRow({ conversation, selected, discover, userId, langua
       <span className="chat-row-body">
         <span className="chat-row-top">
           <span className="chat-row-name">
-            <span className="chat-row-name-text">{saved ? text.savedMessages : conversation.name}</span>
+            <span className="chat-row-name-text" title={saved ? text.savedMessages : conversation.name}>
+              {saved ? text.savedMessages : conversation.name}
+            </span>
             {conversation.pinned && !saved && !discover && (
               <span className="chat-row-pinned" title={text.pinnedChat} aria-label={text.pinnedChat}>
                 <svg viewBox="0 0 16 16" aria-hidden="true">
@@ -401,17 +404,21 @@ function ReactConversationRow({ conversation, selected, discover, userId, langua
               </span>
             )}
           </span>
-          {lastTime && !discover && <span className="chat-row-time">{listTime(lastTime, language)}</span>}
         </span>
         <span className="chat-row-bottom">
-          <span className="chat-row-preview">{description}</span>
-          {!discover && conversation.unreadCount > 0 && (
-            <span className={conversation.muted ? "unread-badge is-muted" : "unread-badge"}>
-              {conversation.unreadCount > 99 ? "99+" : conversation.unreadCount}
-            </span>
-          )}
-          {discover && <span className="join-channel">{text.openChannel}</span>}
+          <span className="chat-row-preview" title={description}>{description}</span>
         </span>
+      </span>
+      <span className="chat-row-meta">
+        {lastTime && !discover && (
+          <time className="chat-row-time" dateTime={lastTime}>{listTime(lastTime, language)}</time>
+        )}
+        {discover && <span className="join-channel">{text.openChannel}</span>}
+        {!discover && conversation.unreadCount > 0 && (
+          <span className={conversation.muted ? "unread-badge is-muted" : "unread-badge"}>
+            {conversation.unreadCount > 99 ? "99+" : conversation.unreadCount}
+          </span>
+        )}
       </span>
     </button>
     {!discover && !saved && (
@@ -443,12 +450,26 @@ function ReactConversationRow({ conversation, selected, discover, userId, langua
 
 function SidebarSearch() {
   const [query, setQuery] = useState("");
+  const searchRef = useRef(null);
   const language = useCurrentLanguage();
   useLayoutEffect(() => {
-    const clear = () => setQuery("");
+    const clear = () => {
+      setQuery("");
+      document.dispatchEvent(new CustomEvent("polus:sidebar-search", { detail: { query: "" } }));
+    };
+    const openPeopleSearch = (event) => {
+      const nextQuery = event.detail?.query || "";
+      setQuery(nextQuery);
+      document.dispatchEvent(new CustomEvent("polus:sidebar-search", { detail: { query: nextQuery } }));
+      searchRef.current?.focus();
+    };
     document.addEventListener("polus:clear-sidebar-search", clear);
+    document.addEventListener("polus:open-people-search", openPeopleSearch);
+    document.addEventListener("polus:close-people-search", clear);
     return () => {
       document.removeEventListener("polus:clear-sidebar-search", clear);
+      document.removeEventListener("polus:open-people-search", openPeopleSearch);
+      document.removeEventListener("polus:close-people-search", clear);
     };
   }, []);
 
@@ -458,6 +479,7 @@ function SidebarSearch() {
       <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5" /><path d="m16 16 4.5 4.5" /></svg>
       <input
         id="sidebar-search"
+        ref={searchRef}
         type="search"
         autoComplete="off"
         placeholder={language === "ru" ? "Поиск" : "Search"}
@@ -532,7 +554,7 @@ function ConversationList({ userId }) {
           />
         ))}
       </nav>
-      {visible.open.length > 0 && (
+      {!normalizedQuery && visible.open.length > 0 && (
         <section className="chat-list-section">
           <h2 className="chat-list-heading">{text.discover}</h2>
           <nav className="chat-list" aria-label={language === "ru" ? "Открытые каналы" : "Open channels"}>
@@ -550,17 +572,15 @@ function ConversationList({ userId }) {
           </nav>
         </section>
       )}
-      {normalizedQuery && (
-        <button
-          type="button"
-          className="chat-row people-row"
-          onClick={() => document.dispatchEvent(new CustomEvent("polus:find-people"))}
-        >
-          <span className="chat-avatar avatar-tone-5" aria-hidden="true">⌕</span>
-          <span className="chat-row-body">
-            <span className="chat-row-name">{text.findPeopleFor} {query.trim()}</span>
-          </span>
-        </button>
+      {normalizedQuery.replace(/^@/, "").length >= 2 && (
+        <section className="chat-list-section people-search-section">
+          <h2 className="chat-list-heading">{language === "ru" ? "Люди" : "People"}</h2>
+          <DiscoverySearchResults
+            query={query}
+            conversations={[...snapshot.channels, ...snapshot.directs]}
+            onOpenConversation={openConversation}
+          />
+        </section>
       )}
       {!normalizedQuery && visible.mine.length === 0 && visible.open.length === 0 && (
         <p className="chat-list-empty">{text.noChats}</p>
@@ -1412,10 +1432,11 @@ function UploadStatus({ upload, language, onCancel }) {
   );
 }
 
-function UserSearchResults({ query }) {
-  const [users, setUsers] = useState([]);
+function DiscoverySearchResults({ query, conversations, onOpenConversation }) {
+  const [results, setResults] = useState({ users: [], channels: [], groups: [] });
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [busyId, setBusyId] = useState("");
   const language = useCurrentLanguage();
   const normalizedQuery = query.trim().replace(/^@/, "");
 
@@ -1423,21 +1444,21 @@ function UserSearchResults({ query }) {
     let active = true;
     setError("");
     if (normalizedQuery.length < 2) {
-      setUsers([]);
+      setResults({ users: [], channels: [], groups: [] });
       setLoading(false);
       return () => { active = false; };
     }
 
-    setUsers([]);
+    setResults({ users: [], channels: [], groups: [] });
     setLoading(true);
     const timer = setTimeout(() => {
-      requestJson(`/api/users?q=${encodeURIComponent(query)}`)
+      requestJson(`/api/discover?q=${encodeURIComponent(query)}`)
         .then((result) => {
-          if (active) setUsers(result);
+          if (active) setResults(result);
         })
         .catch((cause) => {
           if (active) {
-            setUsers([]);
+            setResults({ users: [], channels: [], groups: [] });
             setError(cause.message);
           }
         })
@@ -1451,17 +1472,66 @@ function UserSearchResults({ query }) {
     };
   }, [normalizedQuery, query]);
 
-  const message = normalizedQuery.length < 2
-    ? (language === "ru" ? "Введи не меньше двух символов, чтобы найти людей." : "Type at least two characters to find people.")
-    : loading
-      ? (language === "ru" ? "Ищем людей…" : "Searching…")
-      : error || (language === "ru" ? "Никого не нашли. Проверь имя пользователя." : "No matches. Check the username and try again.");
+  const joinOrOpen = async (item) => {
+    setBusyId(item.id);
+    try {
+      if (item.joined) {
+        const existing = conversations.find((conversation) => conversation.id === item.id);
+        const { chat } = existing
+          ? { chat: existing }
+          : await requestJson(`/api/chats/${encodeURIComponent(item.id)}`);
+        onOpenConversation(chat);
+      } else {
+        const chat = await requestJson(`/api/${item.type === "channel" ? "channels" : "groups"}/${encodeURIComponent(item.id)}/join`, {
+          method: "POST"
+        });
+        onOpenConversation(chat);
+      }
+    } catch (cause) {
+      document.dispatchEvent(new CustomEvent("polus:notify", { detail: cause.message }));
+    } finally {
+      setBusyId("");
+    }
+  };
+
+  const renderCommunityResults = (items) => items.map((item) => (
+    <div className="user-result discovery-result" key={item.id}>
+      <span className={`result-avatar discovery-avatar avatar-tone-${avatarTone(item.id)}`} aria-hidden="true">
+        {initials(item.name)}
+      </span>
+      <span className="result-copy">
+        <strong>{item.name}</strong>
+        <small>{item.description || (language === "ru" ? "Участников" : "Members")} · {item.memberCount}</small>
+      </span>
+      <button
+        className="discovery-action"
+        type="button"
+        disabled={busyId === item.id}
+        onClick={() => void joinOrOpen(item)}
+      >
+        {busyId === item.id ? "…" : item.joined
+          ? (language === "ru" ? "Открыть" : "Open")
+          : (language === "ru" ? "Вступить" : "Join")}
+      </button>
+    </div>
+  ));
+  const isAlreadyJoined = (item) => conversations.some((conversation) =>
+    conversation.id === item.id && conversation.joined !== false);
+  const channels = results.channels.filter((item) => !isAlreadyJoined(item));
+  const groups = results.groups.filter((item) => !isAlreadyJoined(item));
+  const hasResults = results.users.length + channels.length + groups.length > 0;
 
   return (
-    <div id="user-results" className="user-results">
-      {users.length === 0
-        ? <div className="no-results">{message}</div>
-        : users.map((user) => (
+    <div className="user-results discovery-results" aria-live="polite">
+      {loading && <div className="no-results">{language === "ru" ? "Ищем…" : "Searching…"}</div>}
+      {error && <div className="no-results" role="alert">{error}</div>}
+      {!loading && !error && !hasResults && (
+        <div className="no-results">{language === "ru" ? "Ничего не найдено." : "No results found."}</div>
+      )}
+      {!loading && results.users.length > 0 && (
+        <section>
+          <h3 className="discovery-heading">{language === "ru" ? "Люди" : "People"}</h3>
+          {results.users.map((user) => (
           <button
             key={user.id}
             className="user-result"
@@ -1478,67 +1548,588 @@ function UserSearchResults({ query }) {
               <small>@{user.username}</small>
             </span>
           </button>
-        ))}
+          ))}
+        </section>
+      )}
+      {!loading && channels.length > 0 && (
+        <section>
+          <h3 className="discovery-heading">{language === "ru" ? "Публичные каналы" : "Public channels"}</h3>
+          {renderCommunityResults(channels)}
+        </section>
+      )}
+      {!loading && groups.length > 0 && (
+        <section>
+          <h3 className="discovery-heading">{language === "ru" ? "Публичные группы" : "Public groups"}</h3>
+          {renderCommunityResults(groups)}
+        </section>
+      )}
     </div>
   );
 }
 
-function PeopleDirectoryDialog() {
+function ContactsPage({ onBack }) {
+  const language = useCurrentLanguage();
+  const russian = language === "ru";
+  const [contacts, setContacts] = useState([]);
+  const [query, setQuery] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [menuId, setMenuId] = useState("");
+
+  const loadContacts = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    try {
+      setContacts(await requestJson("/api/contacts"));
+    } catch (cause) {
+      setError(cause.message);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadContacts();
+    const refresh = () => void loadContacts();
+    document.addEventListener("polus:contacts-changed", refresh);
+    return () => document.removeEventListener("polus:contacts-changed", refresh);
+  }, [loadContacts]);
+
+  const visibleContacts = contacts.filter((contact) =>
+    `${contact.fullName} ${contact.username}`.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()));
+  const openChat = (contact) => document.dispatchEvent(new CustomEvent("polus:request-direct-message", {
+    detail: { username: contact.username }
+  }));
+  const removeContact = async (contact) => {
+    try {
+      await requestJson(`/api/contacts/${encodeURIComponent(contact.username)}`, { method: "DELETE" });
+      setContacts((current) => current.filter((item) => item.id !== contact.id));
+      document.dispatchEvent(new CustomEvent("polus:contacts-changed"));
+      document.dispatchEvent(new CustomEvent("polus:notify", {
+        detail: russian ? "Контакт удалён." : "Contact removed."
+      }));
+    } catch (cause) {
+      setError(cause.message);
+    }
+  };
+  const activity = (contact) => {
+    if (contact.online) return russian ? "В сети" : "Online";
+    if (!contact.lastSeenAt) return "";
+    return `${russian ? "Был(а)" : "Last seen"} ${new Intl.DateTimeFormat(
+      russian ? "ru-RU" : "en-US",
+      { dateStyle: "short", timeStyle: "short" }
+    ).format(new Date(contact.lastSeenAt))}`;
+  };
+
+  return (
+    <main className="contacts-page">
+      <header className="contacts-page-header">
+        <button className="icon-button profile-page-back" type="button" onClick={onBack}>
+          <span aria-hidden="true">←</span>{russian ? "Назад" : "Back"}
+        </button>
+        <h1>{russian ? "Контакты" : "Contacts"}</h1>
+      </header>
+      <section className="contacts-content">
+        <div className="contacts-toolbar">
+          <label className="contacts-search">
+            <span className="visually-hidden">{russian ? "Поиск по контактам" : "Search contacts"}</span>
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="10.8" cy="10.8" r="6.3" /><path d="m15.4 15.4 4.1 4.1" />
+            </svg>
+            <input
+              type="search"
+              value={query}
+              placeholder={russian ? "Поиск по контактам" : "Search contacts"}
+              onChange={(event) => setQuery(event.target.value)}
+            />
+          </label>
+          <span className="contacts-count">{contacts.length} {russian ? "контактов" : "contacts"}</span>
+          <button className="primary-button" type="button" onClick={() =>
+            document.dispatchEvent(new CustomEvent("polus:open-user-picker", { detail: { mode: "add-contact" } }))}>
+            {russian ? "Добавить контакт" : "Add contact"}
+          </button>
+        </div>
+        {loading ? (
+          <p className="contacts-empty">{russian ? "Загрузка контактов…" : "Loading contacts…"}</p>
+        ) : error && contacts.length === 0 ? (
+          <div className="contacts-load-error" role="alert">
+            <p>{error}</p>
+            <button className="text-button" type="button" onClick={() => void loadContacts()}>
+              {russian ? "Повторить" : "Retry"}
+            </button>
+          </div>
+        ) : contacts.length === 0 ? (
+          <section className="contacts-empty-state">
+            <span className="contacts-empty-icon" aria-hidden="true">◎</span>
+            <h2>{russian ? "Контактов пока нет" : "No contacts yet"}</h2>
+            <p>{russian ? "Найдите человека и добавьте его в контакты." : "Find someone and add them to your contacts."}</p>
+            <button className="primary-button" type="button" onClick={() =>
+              document.dispatchEvent(new CustomEvent("polus:open-user-picker", { detail: { mode: "add-contact" } }))}>
+              {russian ? "Найти человека" : "Find someone"}
+            </button>
+          </section>
+        ) : visibleContacts.length === 0 ? (
+          <p className="contacts-empty">{russian ? "Контакты не найдены." : "No contacts found."}</p>
+        ) : (
+          <div className="contacts-list">
+            {visibleContacts.map((contact) => (
+              <article className="contact-row" key={contact.id}>
+                <button className="contact-identity" type="button" onClick={() =>
+                  document.dispatchEvent(new CustomEvent("polus:open-profile", { detail: { username: contact.username } }))}>
+                  <span className={`contact-avatar avatar-tone-${avatarTone(contact.id)}`}>
+                    {contact.avatarUrl
+                      ? <img src={accountApiUrl(contact.avatarUrl, getActiveAccountKey())} alt="" />
+                      : initials(contact.fullName)}
+                    {contact.online && <i className="contact-online-dot" aria-label={russian ? "В сети" : "Online"} />}
+                  </span>
+                  <span className="contact-copy">
+                    <strong>{contact.fullName}</strong>
+                    <small>@{contact.username}{activity(contact) ? ` · ${activity(contact)}` : ""}</small>
+                  </span>
+                </button>
+                <button className="text-button contact-message-action" type="button" disabled={contact.blocked} onClick={() => openChat(contact)}>
+                  {russian ? "Написать" : "Message"}
+                </button>
+                <div className="contact-more">
+                  <button className="contact-more-trigger" type="button" aria-label={russian ? "Действия с контактом" : "Contact actions"}
+                    aria-expanded={menuId === contact.id} onClick={() => setMenuId((current) => current === contact.id ? "" : contact.id)}>
+                    ···
+                  </button>
+                  {menuId === contact.id && (
+                    <div className="contact-context-menu" role="menu">
+                      <button type="button" role="menuitem" onClick={() => {
+                        setMenuId("");
+                        document.dispatchEvent(new CustomEvent("polus:open-profile", { detail: { username: contact.username } }));
+                      }}>{russian ? "Открыть профиль" : "Open profile"}</button>
+                      <button type="button" role="menuitem" onClick={() => {
+                        setMenuId("");
+                        document.dispatchEvent(new CustomEvent("polus:open-contact-share", { detail: { username: contact.username, type: "group" } }));
+                      }} disabled={contact.blocked}>{russian ? "Добавить в группу" : "Add to group"}</button>
+                      <button type="button" role="menuitem" onClick={() => {
+                        setMenuId("");
+                        document.dispatchEvent(new CustomEvent("polus:open-contact-share", { detail: { username: contact.username, type: "channel" } }));
+                      }} disabled={contact.blocked}>{russian ? "Пригласить в канал" : "Invite to channel"}</button>
+                      <button type="button" role="menuitem" onClick={() => {
+                        setMenuId("");
+                        void removeContact(contact);
+                      }}>{russian ? "Удалить из контактов" : "Remove contact"}</button>
+                    </div>
+                  )}
+                </div>
+              </article>
+            ))}
+          </div>
+        )}
+        {error && contacts.length > 0 && <div className="form-error" role="alert">{error}</div>}
+      </section>
+    </main>
+  );
+}
+
+function UserPicker() {
   const dialogRef = useRef(null);
   const searchRef = useRef(null);
+  const configRef = useRef(null);
+  const openRequestRef = useRef(0);
+  const [config, setConfig] = useState(null);
+  const [contacts, setContacts] = useState([]);
+  const [users, setUsers] = useState([]);
   const [query, setQuery] = useState("");
+  const [selectedIds, setSelectedIds] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [inviteUrl, setInviteUrl] = useState("");
   const language = useCurrentLanguage();
+  const russian = language === "ru";
+  configRef.current = config;
+  const excludedIds = new Set(config?.excludeUserIds || []);
+  const eligibleContacts = contacts.filter((contact) => !contact.blocked && !excludedIds.has(contact.id)
+    && `${contact.fullName} ${contact.username}`.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()));
 
-  useLayoutEffect(() => {
-    const open = (event) => {
-      const nextQuery = event.detail?.query || "";
-      setQuery(nextQuery);
+  useEffect(() => {
+    const open = async (event) => {
+      const next = event.detail || {};
+      const requestId = ++openRequestRef.current;
+      setConfig(next);
+      setQuery("");
+      setSelectedIds([]);
+      setError("");
+      setInviteUrl("");
+      setUsers([]);
       if (!dialogRef.current?.open) dialogRef.current?.showModal();
-      searchRef.current?.focus();
+      document.dispatchEvent(new CustomEvent("polus:dialog-open-state", { detail: { id: "user-picker-dialog", open: true } }));
+      if (next.mode !== "add-contact") {
+        try {
+          const nextContacts = await requestJson("/api/contacts");
+          if (openRequestRef.current === requestId) setContacts(nextContacts);
+        } catch (cause) {
+          if (openRequestRef.current === requestId) setError(cause.message);
+        }
+      }
+      window.setTimeout(() => searchRef.current?.focus(), 0);
     };
-    const close = () => dialogRef.current?.close();
-    document.addEventListener("polus:open-people-search", open);
-    document.addEventListener("polus:close-people-search", close);
+    const close = () => {
+      openRequestRef.current += 1;
+      dialogRef.current?.close();
+    };
+    const contactsChanged = () => {
+      if (dialogRef.current?.open && configRef.current?.mode !== "add-contact") {
+        void requestJson("/api/contacts").then((nextContacts) => {
+          setContacts(nextContacts);
+          const availableIds = new Set(nextContacts.map((contact) => contact.id));
+          setSelectedIds((current) => current.filter((id) => availableIds.has(id)));
+        }).catch((cause) => setError(cause.message));
+      }
+    };
+    document.addEventListener("polus:open-user-picker", open);
+    document.addEventListener("polus:contacts-changed", contactsChanged);
+    document.addEventListener("polus:close-user-picker", close);
     return () => {
-      document.removeEventListener("polus:open-people-search", open);
-      document.removeEventListener("polus:close-people-search", close);
+      openRequestRef.current += 1;
+      document.removeEventListener("polus:open-user-picker", open);
+      document.removeEventListener("polus:contacts-changed", contactsChanged);
+      document.removeEventListener("polus:close-user-picker", close);
     };
   }, []);
 
+  useEffect(() => {
+    if (!config || config.mode !== "add-contact") return undefined;
+    const normalized = query.trim().replace(/^@/, "");
+    if (normalized.length < 2) {
+      setUsers([]);
+      return undefined;
+    }
+    let active = true;
+    const timer = window.setTimeout(() => {
+      requestJson(`/api/users?q=${encodeURIComponent(query)}`)
+        .then((result) => { if (active) setUsers(result); })
+        .catch((cause) => { if (active) setError(cause.message); });
+    }, 180);
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [config, query]);
+
+  const close = () => {
+    openRequestRef.current += 1;
+    dialogRef.current?.close();
+    document.dispatchEvent(new CustomEvent("polus:dialog-open-state", { detail: { id: "user-picker-dialog", open: false } }));
+  };
+  const toggle = (id) => setSelectedIds((current) =>
+    current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
+  const selectedContacts = contacts.filter((contact) => selectedIds.includes(contact.id));
+  const confirm = async () => {
+    if (!config || !selectedIds.length) return;
+    setBusy(true);
+    setError("");
+    try {
+      if (config.mode === "add-contact") {
+        const selected = users.find((item) => item.id === selectedIds[0]);
+        if (!selected) return;
+        await requestJson(`/api/contacts/${encodeURIComponent(selected.username)}`, { method: "PUT" });
+        document.dispatchEvent(new CustomEvent("polus:contacts-changed"));
+        document.dispatchEvent(new CustomEvent("polus:notify", { detail: russian ? "Контакт добавлен." : "Contact added." }));
+        close();
+      } else if (config.mode === "public-channel") {
+        const result = await requestJson(`/api/chats/${encodeURIComponent(config.chatId)}/invite`, { method: "POST" });
+        const url = `${window.location.origin}${result.inviteUrl}`;
+        setInviteUrl(url);
+        try {
+          await navigator.clipboard.writeText(url);
+          document.dispatchEvent(new CustomEvent("polus:notify", {
+            detail: russian ? "Ссылка-приглашение скопирована. Отправьте её выбранным контактам." : "Invite link copied. Share it with the selected contacts."
+          }));
+          close();
+        } catch {
+          setError(russian ? "Скопируйте ссылку и отправьте её выбранным контактам." : "Copy this link and share it with the selected contacts.");
+        }
+      } else {
+        await requestJson(`/api/chats/${encodeURIComponent(config.chatId)}/members`, {
+          method: "POST",
+          body: JSON.stringify({ usernames: selectedContacts.map((contact) => contact.username) })
+        });
+        document.dispatchEvent(new CustomEvent("polus:notify", {
+          detail: russian ? `Добавлено участников: ${selectedContacts.length}.` : `Added ${selectedContacts.length} member(s).`
+        }));
+        close();
+      }
+    } catch (cause) {
+      setError(cause.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const mode = config?.mode;
+  const multiSelect = mode !== "add-contact";
+  const title = mode === "add-contact"
+    ? (russian ? "Добавить контакт" : "Add contact")
+    : (russian ? "Выберите контакты" : "Select contacts");
+  const usersToShow = users.filter((item) => !excludedIds.has(item.id));
+
   return (
-    <dialog id="directory-dialog" className="dialog" ref={dialogRef}>
-      <form method="dialog" className="dialog-top">
-        <div>
-          <div className="eyebrow">{language === "ru" ? "НАЙТИ ЛЮДЕЙ" : "FIND PEOPLE"}</div>
-          <h2>{language === "ru" ? "Новое сообщение" : "New message"}</h2>
-        </div>
-        <button className="icon-button dialog-close" value="cancel" aria-label="Close">×</button>
-      </form>
-      <label className="visually-hidden" htmlFor="user-search">
-        {language === "ru" ? "Искать по имени или @username" : "Search by name or @username"}
-      </label>
+    <dialog
+      id="user-picker-dialog"
+      className="dialog user-picker-dialog"
+      ref={dialogRef}
+      onClose={() => {
+        openRequestRef.current += 1;
+        document.dispatchEvent(new CustomEvent("polus:dialog-open-state", {
+          detail: { id: "user-picker-dialog", open: false }
+        }));
+      }}
+    >
+      <div className="dialog-top">
+        <div><div className="eyebrow">{russian ? "КОНТАКТЫ" : "CONTACTS"}</div><h2>{title}</h2></div>
+        <button className="icon-button dialog-close" type="button" aria-label={russian ? "Закрыть" : "Close"} onClick={close}>×</button>
+      </div>
+      <label className="visually-hidden" htmlFor="user-picker-search">{russian ? "Поиск" : "Search"}</label>
       <input
-        id="user-search"
+        id="user-picker-search"
         ref={searchRef}
-        className="text-field dialog-search"
+        className="text-field"
         type="search"
         autoComplete="off"
-        placeholder={language === "ru" ? "Имя или @username" : "Name or @username"}
+        placeholder={mode === "add-contact"
+          ? (russian ? "Имя или @username" : "Name or @username")
+          : (russian ? "Поиск по контактам" : "Search contacts")}
         value={query}
         onChange={(event) => {
+          setError("");
+          if (mode === "add-contact") {
+            setUsers([]);
+            setSelectedIds([]);
+          }
           setQuery(event.target.value);
         }}
       />
-      <UserSearchResults query={query} />
+      {mode === "public-channel" && (
+        <p className="user-picker-hint">{russian
+          ? "Публичный канал принимает подписчиков по ссылке. Выберите контакты, чтобы подготовить приглашение."
+          : "Public channels use invite links. Select contacts to prepare an invitation."}</p>
+      )}
+      {mode === "add-contact" ? (
+        <div className="user-picker-list">
+          {query.trim().replace(/^@/, "").length < 2
+            ? <p className="contacts-empty">{russian ? "Введите не менее двух символов." : "Enter at least two characters."}</p>
+            : usersToShow.length === 0
+              ? <p className="contacts-empty">{russian ? "Пользователи не найдены." : "No users found."}</p>
+              : usersToShow.map((user) => (
+                <div className="user-picker-row" key={user.id}>
+                  <input type="radio" name="user-picker-selection" checked={!user.isContact && selectedIds[0] === user.id}
+                    disabled={user.isContact}
+                    aria-label={`${user.fullName} @${user.username}`}
+                    onChange={() => setSelectedIds([user.id])} />
+                  <span className={`result-avatar avatar-tone-${avatarTone(user.id)}`}>
+                    {user.avatarUrl ? <img src={accountApiUrl(user.avatarUrl, getActiveAccountKey())} alt="" /> : initials(user.fullName)}
+                  </span>
+                  <span className="result-copy"><strong>{user.fullName}</strong><small>@{user.username}</small></span>
+                  {user.isContact && <small>{russian ? "Уже в контактах" : "Already a contact"}</small>}
+                  <button className="text-button" type="button" onClick={() => {
+                    close();
+                    window.setTimeout(() => document.dispatchEvent(new CustomEvent("polus:open-profile", {
+                      detail: { username: user.username }
+                    })), 0);
+                  }}>{russian ? "Профиль" : "Profile"}</button>
+                </div>
+              ))}
+        </div>
+      ) : (
+        <div className="user-picker-list">
+          {eligibleContacts.length === 0
+            ? <div className="contacts-picker-empty">
+              <p>{contacts.length === 0
+                ? (error
+                  ? (russian ? "Не удалось загрузить контакты." : "Unable to load contacts.")
+                  : (russian ? "Сначала добавьте пользователей в контакты." : "Add people to your contacts first."))
+                : (russian ? "Подходящих контактов нет." : "No eligible contacts found.")}</p>
+              <button className="text-button" type="button" onClick={() => {
+                close();
+                document.dispatchEvent(new CustomEvent("polus:open-user-picker", { detail: { mode: "add-contact" } }));
+              }}>{russian ? "Добавить контакт" : "Add contact"}</button>
+            </div>
+            : eligibleContacts.map((contact) => (
+              <label className="user-picker-row" key={contact.id}>
+                <input type="checkbox" checked={selectedIds.includes(contact.id)} onChange={() => toggle(contact.id)} />
+                <span className={`result-avatar avatar-tone-${avatarTone(contact.id)}`}>
+                  {contact.avatarUrl ? <img src={accountApiUrl(contact.avatarUrl, getActiveAccountKey())} alt="" /> : initials(contact.fullName)}
+                </span>
+                <span className="result-copy"><strong>{contact.fullName}</strong><small>@{contact.username}</small></span>
+              </label>
+            ))}
+        </div>
+      )}
+      {inviteUrl && <input className="text-field" readOnly value={inviteUrl} onFocus={(event) => event.currentTarget.select()} />}
+      {error && <div className="form-error" role="alert">{error}</div>}
+      <div className="user-picker-footer">
+        {multiSelect && <span>{russian ? `Выбрано: ${selectedIds.length}` : `Selected: ${selectedIds.length}`}</span>}
+        <button className="primary-button" type="button" disabled={busy || selectedIds.length === 0} onClick={() => void confirm()}>
+          {busy ? "…" : mode === "add-contact"
+            ? (russian ? "Добавить в контакты" : "Add to contacts")
+            : mode === "public-channel"
+              ? (russian ? "Создать ссылку" : "Create invite link")
+              : config?.chatType === "channel"
+                ? (russian ? "Пригласить в канал" : "Invite to channel")
+                : (russian ? "Добавить в группу" : "Add to group")}
+        </button>
+      </div>
+    </dialog>
+  );
+}
+
+function ContactShareDialog() {
+  const dialogRef = useRef(null);
+  const requestIdRef = useRef(0);
+  const [target, setTarget] = useState(null);
+  const [chats, setChats] = useState([]);
+  const [selectedId, setSelectedId] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [inviteUrl, setInviteUrl] = useState("");
+  const language = useCurrentLanguage();
+  const russian = language === "ru";
+
+  useEffect(() => {
+    const open = async (event) => {
+      const next = event.detail || {};
+      const requestId = ++requestIdRef.current;
+      setTarget(next);
+      setSelectedId("");
+      setError("");
+      setInviteUrl("");
+      if (!dialogRef.current?.open) dialogRef.current?.showModal();
+      document.dispatchEvent(new CustomEvent("polus:dialog-open-state", { detail: { id: "contact-share-dialog", open: true } }));
+      try {
+        const [profile, bootstrap] = await Promise.all([
+          requestJson(`/api/users/${encodeURIComponent(next.username)}/profile`),
+          requestJson("/api/bootstrap")
+        ]);
+        if (requestIdRef.current !== requestId) return;
+        if (profile.user.blocked || !profile.canMessage) {
+          setError(russian ? "Это действие недоступно для этого пользователя." : "This action is unavailable for this user.");
+          setChats([]);
+          return;
+        }
+        const source = next.type === "group" ? bootstrap.directs : bootstrap.channels;
+        setChats(source.filter((chat) => (next.type === "group" ? chat.type === "group" : chat.type === "channel")
+          && chat.joined !== false && ["owner", "admin"].includes(chat.role)
+          && !chat.memberIds.includes(profile.user.id)));
+      } catch (cause) {
+        if (requestIdRef.current === requestId) setError(cause.message);
+      }
+    };
+    const close = () => {
+      requestIdRef.current += 1;
+      dialogRef.current?.close();
+    };
+    document.addEventListener("polus:open-contact-share", open);
+    document.addEventListener("polus:close-contact-share", close);
+    return () => {
+      requestIdRef.current += 1;
+      document.removeEventListener("polus:open-contact-share", open);
+      document.removeEventListener("polus:close-contact-share", close);
+    };
+  }, [language, russian]);
+
+  const close = () => {
+    requestIdRef.current += 1;
+    dialogRef.current?.close();
+    document.dispatchEvent(new CustomEvent("polus:dialog-open-state", { detail: { id: "contact-share-dialog", open: false } }));
+  };
+  const confirm = async () => {
+    const chat = chats.find((item) => item.id === selectedId);
+    if (!chat || !target) return;
+    setBusy(true);
+    setError("");
+    try {
+      if (target.type === "channel" && !chat.isPrivate) {
+        const result = await requestJson(`/api/chats/${encodeURIComponent(chat.id)}/invite`, { method: "POST" });
+        const url = `${window.location.origin}${result.inviteUrl}`;
+        setInviteUrl(url);
+        try {
+          await navigator.clipboard.writeText(url);
+          document.dispatchEvent(new CustomEvent("polus:notify", {
+            detail: russian ? "Ссылка скопирована. Отправьте её контакту." : "Invite link copied. Share it with the contact."
+          }));
+          close();
+        } catch {
+          setError(russian ? "Скопируйте ссылку и отправьте её контакту." : "Copy this link and share it with the contact.");
+        }
+      } else {
+        await requestJson(`/api/chats/${encodeURIComponent(chat.id)}/members`, {
+          method: "POST",
+          body: JSON.stringify({ usernames: [target.username] })
+        });
+        document.dispatchEvent(new CustomEvent("polus:notify", {
+          detail: target.type === "group"
+            ? (russian ? "Контакт добавлен в группу." : "Contact added to the group.")
+            : (russian ? "Контакт приглашён в канал." : "Contact invited to the channel.")
+        }));
+        close();
+      }
+    } catch (cause) {
+      setError(cause.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <dialog id="contact-share-dialog" className="dialog user-picker-dialog" ref={dialogRef}
+      onClose={() => {
+        requestIdRef.current += 1;
+        document.dispatchEvent(new CustomEvent("polus:dialog-open-state", {
+          detail: { id: "contact-share-dialog", open: false }
+        }));
+      }}>
+      <div className="dialog-top">
+        <div><div className="eyebrow">{russian ? "КОНТАКТЫ" : "CONTACTS"}</div>
+          <h2>{target?.type === "group" ? (russian ? "Добавить в группу" : "Add to group") : (russian ? "Пригласить в канал" : "Invite to channel")}</h2>
+          {target && <p className="user-picker-hint">{target.username}</p>}
+        </div>
+        <button className="icon-button dialog-close" type="button" aria-label={russian ? "Закрыть" : "Close"} onClick={close}>×</button>
+      </div>
+      {inviteUrl && <input className="text-field" readOnly value={inviteUrl} onFocus={(event) => event.currentTarget.select()} />}
+      <div className="user-picker-list">
+        {chats.length === 0
+          ? <p className="contacts-empty">{error || (russian ? "Нет доступных чатов для этого действия." : "No chats are available for this action.")}</p>
+          : chats.map((chat) => (
+            <label className="user-picker-row" key={chat.id}>
+              <input type="radio" name="contact-share-chat" checked={selectedId === chat.id}
+                onChange={() => setSelectedId(chat.id)} />
+              <span className="discovery-avatar avatar-tone-5">{initials(chat.name)}</span>
+              <span className="result-copy"><strong>{chat.name}</strong>
+                <small>{chat.type === "channel" && !chat.isPrivate
+                  ? (russian ? "Публичный канал · приглашение по ссылке" : "Public channel · invite by link")
+                  : chat.type === "channel" ? (russian ? "Канал" : "Channel") : (russian ? "Группа" : "Group")}</small>
+              </span>
+            </label>
+          ))}
+      </div>
+      {error && chats.length > 0 && <div className="form-error" role="alert">{error}</div>}
+      <div className="user-picker-footer">
+        <button className="primary-button" type="button" disabled={busy || !selectedId} onClick={() => void confirm()}>
+          {busy ? "…" : russian ? "Продолжить" : "Continue"}
+        </button>
+      </div>
     </dialog>
   );
 }
 
 function UserProfileContent() {
   const [profile, setProfile] = useState(null);
+  const [showAllSharedChats, setShowAllSharedChats] = useState(false);
+  const [showAllSharedMedia, setShowAllSharedMedia] = useState(false);
+  const language = useCurrentLanguage();
+  const russian = language === "ru";
 
   useLayoutEffect(() => {
-    const onProfile = (event) => setProfile(event.detail);
+    const onProfile = (event) => {
+      setProfile(event.detail);
+      setShowAllSharedChats(false);
+      setShowAllSharedMedia(false);
+    };
     document.addEventListener("polus:user-profile-changed", onProfile);
     return () => {
       document.removeEventListener("polus:user-profile-changed", onProfile);
@@ -1547,11 +2138,31 @@ function UserProfileContent() {
 
   if (!profile) return <div id="profile-view-content" />;
   const { user, sharedChats, sharedMedia, canMessage, labels, status, registered, muted } = profile;
+  const visibleSharedChats = showAllSharedChats ? sharedChats : sharedChats.slice(0, 4);
+  const visibleSharedMedia = showAllSharedMedia ? sharedMedia : sharedMedia.slice(0, 8);
   const trigger = (action) => document.dispatchEvent(new CustomEvent("polus:user-profile-action", {
     detail: { action, username: user.username }
   }));
+  const confirmBlock = () => {
+    if (window.confirm(russian
+      ? `Заблокировать пользователя @${user.username}?`
+      : `Block @${user.username}?`)) {
+      trigger("toggle-block");
+    }
+  };
   return (
     <div id="profile-view-content">
+      <header className="user-profile-dialog-header">
+        <span>{russian ? "ПРОФИЛЬ" : "PROFILE"}</span>
+        <button
+          className="icon-button dialog-close"
+          type="button"
+          aria-label={russian ? "Закрыть профиль" : "Close profile"}
+          onClick={() => document.dispatchEvent(new CustomEvent("polus:close-dialog", {
+            detail: { id: "profile-view-dialog" }
+          }))}
+        >×</button>
+      </header>
       <section className="user-profile-hero">
         <div className="user-profile-avatar">
           {user.avatarUrl ? <img src={user.avatarUrl} alt="" /> : initials(user.fullName)}
@@ -1560,46 +2171,114 @@ function UserProfileContent() {
           <h3>{user.fullName}</h3>
           <span className="user-profile-handle">@{user.username}</span>
           {status && <span className={`user-profile-status${user.online ? " is-online" : ""}`}>{status}</span>}
+          {registered && <span className="user-profile-joined">{labels.registered}: {registered}</span>}
         </div>
       </section>
+      {user.blocked && (
+        <div className="user-profile-blocked" role="status">
+          <span>{labels.blockedInfo}</span>
+          <button className="text-button" type="button" onClick={() => trigger("toggle-block")}>
+            {labels.unblockUser}
+          </button>
+        </div>
+      )}
       <div className="profile-actions">
-        {canMessage && <button className="primary-button" type="button" onClick={() => trigger("message")}>{labels.writeToUser}</button>}
-        <button className="danger-button" type="button" onClick={() => trigger("toggle-block")}>
-          {user.blocked ? labels.unblockUser : labels.blockUser}
-        </button>
-        {muted !== null && (
-          <button className="text-button" type="button" onClick={() => trigger("toggle-mute")}>
-            {muted ? labels.unmuteChat : labels.muteChat}
+        {canMessage && (
+          <button className="primary-button profile-message-button" type="button" onClick={() => trigger("message")}>
+            {labels.writeToUser}
           </button>
         )}
-      </div>
-      <section className="profile-detail-section">
-        <h3>{labels.about}</h3>
-        <p className="profile-about-copy">{user.about || labels.noAbout}</p>
-      </section>
-      {registered && <div className="profile-registered">{labels.registered}: {registered}</div>}
-      <h3 className="profile-section-heading">{labels.sharedChats}</h3>
-      <div className="profile-shared-chats">
-        {sharedChats.length === 0
-          ? <p className="profile-section-empty">{labels.noSharedChats}</p>
-          : sharedChats.map((chat) => (
-            <div className="profile-shared-chat" key={chat.id}>
-              <span className="profile-shared-chat-icon">{chat.type === "channel" ? "#" : initials(chat.name)}</span>
-              <span>{chat.name}</span>
+        {canMessage && (
+          <div className="profile-secondary-actions">
+            <button className="text-button" type="button" onClick={() => trigger("toggle-contact")}>
+              {user.isContact ? labels.removeContact : labels.addContact}
+            </button>
+            <button className="text-button" type="button" onClick={() => trigger("share-to-group")}>
+              {labels.addToGroup}
+            </button>
+            <button className="text-button" type="button" onClick={() => trigger("share-to-channel")}>
+              {labels.inviteToChannel}
+            </button>
+            {muted !== null && (
+              <button className="text-button" type="button" onClick={() => trigger("toggle-mute")}>
+                {muted ? labels.unmuteChat : labels.muteChat}
+              </button>
+            )}
+          </div>
+        )}
+        {!user.blocked && (
+          <details className="profile-more-actions">
+            <summary>{russian ? "Дополнительно" : "More"}</summary>
+            <div className="profile-more-menu">
+              <button className="danger-button" type="button" onClick={confirmBlock}>
+                {labels.blockUser}
+              </button>
             </div>
-          ))}
+          </details>
+        )}
       </div>
-      <h3 className="profile-section-heading">{labels.sharedMedia}</h3>
-      <div className="media-grid profile-media-grid">
-        {sharedMedia.map((attachment) => (
-          <img
-            key={attachment.id}
-            src={attachment.thumbnailUrl || `/api/attachments/${encodeURIComponent(attachment.id)}`}
-            alt={attachment.name}
-          />
-        ))}
-      </div>
-      {sharedMedia.length === 0 && <p className="profile-section-empty">{labels.noSharedMedia}</p>}
+      {user.about ? (
+        <section className="profile-detail-section">
+          <h3>{labels.about}</h3>
+          <p className="profile-about-copy">{user.about}</p>
+        </section>
+      ) : (
+        <p className="profile-no-about">{labels.noAbout}</p>
+      )}
+      {sharedChats.length > 0 && (
+        <section className="profile-shared-section">
+          <div className="profile-shared-heading">
+            <h3>{labels.sharedChats}</h3>
+            {sharedChats.length > 4 && (
+              <button className="text-button" type="button" onClick={() => setShowAllSharedChats((value) => !value)}>
+                {showAllSharedChats ? labels.showLess : `${labels.showAll} (${sharedChats.length})`}
+              </button>
+            )}
+          </div>
+          <div className="profile-shared-chats">
+            {visibleSharedChats.map((chat) => (
+              <button
+                className="profile-shared-chat"
+                key={chat.id}
+                type="button"
+                onClick={() => document.dispatchEvent(new CustomEvent("polus:open-profile-community", {
+                  detail: { id: chat.id, type: chat.type }
+                }))}
+              >
+                <span className={`profile-shared-chat-icon${chat.type === "channel" ? " is-channel" : ""}`}>
+                  {chat.type === "channel" ? "#" : initials(chat.name)}
+                </span>
+                <span className="profile-shared-chat-copy">
+                  <strong>{chat.name}</strong>
+                  <small>{chat.type === "channel" ? labels.sharedChannel : labels.sharedGroup}</small>
+                </span>
+                <span className="profile-shared-chat-arrow" aria-hidden="true">›</span>
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+      {sharedMedia.length > 0 && (
+        <section className="profile-shared-section">
+          <div className="profile-shared-heading">
+            <h3>{labels.sharedMedia}</h3>
+            {sharedMedia.length > 8 && (
+              <button className="text-button" type="button" onClick={() => setShowAllSharedMedia((value) => !value)}>
+                {showAllSharedMedia ? labels.showLess : `${labels.showAll} (${sharedMedia.length})`}
+              </button>
+            )}
+          </div>
+          <div className="media-grid profile-media-grid">
+            {visibleSharedMedia.map((attachment) => (
+              <img
+                key={attachment.id}
+                src={attachment.thumbnailUrl || `/api/attachments/${encodeURIComponent(attachment.id)}`}
+                alt={attachment.name}
+              />
+            ))}
+          </div>
+        </section>
+      )}
     </div>
   );
 }
@@ -1845,7 +2524,6 @@ function ChatInfoDialogContent() {
     document.addEventListener("polus:chat-info-changed", onInfo);
     return () => document.removeEventListener("polus:chat-info-changed", onInfo);
   }, []);
-
   const act = (action, detail = {}) => document.dispatchEvent(new CustomEvent("polus:chat-info-action", {
     detail: { action, conversationId: snapshot?.conversationId, ...detail }
   }));
@@ -1893,19 +2571,31 @@ function ChatInfoDialogContent() {
           {snapshot.labels.channelSettings}
         </button>
       )}
-      <nav id="chat-info-tabs" className="chat-info-tabs">
-        {snapshot?.tabs.map((item) => (
-          <button
-            key={item.kind}
-            className={`chat-info-tab${item.kind === tab ? " is-active" : ""}`}
-            type="button"
-            onClick={() => act("select-tab", { tab: item.kind })}
-          >
-            {item.label} ({item.total})
-          </button>
-        ))}
-      </nav>
-      <div id="chat-info-content" className="chat-info-content">
+      {snapshot?.chatType === "group" && (
+        <button
+          className="primary-button channel-settings-link"
+          type="button"
+          onClick={() => document.dispatchEvent(new CustomEvent("polus:open-group-settings", {
+            detail: { groupId: snapshot.conversationId }
+          }))}
+        >
+          {snapshot.labels.groupSettings}
+        </button>
+      )}
+      <>
+          <nav id="chat-info-tabs" className="chat-info-tabs">
+            {snapshot?.tabs.map((item) => (
+              <button
+                key={item.kind}
+                className={`chat-info-tab${item.kind === tab ? " is-active" : ""}`}
+                type="button"
+                onClick={() => act("select-tab", { tab: item.kind })}
+              >
+                {item.label} ({item.total})
+              </button>
+            ))}
+          </nav>
+          <div id="chat-info-content" className="chat-info-content">
         {response && (
           <>
             <div className="chat-info-count">{kindLabel} ({response.total})</div>
@@ -1990,19 +2680,24 @@ function ChatInfoDialogContent() {
                 {snapshot.muted ? snapshot.labels.unmuteChat : snapshot.labels.muteChat}
               </button>
             )}
-          </>
+        </>
         )}
-      </div>
+          </div>
+        </>
     </>
   );
 }
 
+const ChatManagementViewContext = createContext({});
+
 function ChatManagementContent() {
+  const { activeSection, onDirtyChange } = useContext(ChatManagementViewContext);
   const [snapshot, setSnapshot] = useState(null);
   const [username, setUsername] = useState("");
   const [ownerUsername, setOwnerUsername] = useState("");
   const [channelName, setChannelName] = useState("");
   const [channelDescription, setChannelDescription] = useState("");
+  const [memberSearch, setMemberSearch] = useState("");
   const [busy, setBusy] = useState(false);
 
   useLayoutEffect(() => {
@@ -2013,6 +2708,7 @@ function ChatManagementContent() {
         setOwnerUsername("");
         setChannelName("");
         setChannelDescription("");
+        setMemberSearch("");
         setBusy(false);
         return;
       }
@@ -2021,11 +2717,28 @@ function ChatManagementContent() {
       setOwnerUsername(event.detail.members.find((member) => member.id !== event.detail.chat.ownerId)?.username || "");
       setChannelName(event.detail.chat.name || "");
       setChannelDescription(event.detail.chat.description || "");
+      setMemberSearch("");
       setBusy(false);
     };
     document.addEventListener("polus:chat-management-changed", onManagement);
     return () => document.removeEventListener("polus:chat-management-changed", onManagement);
   }, []);
+
+  useEffect(() => {
+    if (!snapshot) return;
+    setChannelName(snapshot.chat.name || "");
+    setChannelDescription(snapshot.chat.description || "");
+  }, [activeSection, snapshot]);
+
+  const hasUnsavedChanges = Boolean(snapshot
+    && ["channel", "group"].includes(snapshot.chat.type)
+    && snapshot.members.find((member) => member.id === snapshot.currentUserId)?.role === "owner"
+    && (channelName !== snapshot.chat.name || channelDescription !== (snapshot.chat.description || "")));
+  useEffect(() => {
+    if (!onDirtyChange) return undefined;
+    onDirtyChange(hasUnsavedChanges);
+    return () => onDirtyChange(false);
+  }, [hasUnsavedChanges, onDirtyChange]);
 
   const act = (action, detail = {}) => {
     setBusy(true);
@@ -2038,12 +2751,26 @@ function ChatManagementContent() {
   const currentRole = members.find((member) => member.id === snapshot.currentUserId)?.role || "member";
   const isChannel = chat.type === "channel";
   const canManage = ["owner", "admin"].includes(currentRole);
+  const matchingMembers = members.filter((member) => {
+    const query = memberSearch.trim().toLocaleLowerCase();
+    return !query || member.fullName.toLocaleLowerCase().includes(query)
+      || member.username.toLocaleLowerCase().includes(query);
+  });
+  const unavailable = (title, description) => (
+    <section className="channel-settings-section">
+      <h2 className="channel-settings-section-title">{title}</h2>
+      <p className="channel-settings-help">{description}</p>
+      <p className="channel-settings-unavailable">
+        {snapshot.labels.notAvailable}
+      </p>
+    </section>
+  );
 
   return (
     <section id="chat-management-content" className="chat-profile-management">
-      {isChannel && (
+      {isChannel && (!activeSection || activeSection === "info") && (
         <section className="channel-settings-section">
-          <h3 className="management-heading">{labels.channelDetails}</h3>
+          <h2 className="channel-settings-section-title">{labels.channelDetails}</h2>
           <form
             method="post"
             className="channel-details-form"
@@ -2075,39 +2802,150 @@ function ChatManagementContent() {
               disabled={currentRole !== "owner" || busy}
               onChange={(event) => setChannelDescription(event.target.value)}
             />
-            {currentRole === "owner" && <button className="primary-button" type="submit" disabled={busy}>{labels.saveChannelDetails}</button>}
+            <label className="field-label" htmlFor="group-privacy">{labels.groupPrivacy}</label>
+            <select
+              id="group-privacy"
+              className="text-field"
+              value={chat.isPublic ? "public" : "private"}
+              disabled={currentRole !== "owner" || busy || hasUnsavedChanges}
+              onChange={(event) => void act("set-group-privacy", { isPublic: event.target.value === "public" })}
+            >
+              <option value="public">{labels.publicGroup}</option>
+              <option value="private">{labels.privateGroup}</option>
+            </select>
+            {currentRole === "owner" && (
+              <button className="primary-button" type="submit" disabled={busy}>
+                {busy ? labels.saving : labels.saveChannelDetails}
+              </button>
+            )}
           </form>
-          {currentRole === "owner" && (
-            <div className="channel-settings-options">
-              <label className="field-label" htmlFor="channel-post-identity">{labels.channelPostIdentity}</label>
-              <select
-                id="channel-post-identity"
-                className="text-field"
-                value={chat.postAs === "channel" ? "channel" : "person"}
-                disabled={busy}
-                onChange={(event) => void act("set-post-identity", { postAs: event.target.value })}
-              >
-                <option value="person">{labels.postAsPerson}</option>
-                <option value="channel">{labels.postAsChannel}</option>
-              </select>
-              <label className="field-label" htmlFor="channel-privacy">{labels.channelPrivacy}</label>
-              <select
-                id="channel-privacy"
-                className="text-field"
-                value={chat.isPrivate ? "private" : "public"}
-                disabled={busy}
-                onChange={(event) => void act("set-channel-privacy", { isPrivate: event.target.value === "private" })}
-              >
-                <option value="public">{labels.publicChannel}</option>
-                <option value="private">{labels.privateChannel}</option>
-              </select>
-            </div>
-          )}
+          <label className="field-label" htmlFor="channel-privacy">{labels.channelPrivacy}</label>
+          <select
+            id="channel-privacy"
+            className="text-field"
+            value={chat.isPrivate ? "private" : "public"}
+            disabled={currentRole !== "owner" || busy}
+            onChange={(event) => void act("set-channel-privacy", { isPrivate: event.target.value === "private" })}
+          >
+            <option value="public">{labels.publicChannel}</option>
+            <option value="private">{labels.privateChannel}</option>
+          </select>
         </section>
       )}
-      <section className="channel-settings-section">
-        <h3 className="management-heading">{labels.invitationSettings}</h3>
-        <p className="channel-settings-help">{labels.invitationHelp}</p>
+      {isChannel && (!activeSection || activeSection === "publishing") && (
+        <section className="channel-settings-section">
+          <h2 className="channel-settings-section-title">{labels.publishing}</h2>
+          <p className="channel-settings-help">{labels.postIdentityHelp}</p>
+          <label className="field-label" htmlFor="channel-post-identity">{labels.channelPostIdentity}</label>
+          <select
+            id="channel-post-identity"
+            className="text-field"
+            value={chat.postAs === "channel" ? "channel" : "person"}
+            disabled={!canManage || busy}
+            onChange={(event) => void act("set-post-identity", { postAs: event.target.value })}
+          >
+            <option value="person">{labels.postAsPerson}</option>
+            <option value="channel">{labels.postAsChannel}</option>
+          </select>
+          {!canManage && <p className="channel-settings-help">{labels.managersOnly}</p>}
+        </section>
+      )}
+      {isChannel && (!activeSection || activeSection === "subscribers") && (
+        <section className="channel-settings-section">
+          <h2 className="channel-settings-section-title">{labels.subscribers} ({members.length})</h2>
+          <input
+            className="text-field"
+            type="search"
+            aria-label={labels.searchSubscribers}
+            placeholder={labels.searchSubscribers}
+            value={memberSearch}
+            onChange={(event) => setMemberSearch(event.target.value)}
+          />
+          <div className="management-members">
+            {matchingMembers.filter((member) => member.role !== "admin" && member.role !== "owner").map((member) => (
+              <div className="management-member" key={member.id}>
+                <span className="management-member-copy">
+                  <button
+                    className="profile-inline-button management-member-name"
+                    type="button"
+                    onClick={() => document.dispatchEvent(new CustomEvent("polus:open-profile", {
+                      detail: { username: member.username }
+                    }))}
+                  >{member.fullName}</button>
+                  <small>@{member.username} · {member.roleLabel}</small>
+                </span>
+                {canManage && member.id !== snapshot.currentUserId && (
+                  <button
+                    className="text-button"
+                    type="button"
+                    disabled={busy}
+                    onClick={() => {
+                      if (window.confirm(labels.confirmRemoveMember)) {
+                        void act("remove-member", { memberId: member.id });
+                      }
+                    }}
+                  >{labels.remove}</button>
+                )}
+              </div>
+            ))}
+            {matchingMembers.every((member) => member.role !== "member") && (
+              <p className="channel-settings-help">{labels.noMatchingSubscribers}</p>
+            )}
+          </div>
+        </section>
+      )}
+      {isChannel && (!activeSection || activeSection === "administrators") && (
+        <section className="channel-settings-section">
+          <h2 className="channel-settings-section-title">{labels.administrators}</h2>
+          <div className="management-members">
+            {members.filter((member) => member.role === "owner" || member.role === "admin").map((member) => (
+              <div className="management-member" key={member.id}>
+                <span className="management-member-copy">
+                  <button
+                    className="profile-inline-button management-member-name"
+                    type="button"
+                    onClick={() => document.dispatchEvent(new CustomEvent("polus:open-profile", {
+                      detail: { username: member.username }
+                    }))}
+                  >{member.fullName}</button>
+                  <small>@{member.username} · {member.roleLabel}</small>
+                </span>
+                {currentRole === "owner" && member.role === "admin" && (
+                  <button className="text-button" type="button" disabled={busy}
+                    onClick={() => void act("toggle-admin", { memberId: member.id, makeAdmin: false })}>
+                    {labels.removeAdmin}
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+          {currentRole === "owner" && (
+            <form
+              className="management-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                if (username.trim()) {
+                  void act("toggle-admin", { memberId: members.find((member) => member.username === username)?.id, makeAdmin: true });
+                }
+              }}
+            >
+              <select className="text-field" value={username} disabled={busy}
+                onChange={(event) => setUsername(event.target.value)} required>
+                <option value="">{labels.selectSubscriber}</option>
+                {members.filter((member) => member.role === "member").map((member) => (
+                  <option value={member.username} key={member.id}>{member.fullName} (@{member.username})</option>
+                ))}
+              </select>
+              <button className="primary-button" type="submit" disabled={busy || !username}>{labels.makeAdmin}</button>
+            </form>
+          )}
+          {currentRole !== "owner" && <p className="channel-settings-help">{labels.ownerOnly}</p>}
+        </section>
+      )}
+      {isChannel && (!activeSection || activeSection === "invites") && (
+        <section className="channel-settings-section">
+          <h2 className="channel-settings-section-title">{labels.invitationSettings}</h2>
+          <p className="channel-settings-help">{labels.invitationHelp}</p>
         {canManage && (
           <div className="invite-link-management">
             {chat.inviteUrl
@@ -2146,110 +2984,381 @@ function ChatManagementContent() {
                   className="text-button"
                   type="button"
                   disabled={busy}
-                  onClick={() => void act("revoke-invite-link")}
+                  onClick={() => {
+                    if (window.confirm(labels.confirmRevokeInvite)) void act("revoke-invite-link");
+                  }}
                 >{labels.revokeInviteLink}</button>
               )}
             </div>
           </div>
         )}
         {canManage && (
-          <form
-            method="post"
-            className="management-form"
-            onSubmit={(event) => {
-              event.preventDefault();
-              if (username.trim()) void act("invite-member", { username: username.trim().replace(/^@/, "") });
-            }}
-          >
-            <input
-              className="text-field"
-              placeholder={labels.usernamePlaceholder}
-              maxLength={33}
-              required
-              value={username}
-              disabled={busy}
-              onChange={(event) => setUsername(event.target.value)}
-            />
-            <button className="primary-button" type="submit" disabled={busy}>{labels.inviteMember}</button>
-          </form>
+          <button
+            className="primary-button"
+            type="button"
+            disabled={busy}
+            onClick={() => document.dispatchEvent(new CustomEvent("polus:open-user-picker", {
+              detail: {
+                mode: isChannel && !chat.isPrivate ? "public-channel" : "add-chat-members",
+                chatId: chat.id,
+                chatType: chat.type,
+                excludeUserIds: members.map((member) => member.id)
+              }
+            }))}
+          >{labels.inviteMember}</button>
         )}
-      </section>
-      <section className="channel-settings-section">
-        <h3 className="management-heading">{labels.chatMembers} ({members.length})</h3>
-        <div className="management-members">
-          {members.map((member) => (
-            <div className="management-member" key={member.id}>
-              <span className="management-member-copy">
-                <button
-                  className="profile-inline-button management-member-name"
-                  type="button"
-                  onClick={() => document.dispatchEvent(new CustomEvent("polus:open-profile", {
-                    detail: { username: member.username }
-                  }))}
-                >
-                  {member.fullName}
-                </button>
-                <small>@{member.username} · {member.roleLabel}</small>
-              </span>
-              {currentRole === "owner" && member.id !== chat.ownerId && (
-                <button
-                  className="text-button"
-                  type="button"
-                  disabled={busy}
-                  onClick={() => void act("toggle-admin", { memberId: member.id, makeAdmin: member.role !== "admin" })}
-                >
-                  {member.role === "admin" ? labels.removeAdmin : labels.makeAdmin}
-                </button>
-              )}
-              {canManage && member.id !== snapshot.currentUserId && member.role === "member" && (
-                <button
-                  className="text-button"
-                  type="button"
-                  disabled={busy}
-                  onClick={() => void act("remove-member", { memberId: member.id })}
-                >
-                  {labels.remove}
-                </button>
+        </section>
+      )}
+      {isChannel && activeSection === "appearance" && unavailable(labels.appearance, labels.appearanceUnavailable)}
+      {isChannel && activeSection === "permissions" && (
+        <section className="channel-settings-section">
+          <h2 className="channel-settings-section-title">{labels.permissions}</h2>
+          <p className="channel-settings-help">{labels.pinPostsUnavailable}</p>
+          {currentRole === "owner" ? (
+            <div className="channel-admin-permission-list">
+              {members.filter((member) => member.role === "admin").map((member) => {
+                const permissions = snapshot.adminPermissions?.[member.id] || {
+                  publish: true,
+                  editMessages: true,
+                  deleteMessages: true
+                };
+                return (
+                  <section className="channel-admin-permission" key={member.id}>
+                    <h3>{member.fullName}</h3>
+                    <p>@{member.username}</p>
+                    {labels.adminPermissionOptions.map((option) => (
+                      <label className="channel-settings-toggle-row" key={option.id}>
+                        <span>
+                          <strong>{option.label}</strong>
+                          <small>{option.description}</small>
+                        </span>
+                        <input
+                          type="checkbox"
+                          role="switch"
+                          checked={permissions[option.id]}
+                          disabled={busy}
+                          onChange={(event) => void act("set-admin-permissions", {
+                            memberId: member.id,
+                            permissions: { ...permissions, [option.id]: event.target.checked }
+                          })}
+                        />
+                      </label>
+                    ))}
+                  </section>
+                );
+              })}
+              {members.every((member) => member.role !== "admin") && (
+                <p className="channel-settings-help">{labels.noAdministrators}</p>
               )}
             </div>
-          ))}
-        </div>
-      </section>
-      <section className="channel-settings-section channel-settings-danger">
-        <h3 className="management-heading">{labels.administration}</h3>
-        {currentRole === "owner" && (
-          <>
+          ) : currentRole === "admin" ? (
+            <div className="channel-admin-permission">
+              <p className="channel-settings-help">{labels.yourAdminPermissions}</p>
+              {labels.adminPermissionOptions.map((option) => (
+                <label className="channel-settings-toggle-row" key={option.id}>
+                  <span>
+                    <strong>{option.label}</strong>
+                    <small>{option.description}</small>
+                  </span>
+                  <input
+                    type="checkbox"
+                    role="switch"
+                    checked={snapshot.adminPermissions?.[snapshot.currentUserId]?.[option.id] !== false}
+                    disabled
+                    readOnly
+                  />
+                </label>
+              ))}
+            </div>
+          ) : <p className="channel-settings-help">{labels.managersOnly}</p>}
+        </section>
+      )}
+      {isChannel && activeSection === "notifications" && (
+        <section className="channel-settings-section">
+          <h2 className="channel-settings-section-title">{labels.notifications}</h2>
+          <label className="channel-settings-toggle-row">
+            <span>
+              <strong>{labels.channelNotifications}</strong>
+              <small>{labels.channelNotificationsHelp}</small>
+            </span>
+            <input type="checkbox" role="switch" checked={!chat.muted} disabled={busy}
+              onChange={(event) => void act("toggle-channel-notifications", { muted: !event.target.checked })} />
+          </label>
+        </section>
+      )}
+      {isChannel && (!activeSection || activeSection === "additional") && (
+        <section className="channel-settings-section">
+          <h2 className="channel-settings-section-title">{labels.administration}</h2>
+          {currentRole === "owner" && (
+            <>
+              <p className="channel-settings-help">{labels.transferOwnershipHelp}</p>
+              <form className="management-form ownership-transfer-form" onSubmit={(event) => {
+                event.preventDefault();
+                if (ownerUsername && window.confirm(labels.confirmTransferOwnership)) {
+                  void act("transfer-ownership", { username: ownerUsername });
+                }
+              }}>
+                <select className="text-field" value={ownerUsername}
+                  disabled={busy || !members.some((member) => member.id !== chat.ownerId)}
+                  onChange={(event) => setOwnerUsername(event.target.value)}>
+                  {members.filter((member) => member.id !== chat.ownerId).map((member) => (
+                    <option value={member.username} key={member.id}>{member.fullName} (@{member.username})</option>
+                  ))}
+                </select>
+                <button className="text-button" type="submit" disabled={busy || !ownerUsername}>{labels.transferOwnership}</button>
+              </form>
+              <div className="channel-settings-danger">
+                <div>
+                  <strong>{labels.deleteChannelHeading}</strong>
+                  <p>{labels.deleteChannelHelp}</p>
+                </div>
+                <button className="danger-button" type="button" disabled={busy}
+                  onClick={() => void act("delete-chat")}>{labels.deleteChannel}</button>
+              </div>
+            </>
+          )}
+          {currentRole !== "owner" && (
+            <button className="danger-button" type="button" disabled={busy}
+              onClick={() => {
+                if (window.confirm(labels.confirmLeave)) void act("leave-chat");
+              }}>{labels.leaveChat}</button>
+          )}
+        </section>
+      )}
+      {!isChannel && chat.type === "group" && (
+        <div className="group-management-settings">
+          {activeSection === "info" && <section className="channel-settings-section">
+            <h2 className="channel-settings-section-title">{labels.groupDetails}</h2>
             <form
-              method="post"
-              className="management-form ownership-transfer-form"
+              className="channel-details-form"
               onSubmit={(event) => {
                 event.preventDefault();
-                if (ownerUsername) void act("transfer-ownership", { username: ownerUsername });
+                void act("save-group-details", {
+                  name: channelName.trim(),
+                  description: channelDescription.trim()
+                });
               }}
             >
-              <select
+              <label className="field-label" htmlFor="group-settings-name">{labels.groupName}</label>
+              <input
+                id="group-settings-name"
                 className="text-field"
-                value={ownerUsername}
-                disabled={busy || !members.some((member) => member.id !== chat.ownerId)}
-                onChange={(event) => setOwnerUsername(event.target.value)}
-              >
-                {members.filter((member) => member.id !== chat.ownerId).map((member) => (
-                  <option value={member.username} key={member.id}>{member.fullName} (@{member.username})</option>
-                ))}
-              </select>
-              <button className="text-button" type="submit" disabled={busy || !ownerUsername}>{labels.transferOwnership}</button>
+                value={channelName}
+                maxLength={50}
+                minLength={2}
+                required
+                disabled={currentRole !== "owner" || busy}
+                onChange={(event) => setChannelName(event.target.value)}
+              />
+              <label className="field-label" htmlFor="group-settings-description">{labels.groupDescription}</label>
+              <textarea
+                id="group-settings-description"
+                className="text-field channel-description-field"
+                value={channelDescription}
+                maxLength={160}
+                disabled={currentRole !== "owner" || busy}
+                onChange={(event) => setChannelDescription(event.target.value)}
+              />
+              {currentRole === "owner" && (
+                <button className="primary-button" type="submit" disabled={busy}>
+                  {busy ? labels.saving : labels.saveGroupDetails}
+                </button>
+              )}
             </form>
-            <button className="danger-button" type="button" disabled={busy} onClick={() => void act("delete-chat")}>
-              {labels.deleteChat}
-            </button>
-          </>
-        )}
-        {currentRole !== "owner" && (
-          <button className="danger-button" type="button" disabled={busy} onClick={() => void act("leave-chat")}>
-            {labels.leaveChat}
-          </button>
-        )}
-      </section>
+          </section>}
+
+          {activeSection === "members" && <section className="channel-settings-section">
+            <h2 className="channel-settings-section-title">{labels.chatMembers} ({members.length})</h2>
+            <input
+              className="text-field"
+              type="search"
+              aria-label={labels.searchGroupMembers}
+              placeholder={labels.searchGroupMembers}
+              value={memberSearch}
+              onChange={(event) => setMemberSearch(event.target.value)}
+            />
+            <div className="management-members">
+              {matchingMembers.map((member) => (
+                <div className="management-member" key={member.id}>
+                  <span className="management-member-copy">
+                    <button
+                      className="profile-inline-button management-member-name"
+                      type="button"
+                      onClick={() => document.dispatchEvent(new CustomEvent("polus:open-profile", {
+                        detail: { username: member.username }
+                      }))}
+                    >{member.fullName}</button>
+                    <small>@{member.username} · {member.roleLabel}</small>
+                  </span>
+                  {canManage && member.id !== snapshot.currentUserId && member.role !== "owner"
+                    && (currentRole === "owner" || member.role === "member") && (
+                    <button
+                      className="text-button"
+                      type="button"
+                      disabled={busy}
+                      onClick={() => {
+                        if (window.confirm(labels.confirmRemoveGroupMember)) {
+                          void act("remove-member", { memberId: member.id });
+                        }
+                      }}
+                    >{labels.remove}</button>
+                  )}
+                </div>
+              ))}
+              {matchingMembers.length === 0 && (
+                <p className="channel-settings-help">{labels.noGroupMembers}</p>
+              )}
+            </div>
+            {canManage && (
+              <button
+                className="primary-button"
+                type="button"
+                disabled={busy}
+                onClick={() => document.dispatchEvent(new CustomEvent("polus:open-user-picker", {
+                  detail: {
+                    mode: "add-chat-members",
+                    chatId: chat.id,
+                    chatType: "group",
+                    excludeUserIds: members.map((member) => member.id)
+                  }
+                }))}
+              >{labels.inviteMember}</button>
+            )}
+          </section>}
+
+          {activeSection === "administrators" && <section className="channel-settings-section">
+            <h2 className="channel-settings-section-title">{labels.groupAdministrators}</h2>
+            <div className="management-members">
+              {members.filter((member) => member.role === "owner" || member.role === "admin").map((member) => (
+                <div className="management-member" key={member.id}>
+                  <span className="management-member-copy">
+                    <button
+                      className="profile-inline-button management-member-name"
+                      type="button"
+                      onClick={() => document.dispatchEvent(new CustomEvent("polus:open-profile", {
+                        detail: { username: member.username }
+                      }))}
+                    >{member.fullName}</button>
+                    <small>@{member.username} · {member.roleLabel}</small>
+                  </span>
+                  {currentRole === "owner" && member.role === "admin" && (
+                    <button className="text-button" type="button" disabled={busy}
+                      onClick={() => void act("toggle-admin", { memberId: member.id, makeAdmin: false })}>
+                      {labels.removeAdmin}
+                    </button>
+                  )}
+                </div>
+              ))}
+              {members.every((member) => member.role !== "admin") && (
+                <p className="channel-settings-help">{labels.noGroupAdmins}</p>
+              )}
+            </div>
+            {currentRole === "owner" && (
+              <form className="management-form" onSubmit={(event) => {
+                event.preventDefault();
+                const member = members.find((item) => item.username === username);
+                if (member) void act("toggle-admin", { memberId: member.id, makeAdmin: true });
+              }}>
+                <select className="text-field" value={username} disabled={busy}
+                  onChange={(event) => setUsername(event.target.value)} required>
+                  <option value="">{labels.selectSubscriber}</option>
+                  {members.filter((member) => member.role === "member").map((member) => (
+                    <option value={member.username} key={member.id}>{member.fullName} (@{member.username})</option>
+                  ))}
+                </select>
+                <button className="primary-button" type="submit" disabled={busy || !username}>
+                  {labels.makeAdmin}
+                </button>
+              </form>
+            )}
+          </section>}
+
+          {activeSection === "invites" && <section className="channel-settings-section">
+            <h2 className="channel-settings-section-title">{labels.invitationSettings}</h2>
+            <p className="channel-settings-help">{labels.invitationHelp}</p>
+            {canManage && (
+              <div className="invite-link-management">
+                {chat.inviteUrl
+                  ? <input
+                    className="text-field"
+                    aria-label={labels.inviteLink}
+                    readOnly
+                    value={`${window.location.origin}${chat.inviteUrl}`}
+                    onFocus={(event) => event.currentTarget.select()}
+                  />
+                  : <span className="management-hint">{labels.noInviteLink}</span>}
+                <div className="invite-link-actions">
+                  {chat.inviteUrl && (
+                    <button
+                      className="text-button"
+                      type="button"
+                      disabled={busy}
+                      onClick={async () => {
+                        try {
+                          await navigator.clipboard.writeText(`${window.location.origin}${chat.inviteUrl}`);
+                          document.dispatchEvent(new CustomEvent("polus:notify", { detail: labels.linkCopied }));
+                        } catch (error) {
+                          document.dispatchEvent(new CustomEvent("polus:notify", { detail: error.message }));
+                        }
+                      }}
+                    >{labels.copyInviteLink}</button>
+                  )}
+                  <button className="text-button" type="button" disabled={busy}
+                    onClick={() => void act("create-invite-link")}>
+                    {chat.inviteUrl ? labels.rotateInviteLink : labels.createInviteLink}
+                  </button>
+                  {chat.inviteUrl && (
+                    <button className="text-button" type="button" disabled={busy}
+                      onClick={() => {
+                        if (window.confirm(labels.confirmRevokeInvite)) void act("revoke-invite-link");
+                      }}>{labels.revokeInviteLink}</button>
+                  )}
+                </div>
+              </div>
+            )}
+          </section>}
+
+          {activeSection === "additional" && <section className="channel-settings-section">
+            <h2 className="channel-settings-section-title">{labels.administration}</h2>
+            {currentRole === "owner" && (
+              <>
+                <p className="channel-settings-help">{labels.groupTransferOwnershipHelp}</p>
+                <form className="management-form ownership-transfer-form" onSubmit={(event) => {
+                  event.preventDefault();
+                  if (ownerUsername && window.confirm(labels.confirmTransferGroupOwnership)) {
+                    void act("transfer-ownership", { username: ownerUsername });
+                  }
+                }}>
+                  <select className="text-field" value={ownerUsername}
+                    disabled={busy || !members.some((member) => member.id !== chat.ownerId)}
+                    onChange={(event) => setOwnerUsername(event.target.value)}>
+                    {members.filter((member) => member.id !== chat.ownerId).map((member) => (
+                      <option value={member.username} key={member.id}>{member.fullName} (@{member.username})</option>
+                    ))}
+                  </select>
+                  <button className="text-button" type="submit" disabled={busy || !ownerUsername}>
+                    {labels.transferOwnership}
+                  </button>
+                </form>
+                <div className="channel-settings-danger">
+                  <div>
+                    <strong>{labels.deleteGroupHeading}</strong>
+                    <p>{labels.deleteGroupHelp}</p>
+                  </div>
+                  <button className="danger-button" type="button" disabled={busy}
+                    onClick={() => void act("delete-chat")}>{labels.deleteGroup}</button>
+                </div>
+              </>
+            )}
+            {currentRole !== "owner" && (
+              <button className="danger-button" type="button" disabled={busy}
+                onClick={() => {
+                  if (window.confirm(labels.confirmLeaveGroup)) void act("leave-chat");
+                }}>{labels.leaveChat}</button>
+            )}
+          </section>}
+        </div>
+      )}
     </section>
   );
 }
@@ -2938,7 +4047,16 @@ function Composer() {
   );
 }
 
-function SidebarMenu({ open, onClose }) {
+function SidebarMenu({
+  open,
+  onClose,
+  accounts,
+  activeAccountKey,
+  onSwitchAccount,
+  onAddAccount,
+  onManageAccounts,
+  onOpenContacts
+}) {
   const [user, setUser] = useState(null);
   const language = useCurrentLanguage();
   const menuRef = useRef(null);
@@ -2979,7 +4097,7 @@ function SidebarMenu({ open, onClose }) {
       >
         <span id="profile-avatar" className="profile-avatar">
           {user?.avatarUrl
-            ? <img src={user.avatarUrl} alt="" />
+            ? <img src={accountApiUrl(user.avatarUrl, activeAccountKey)} alt="" />
             : initials(user?.fullName || (language === "ru" ? "Пользователь" : "User"))}
         </span>
         <span className="profile-copy">
@@ -2987,6 +4105,62 @@ function SidebarMenu({ open, onClose }) {
           <small id="profile-handle">@{user?.username || "username"}</small>
         </span>
         <span className="profile-menu-mark" aria-hidden="true">···</span>
+      </button>
+      <div className="sidebar-menu-divider" role="separator" />
+      <div className="account-switcher-list" aria-label={language === "ru" ? "Аккаунты" : "Accounts"}>
+        {accounts.map((account) => (
+          <button
+            key={account.key}
+            className={`sidebar-menu-item account-switcher-item${account.key === activeAccountKey ? " is-active" : ""}`}
+            type="button"
+            role="menuitemradio"
+            aria-checked={account.key === activeAccountKey}
+            onClick={() => {
+              onClose();
+              if (account.key !== activeAccountKey) onSwitchAccount(account.key);
+            }}
+          >
+            <span className="account-switcher-avatar">
+              {account.user.avatarUrl
+                ? <img src={accountApiUrl(account.user.avatarUrl, account.key)} alt="" />
+                : initials(account.user.fullName || account.user.username)}
+            </span>
+            <span className="profile-copy">
+              <strong>{account.user.fullName || account.user.username}</strong>
+              <small>@{account.user.username}</small>
+            </span>
+            {account.unreadCount > 0 && <span className="account-unread-count">{account.unreadCount}</span>}
+            {account.key === activeAccountKey && <span className="account-active-mark" aria-label={language === "ru" ? "Активен" : "Active"}>✓</span>}
+          </button>
+        ))}
+        <button
+          className="sidebar-menu-item account-add-item"
+          type="button"
+          role="menuitem"
+          onClick={() => { onClose(); onAddAccount(); }}
+        >
+          <span className="account-add-mark" aria-hidden="true">+</span>
+          <span>{language === "ru" ? "Добавить аккаунт" : "Add account"}</span>
+        </button>
+        <button
+          className="sidebar-menu-item"
+          type="button"
+          role="menuitem"
+          onClick={() => { onClose(); onManageAccounts(); }}
+        >
+          <span aria-hidden="true">☷</span>
+          <span>{language === "ru" ? "Управление аккаунтами" : "Manage accounts"}</span>
+        </button>
+      </div>
+      <div className="sidebar-menu-divider" role="separator" />
+      <button
+        className="sidebar-menu-item"
+        type="button"
+        role="menuitem"
+        onClick={() => { onClose(); onOpenContacts(); }}
+      >
+        <span aria-hidden="true">♙</span>
+        <span>{language === "ru" ? "Контакты" : "Contacts"}</span>
       </button>
       <div className="sidebar-menu-divider" role="separator" />
       <button
@@ -3493,6 +4667,20 @@ function ChannelSettingsPage({ channelId, onBack, onProfile }) {
   const russian = language === "ru";
   const [chat, setChat] = useState(null);
   const [loadError, setLoadError] = useState("");
+  const [activeSection, setActiveSection] = useState("info");
+  const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
+  const onDirtyChange = useCallback((dirty) => setHasUnsavedChanges(dirty), []);
+  const confirmDiscard = useCallback(() => !hasUnsavedChanges || window.confirm(
+    russian
+      ? "Есть несохранённые изменения. Покинуть раздел и потерять их?"
+      : "You have unsaved changes. Leave this section and discard them?"
+  ), [hasUnsavedChanges, russian]);
+  const goBack = useCallback(() => {
+    if (confirmDiscard()) onBack();
+  }, [confirmDiscard, onBack]);
+  const openProfile = useCallback(() => {
+    if (confirmDiscard()) onProfile();
+  }, [confirmDiscard, onProfile]);
 
   useEffect(() => {
     const onManagement = (event) => {
@@ -3530,14 +4718,19 @@ function ChannelSettingsPage({ channelId, onBack, onProfile }) {
             remove: russian ? "Удалить" : "Remove",
             channelPostIdentity: russian ? "Публиковать сообщения от имени" : "Post messages as",
             channelPrivacy: russian ? "Приватность канала" : "Channel privacy",
+            groupPrivacy: russian ? "Доступ к группе" : "Group access",
+            publicGroup: russian ? "Публичная — видна в поиске, вступить может любой" : "Public — discoverable and open to join",
+            privateGroup: russian ? "Приватная — только по приглашению" : "Private — invite only",
             channelDetails: russian ? "Основная информация" : "Channel details",
             channelName: russian ? "Название канала" : "Channel name",
             channelDescription: russian ? "Описание канала" : "Channel description",
             saveChannelDetails: russian ? "Сохранить изменения" : "Save changes",
+            saving: russian ? "Сохранение…" : "Saving…",
             invitationSettings: russian ? "Приглашения" : "Invitations",
             invitationHelp: russian
               ? "Создайте ссылку или добавьте участника по имени пользователя."
               : "Create an invite link or add a member by username.",
+            linkCopied: russian ? "Ссылка скопирована" : "Link copied",
             noInviteLink: russian ? "Пригласительная ссылка ещё не создана." : "No invite link has been created yet.",
             rotateInviteLink: russian ? "Обновить ссылку" : "Refresh link",
             administration: russian ? "Управление каналом" : "Channel administration",
@@ -3551,6 +4744,43 @@ function ChannelSettingsPage({ channelId, onBack, onProfile }) {
             postAsChannel: russian ? "Канала" : "Channel",
             usernamePlaceholder: "@username",
             inviteMember: russian ? "Добавить участника" : "Add member",
+            subscribers: russian ? "Подписчики" : "Subscribers",
+            administrators: russian ? "Администраторы" : "Administrators",
+            appearance: russian ? "Внешний вид" : "Appearance",
+            appearanceUnavailable: russian ? "Настройки изображения и оформления канала пока не поддерживаются." : "Channel image and appearance settings are not supported yet.",
+            publishing: russian ? "Управление публикациями" : "Publishing",
+            postIdentityHelp: russian ? "Выберите, от чьего имени будут публиковаться сообщения администраторов." : "Choose whose identity administrators use when publishing messages.",
+            permissions: russian ? "Права доступа" : "Permissions",
+            pinPostsUnavailable: russian ? "Закрепление публикаций в канале пока не поддерживается." : "Pinning channel posts is not supported yet.",
+            notifications: russian ? "Уведомления" : "Notifications",
+            channelNotifications: russian ? "Уведомления об активности канала" : "Channel activity notifications",
+            channelNotificationsHelp: russian ? "Настройка действует только для вашего аккаунта." : "This setting applies only to your account.",
+            notAvailable: russian ? "Эта возможность пока не поддерживается." : "This feature is not available yet.",
+            ownerOnly: russian ? "Изменять эту настройку может только владелец канала." : "Only the channel owner can change this setting.",
+            managersOnly: russian ? "Изменять эту настройку могут только владелец и администраторы канала." : "Only the owner and channel administrators can change this setting.",
+            noAdministrators: russian ? "В канале пока нет администраторов." : "There are no channel administrators yet.",
+            yourAdminPermissions: russian ? "Разрешения, назначенные вам владельцем канала." : "Permissions assigned to you by the channel owner.",
+            adminPermissionOptions: russian ? [
+              { id: "publish", label: "Публиковать сообщения", description: "Разрешить отправлять сообщения и файлы в канал." },
+              { id: "editMessages", label: "Редактировать сообщения", description: "Разрешить редактировать сообщения канала, в том числе опубликованные другими." },
+              { id: "deleteMessages", label: "Удалять сообщения", description: "Разрешить удалять сообщения канала, в том числе опубликованные другими." }
+            ] : [
+              { id: "publish", label: "Publish messages", description: "Allow sending messages and files to the channel." },
+              { id: "editMessages", label: "Edit messages", description: "Allow editing channel messages, including those published by others." },
+              { id: "deleteMessages", label: "Delete messages", description: "Allow deleting channel messages, including those published by others." }
+            ],
+            searchSubscribers: russian ? "Поиск по подписчикам" : "Search subscribers",
+            noMatchingSubscribers: russian ? "Подписчики не найдены." : "No subscribers found.",
+            selectSubscriber: russian ? "Выберите подписчика" : "Select a subscriber",
+            confirmRemoveMember: russian ? "Удалить этого подписчика из канала?" : "Remove this subscriber from the channel?",
+            confirmRevokeInvite: russian ? "Отозвать ссылку? Все, у кого она есть, потеряют возможность вступить по ней." : "Revoke this link? Anyone who has it will no longer be able to join with it.",
+            transferOwnershipHelp: russian ? "Передача владельца предоставит выбранному участнику полный контроль над каналом." : "Transferring ownership gives the selected member full control of the channel.",
+            confirmTransferOwnership: russian ? "Передать владение выбранному участнику?" : "Transfer ownership to the selected member?",
+            confirmLeave: russian ? "Покинуть канал?" : "Leave this channel?",
+            deleteChannelHeading: russian ? "Удалить канал" : "Delete channel",
+            deleteChannelHelp: russian ? "Канал и его история будут удалены для всех участников. Это действие нельзя отменить." : "The channel and its history will be deleted for everyone. This cannot be undone.",
+            deleteChannel: russian ? "Удалить канал" : "Delete channel",
+            confirmDeleteChannel: russian ? "Удалить канал и всю его историю для всех участников? Это действие нельзя отменить." : "Delete this channel and its entire history for everyone? This cannot be undone.",
             transferOwnership: russian ? "Передать владение" : "Transfer ownership",
             deleteChat: russian ? "Удалить чат" : "Delete chat",
             leaveChat: russian ? "Покинуть чат" : "Leave chat"
@@ -3566,36 +4796,159 @@ function ChannelSettingsPage({ channelId, onBack, onProfile }) {
     };
   }, [channelId, russian]);
 
+  useEffect(() => {
+    if (!hasUnsavedChanges) return undefined;
+    const warnBeforeUnload = (event) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnBeforeUnload);
+    return () => window.removeEventListener("beforeunload", warnBeforeUnload);
+  }, [hasUnsavedChanges]);
+
+  const sections = [
+    { id: "info", label: russian ? "Основная информация" : "Basic information" },
+    { id: "appearance", label: russian ? "Внешний вид" : "Appearance" },
+    { id: "publishing", label: russian ? "Управление публикациями" : "Publishing" },
+    { id: "subscribers", label: russian ? "Подписчики" : "Subscribers" },
+    { id: "administrators", label: russian ? "Администраторы" : "Administrators" },
+    { id: "invites", label: russian ? "Пригласительные ссылки" : "Invite links" },
+    { id: "permissions", label: russian ? "Права доступа" : "Permissions" },
+    { id: "notifications", label: russian ? "Уведомления" : "Notifications" },
+    { id: "additional", label: russian ? "Дополнительно" : "Additional" }
+  ];
+
   return (
     <main className="community-page channel-settings-page">
       <header className="community-page-header">
-        <button className="icon-button profile-page-back" type="button" onClick={onBack}>
+        <button className="icon-button profile-page-back" type="button" onClick={goBack}>
           <span aria-hidden="true">←</span>{russian ? "Назад" : "Back"}
         </button>
         <h1>{russian ? "Настройки канала" : "Channel settings"}</h1>
-        <button className="text-button" type="button" onClick={onProfile}>
+        <button className="text-button" type="button" onClick={openProfile}>
           {russian ? "Профиль канала" : "Channel profile"}
         </button>
       </header>
       <div className="channel-settings-content">
+        <div className="channel-settings-heading">
+          <h2>{chat?.name || (russian ? "Канал" : "Channel")}</h2>
+          <p>{russian
+            ? "Управляйте информацией, участниками и возможностями вашего канала"
+            : "Manage your channel information, members, and features"}</p>
+          {chat && !["owner", "admin"].includes(chat.role) && (
+            <p className="channel-settings-permission-note">
+              {russian
+                ? "Изменять настройки могут только владелец и администраторы канала."
+                : "Only the channel owner and administrators can change settings."}
+            </p>
+          )}
+        </div>
         {loadError && <div className="form-error" role="alert">{loadError}</div>}
-        {chat && (
-          <div className="channel-settings-identity">
-            <span className="community-profile-icon" aria-hidden="true">#</span>
-            <div>
-              <h2>{chat.name}</h2>
-              <p>{chat.description || (russian ? "Управление каналом и участниками." : "Manage your channel and members.")}</p>
-              {!["owner", "admin"].includes(chat.role) && (
-                <p className="channel-settings-permission-note">
-                  {russian
-                    ? "Изменять настройки могут только владелец и администраторы канала."
-                    : "Only the channel owner and administrators can change settings."}
-                </p>
-              )}
-            </div>
+        <div className="channel-settings-layout">
+          <nav className="channel-settings-nav" aria-label={russian ? "Разделы настроек канала" : "Channel settings sections"}>
+            {sections.map((section) => (
+              <button
+                className="channel-settings-nav-item"
+                type="button"
+                key={section.id}
+                aria-current={activeSection === section.id ? "page" : undefined}
+                onClick={() => {
+                  if (section.id !== activeSection && confirmDiscard()) setActiveSection(section.id);
+                }}
+              >{section.label}</button>
+            ))}
+          </nav>
+          <div className="channel-settings-panel" aria-live="polite">
+            <ChatManagementViewContext.Provider value={{ activeSection, onDirtyChange }}>
+              <ChatManagementContent />
+            </ChatManagementViewContext.Provider>
           </div>
-        )}
-        <ChatManagementContent />
+        </div>
+      </div>
+    </main>
+  );
+}
+
+function GroupSettingsPage({ groupId, onBack }) {
+  const language = useCurrentLanguage();
+  const russian = language === "ru";
+  const [activeSection, setActiveSection] = useState("info");
+  const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
+  const onDirtyChange = useCallback((dirty) => setHasUnsavedChanges(dirty), []);
+  const confirmDiscard = useCallback(() => !hasUnsavedChanges || window.confirm(
+    russian
+      ? "Есть несохранённые изменения. Покинуть раздел и потерять их?"
+      : "You have unsaved changes. Leave this page and discard them?"
+  ), [hasUnsavedChanges, russian]);
+  const goBack = useCallback(() => {
+    if (confirmDiscard()) onBack();
+  }, [confirmDiscard, onBack]);
+
+  useEffect(() => {
+    const requestId = window.setTimeout(() => {
+      document.dispatchEvent(new CustomEvent("polus:request-chat-management", {
+        detail: { chatId: groupId }
+      }));
+    }, 0);
+    return () => {
+      window.clearTimeout(requestId);
+      document.dispatchEvent(new CustomEvent("polus:chat-management-changed", { detail: null }));
+    };
+  }, [groupId]);
+
+  useEffect(() => {
+    if (!hasUnsavedChanges) return undefined;
+    const warnBeforeUnload = (event) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnBeforeUnload);
+    return () => window.removeEventListener("beforeunload", warnBeforeUnload);
+  }, [hasUnsavedChanges]);
+
+  const sections = [
+    { id: "info", label: russian ? "Основная информация" : "Basic information" },
+    { id: "members", label: russian ? "Участники" : "Members" },
+    { id: "administrators", label: russian ? "Администраторы" : "Administrators" },
+    { id: "invites", label: russian ? "Пригласительные ссылки" : "Invite links" },
+    { id: "additional", label: russian ? "Дополнительно" : "Additional" }
+  ];
+
+  return (
+    <main className="community-page channel-settings-page group-settings-page">
+      <header className="community-page-header">
+        <button className="icon-button profile-page-back" type="button" onClick={goBack}>
+          <span aria-hidden="true">←</span>{russian ? "Назад к группе" : "Back to group"}
+        </button>
+        <h1>{russian ? "Настройки группы" : "Group settings"}</h1>
+      </header>
+      <div className="channel-settings-content">
+        <div className="channel-settings-heading">
+          <h2>{russian ? "Управление группой" : "Manage group"}</h2>
+          <p>{russian
+            ? "Изменяйте информацию, участников и приглашения группы."
+            : "Update your group information, members, and invitations."}</p>
+        </div>
+        <div className="channel-settings-layout">
+          <nav className="channel-settings-nav" aria-label={russian ? "Разделы настроек группы" : "Group settings sections"}>
+            {sections.map((section) => (
+              <button
+                className="channel-settings-nav-item"
+                type="button"
+                key={section.id}
+                aria-current={activeSection === section.id ? "page" : undefined}
+                onClick={() => {
+                  if (section.id !== activeSection && confirmDiscard()) setActiveSection(section.id);
+                }}
+              >{section.label}</button>
+            ))}
+          </nav>
+          <div className="channel-settings-panel">
+            <ChatManagementViewContext.Provider value={{ activeSection, onDirtyChange }}>
+              <ChatManagementContent />
+            </ChatManagementViewContext.Provider>
+          </div>
+        </div>
       </div>
     </main>
   );
@@ -3823,6 +5176,7 @@ function ChatDeleteDialog() {
 function CreateGroupForm() {
   const language = useCurrentLanguage();
   const request = useFormRequest("polus:create-group", "group-error");
+  const [isPublic, setIsPublic] = useState(false);
   return (
     <form
       id="group-form"
@@ -3833,6 +5187,7 @@ function CreateGroupForm() {
         const data = new FormData(event.currentTarget);
         void request.submit(event, {
           name: String(data.get("name") || "").trim(),
+          isPublic: data.get("isPublic") === "public",
           usernames: String(data.get("usernames") || "").split(",")
             .map((item) => item.trim().replace(/^@/, "")).filter(Boolean)
         });
@@ -3840,10 +5195,29 @@ function CreateGroupForm() {
     >
       <label className="field-label" htmlFor="group-name">{language === "ru" ? "Название группы" : "Group name"}</label>
       <input id="group-name" name="name" className="text-field" maxLength={50} required disabled={request.submitting} />
+      <label className="field-label" htmlFor="group-visibility">{language === "ru" ? "Тип группы" : "Group type"}</label>
+      <select
+        id="group-visibility"
+        name="isPublic"
+        className="text-field"
+        value={isPublic ? "public" : "private"}
+        disabled={request.submitting}
+        onChange={(event) => setIsPublic(event.target.value === "public")}
+      >
+        <option value="private">{language === "ru" ? "Приватная — только по приглашению" : "Private — invite only"}</option>
+        <option value="public">{language === "ru" ? "Публичная — видна в поиске, вступить может любой" : "Public — discoverable and open to join"}</option>
+      </select>
       <label className="field-label" htmlFor="group-members">
         {language === "ru" ? "Участники (@имена через запятую)" : "Members (@usernames, comma-separated)"}
       </label>
-      <input id="group-members" name="usernames" className="text-field" placeholder="@alex, @sam" required disabled={request.submitting} />
+      <input
+        id="group-members"
+        name="usernames"
+        className="text-field"
+        placeholder="@alex, @sam"
+        required={!isPublic}
+        disabled={request.submitting}
+      />
       <FormError id="group-error" />
       <button className="primary-button" type="submit" disabled={request.submitting}>
         {language === "ru" ? "Создать" : "Create"}
@@ -3855,6 +5229,15 @@ function CreateGroupForm() {
 function ReactDialogs({ user }) {
   const language = useCurrentLanguage();
   useLayoutEffect(() => {
+    const closeOnBackdropClick = (event) => {
+      const dialog = event.target;
+      if (dialog?.tagName !== "DIALOG" || !dialog.open || event.detail === 0) return;
+      const bounds = dialog.getBoundingClientRect();
+      if (event.clientX < bounds.left || event.clientX > bounds.right
+        || event.clientY < bounds.top || event.clientY > bounds.bottom) {
+        dialog.close();
+      }
+    };
     const show = (id) => {
       const dialog = document.getElementById(id);
       if (dialog && !dialog.open) {
@@ -3870,7 +5253,8 @@ function ReactDialogs({ user }) {
     const closeDialog = (event) => close(event.detail.id);
     const ids = [
       "chat-info-dialog", "chat-search-dialog", "forward-message-dialog", "profile-view-dialog",
-      "media-viewer", "directory-dialog", "channel-dialog", "group-dialog", "settings-dialog"
+      "media-viewer", "channel-dialog", "group-dialog", "settings-dialog",
+      "user-picker-dialog", "contact-share-dialog"
     ];
     const onClose = (event) => {
       document.dispatchEvent(new CustomEvent("polus:dialog-open-state", {
@@ -3878,9 +5262,11 @@ function ReactDialogs({ user }) {
       }));
     };
     ids.forEach((id) => document.getElementById(id)?.addEventListener("close", onClose));
+    document.addEventListener("click", closeOnBackdropClick, true);
     document.addEventListener("polus:open-dialog", openDialog);
     document.addEventListener("polus:close-dialog", closeDialog);
     return () => {
+      document.removeEventListener("click", closeOnBackdropClick, true);
       document.removeEventListener("polus:open-dialog", openDialog);
       document.removeEventListener("polus:close-dialog", closeDialog);
       ids.forEach((id) => document.getElementById(id)?.removeEventListener("close", onClose));
@@ -3901,20 +5287,16 @@ function ReactDialogs({ user }) {
     <>
       <dialog id="chat-info-dialog" className="dialog chat-info-dialog">
         <ChatInfoDialogContent />
-        <ChatManagementContent />
       </dialog>
 
       <ChatSearchDialog />
       <ForwardMessageDialog />
 
       <dialog id="profile-view-dialog" className="dialog profile-view-dialog">
-        {dialogTitle(["ПРОФИЛЬ", "PROFILE"], ["Профиль", "Profile"], "profile-view-title")}
         <UserProfileContent />
       </dialog>
 
       <MediaViewer />
-
-      <PeopleDirectoryDialog />
 
       <dialog id="channel-dialog" className="dialog">
         {dialogTitle(["СООБЩЕСТВО", "COMMUNITY"], ["Создать канал", "Create channel"], "channel-dialog-title")}
@@ -3932,17 +5314,138 @@ function ReactDialogs({ user }) {
   );
 }
 
-function MessengerShell({ user, onSignOut }) {
+function AccountManagementDialog({ open, onClose, accounts, activeAccountKey, onSwitchAccount, onRemoveAccount }) {
   const language = useCurrentLanguage();
+  const dialogRef = useRef(null);
+  const [error, setError] = useState("");
+  const [busyKey, setBusyKey] = useState("");
+  useEffect(() => {
+    if (open && !dialogRef.current?.open) dialogRef.current?.showModal();
+    if (!open && dialogRef.current?.open) dialogRef.current.close();
+  }, [open]);
+  const revokeAccount = async (account, action) => {
+    const confirmed = window.confirm(language === "ru"
+      ? action === "remove"
+        ? `Удалить аккаунт @${account.user.username} из приложения?`
+        : `Выйти из аккаунта @${account.user.username}?`
+      : action === "remove"
+        ? `Remove @${account.user.username} from this app?`
+        : `Sign out of @${account.user.username}?`);
+    if (!confirmed) return;
+    setError("");
+    setBusyKey(account.key);
+    try {
+      const registration = "serviceWorker" in navigator && window.isSecureContext
+        ? await navigator.serviceWorker.ready
+        : null;
+      const subscription = registration ? await registration.pushManager.getSubscription() : null;
+      await requestJson("/api/auth/logout", {
+        method: "POST",
+        body: JSON.stringify({ pushEndpoint: subscription?.endpoint || "" }),
+        accountKey: account.key
+      });
+      onRemoveAccount(account.key);
+    } catch (cause) {
+      setError(cause.message);
+    } finally {
+      setBusyKey("");
+    }
+  };
+  return (
+    <dialog
+      ref={dialogRef}
+      className="dialog account-management-dialog"
+      onClose={onClose}
+      onCancel={onClose}
+    >
+      <form method="dialog" className="dialog-top">
+        <div>
+          <div className="eyebrow">{language === "ru" ? "ПРОФИЛЬ" : "PROFILE"}</div>
+          <h2>{language === "ru" ? "Управление аккаунтами" : "Manage accounts"}</h2>
+        </div>
+        <button className="icon-button dialog-close" value="cancel" aria-label={language === "ru" ? "Закрыть" : "Close"}>×</button>
+      </form>
+      <div className="account-management-list">
+        {accounts.map((account) => (
+          <div className="account-management-row" key={account.key}>
+            <button
+              className="account-management-user"
+              type="button"
+              onClick={() => {
+                onSwitchAccount(account.key);
+                onClose();
+              }}
+            >
+              <span className="account-switcher-avatar">
+                {account.user.avatarUrl
+                  ? <img src={accountApiUrl(account.user.avatarUrl, account.key)} alt="" />
+                  : initials(account.user.fullName || account.user.username)}
+              </span>
+              <span className="profile-copy">
+                <strong>{account.user.fullName || account.user.username}</strong>
+                <small>@{account.user.username}</small>
+              </span>
+              {account.key === activeAccountKey && <span className="account-active-mark">{language === "ru" ? "Активен" : "Active"}</span>}
+            </button>
+            <div className="account-management-actions">
+              <button
+                type="button"
+                className="text-button"
+                disabled={busyKey === account.key}
+                onClick={() => void revokeAccount(account, "remove")}
+              >
+                {language === "ru" ? "Удалить из приложения" : "Remove"}
+              </button>
+              <button
+                type="button"
+                className="text-button"
+                disabled={busyKey === account.key}
+                onClick={() => void revokeAccount(account, "sign-out")}
+              >
+                {busyKey === account.key ? "…" : language === "ru" ? "Выйти" : "Sign out"}
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+      {error && <div className="form-error" role="alert">{error}</div>}
+      <div className="account-management-footer">
+        <button className="primary-button" type="button" onClick={onClose}>
+          {language === "ru" ? "Готово" : "Done"}
+        </button>
+      </div>
+    </dialog>
+  );
+}
+
+function MessengerShell({
+  user,
+  onSignOut,
+  accounts,
+  activeAccountKey,
+  onSwitchAccount,
+  onAddAccount,
+  onRemoveAccount,
+  hidden = false
+}) {
+  const language = useCurrentLanguage();
+  const userRef = useRef(user);
+  const onSignOutRef = useRef(onSignOut);
+  userRef.current = user;
+  onSignOutRef.current = onSignOut;
   const languageRef = useRef(language);
   languageRef.current = language;
   const mobileSwipeStartRef = useRef(null);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [accountsDialogOpen, setAccountsDialogOpen] = useState(false);
   const [profilePage, setProfilePage] = useState(() => window.location.pathname === "/profile");
+  const [contactsPage, setContactsPage] = useState(() => window.location.pathname === "/contacts");
   const [channelProfileId, setChannelProfileId] = useState(() =>
     /^\/channels\/([^/]+)$/.exec(window.location.pathname)?.[1] || null);
   const [channelSettingsId, setChannelSettingsId] = useState(() =>
     /^\/channels\/([^/]+)\/settings$/.exec(window.location.pathname)?.[1] || null);
+  const [groupSettingsId, setGroupSettingsId] = useState(() =>
+    /^\/groups\/([^/]+)\/settings$/.exec(window.location.pathname)?.[1] || null);
   const [inviteToken, setInviteToken] = useState(() =>
     /^\/join\/([^/]+)$/.exec(window.location.pathname)?.[1] || null);
   const [profileUser, setProfileUser] = useState(user);
@@ -3976,11 +5479,13 @@ function MessengerShell({ user, onSignOut }) {
   };
   useEffect(() => {
     let active = true;
+    const accountKey = getActiveAccountKey();
     let disposeController;
     let eventStream = null;
     let presenceTimer = null;
     let currentConversation = null;
     let activeChannelSettingsId = /^\/channels\/([^/]+)\/settings$/.exec(window.location.pathname)?.[1] || null;
+    let activeGroupSettingsId = /^\/groups\/([^/]+)\/settings$/.exec(window.location.pathname)?.[1] || null;
     const viewingClientId = (() => {
       try {
         let clientId = sessionStorage.getItem("polus-viewing-client");
@@ -3993,17 +5498,33 @@ function MessengerShell({ user, onSignOut }) {
         return createClientId();
       }
     })();
-    const handleSignOut = () => onSignOut();
+    const handleSignOut = () => onSignOutRef.current();
+    const handleOpenContacts = () => {
+      setMenuOpen(false);
+      if (window.location.pathname !== "/contacts") {
+        window.history.pushState({ polusPage: true, polusContactsPage: true }, "", "/contacts");
+      }
+      setContactsPage(true);
+      setProfilePage(false);
+      setChannelProfileId(null);
+      setChannelSettingsId(null);
+      setGroupSettingsId(null);
+      setInviteToken(null);
+      window.setTimeout(() => void reportChatViewingState(), 0);
+    };
     const reportChatViewingState = (forceHidden = false) => {
       const messengerView = document.getElementById("messenger-view");
       const visible = !forceHidden && Boolean(messengerView?.isConnected && !messengerView.hidden)
         && document.visibilityState === "visible"
         && Boolean(currentConversation && !currentConversation.pending);
-      return fetch("/api/presence/chat", {
+      return fetch(accountApiUrl("/api/presence/chat", accountKey), {
         method: "POST",
         credentials: "same-origin",
         keepalive: forceHidden,
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(accountKey ? { "X-Polus-Account": accountKey } : {})
+        },
         body: JSON.stringify({
           clientId: viewingClientId,
           conversationId: visible ? currentConversation.id : null,
@@ -4022,6 +5543,7 @@ function MessengerShell({ user, onSignOut }) {
       if (window.location.pathname !== "/profile") {
         window.history.pushState({ polusPage: true, polusProfilePage: true }, "", "/profile");
       }
+      setContactsPage(false);
       setProfilePage(true);
       setChannelProfileId(null);
       setInviteToken(null);
@@ -4031,6 +5553,7 @@ function MessengerShell({ user, onSignOut }) {
       const channelId = event.detail?.channelId;
       if (!channelId) return;
       window.history.pushState({ polusPage: true }, "", `/channels/${encodeURIComponent(channelId)}`);
+      setContactsPage(false);
       setProfilePage(false);
       setChannelProfileId(channelId);
       setChannelSettingsId(null);
@@ -4045,11 +5568,38 @@ function MessengerShell({ user, onSignOut }) {
         detail: { id: "chat-info-dialog" }
       }));
       window.history.pushState({ polusPage: true }, "", `/channels/${encodeURIComponent(channelId)}/settings`);
+      setContactsPage(false);
       setProfilePage(false);
       setChannelProfileId(null);
       setChannelSettingsId(channelId);
       setInviteToken(null);
       window.setTimeout(() => void reportChatViewingState(), 0);
+    };
+    const handleOpenGroupSettings = (event) => {
+      const groupId = event.detail?.groupId;
+      if (!groupId || currentConversation?.id !== groupId || currentConversation.type !== "group") return;
+      activeGroupSettingsId = groupId;
+      document.dispatchEvent(new CustomEvent("polus:close-dialog", {
+        detail: { id: "chat-info-dialog" }
+      }));
+      window.history.pushState({ polusPage: true }, "", `/groups/${encodeURIComponent(groupId)}/settings`);
+      setContactsPage(false);
+      setProfilePage(false);
+      setChannelProfileId(null);
+      setChannelSettingsId(null);
+      setGroupSettingsId(groupId);
+      setInviteToken(null);
+      window.setTimeout(() => void reportChatViewingState(), 0);
+    };
+    const handleExitGroupSettings = () => {
+      activeGroupSettingsId = null;
+      window.history.replaceState({}, "", "/");
+      setContactsPage(false);
+      setProfilePage(false);
+      setChannelProfileId(null);
+      setChannelSettingsId(null);
+      setGroupSettingsId(null);
+      setInviteToken(null);
     };
     const openChannelChat = async (channelId, openInfo = false) => {
       try {
@@ -4065,6 +5615,7 @@ function MessengerShell({ user, onSignOut }) {
         if (!conversation) throw new Error("Channel not found.");
         activeChannelSettingsId = null;
         window.history.replaceState({}, "", "/");
+        setContactsPage(false);
         setProfilePage(false);
         setChannelProfileId(null);
         setChannelSettingsId(null);
@@ -4082,6 +5633,7 @@ function MessengerShell({ user, onSignOut }) {
     };
     const handleProfileBack = (event) => {
       const channelId = event.detail?.channelId || activeChannelSettingsId;
+      const groupId = event.detail?.groupId || activeGroupSettingsId;
       if (channelId) {
         if (window.history.state?.polusPage
           && window.location.pathname === `/channels/${encodeURIComponent(channelId)}/settings`) {
@@ -4091,14 +5643,46 @@ function MessengerShell({ user, onSignOut }) {
         }
         return;
       }
+      if (groupId) {
+        if (window.history.state?.polusPage
+          && window.location.pathname === `/groups/${encodeURIComponent(groupId)}/settings`) {
+          window.history.back();
+        } else {
+          void openGroupChat(groupId);
+        }
+        return;
+      }
       if (window.history.state?.polusPage || window.history.state?.polusProfilePage) {
         window.history.back();
       } else {
         window.history.replaceState({}, "", "/");
+        setContactsPage(false);
         setProfilePage(false);
         setChannelProfileId(null);
         setChannelSettingsId(null);
+        setGroupSettingsId(null);
         setInviteToken(null);
+      }
+    };
+    const openGroupChat = async (groupId) => {
+      try {
+        let conversation = currentConversation?.id === groupId ? currentConversation : null;
+        if (!conversation) {
+          const bootstrap = await requestJson("/api/bootstrap");
+          conversation = bootstrap.directs.find((item) => item.id === groupId && item.type === "group");
+        }
+        if (!conversation) throw new Error(languageRef.current === "ru" ? "Группа не найдена." : "Group not found.");
+        activeGroupSettingsId = null;
+        window.history.replaceState({}, "", "/");
+        setProfilePage(false);
+        setChannelProfileId(null);
+        setChannelSettingsId(null);
+        setGroupSettingsId(null);
+        setInviteToken(null);
+        document.dispatchEvent(new CustomEvent("polus:open-conversation", { detail: { conversation } }));
+        window.setTimeout(() => void reportChatViewingState(), 0);
+      } catch (cause) {
+        document.dispatchEvent(new CustomEvent("polus:notify", { detail: cause.message }));
       }
     };
     const handleOpenPageChat = (event) => {
@@ -4110,29 +5694,58 @@ function MessengerShell({ user, onSignOut }) {
       } else {
         window.history.pushState({}, "", "/");
       }
+      setContactsPage(false);
       setProfilePage(false);
       setChannelProfileId(null);
       setChannelSettingsId(null);
+      setGroupSettingsId(null);
       setInviteToken(null);
       document.dispatchEvent(new CustomEvent("polus:open-conversation", { detail: { conversation } }));
+    };
+    const handleOpenProfileCommunity = async (event) => {
+      const { id, type } = event.detail || {};
+      if (typeof id !== "string" || !["group", "channel"].includes(type)) return;
+      try {
+        const bootstrap = await requestJson("/api/bootstrap");
+        const collection = type === "channel" ? bootstrap.channels : bootstrap.directs;
+        const conversation = collection.find((chat) => chat.id === id && chat.type === type
+          && chat.joined !== false);
+        if (!conversation) {
+          throw new Error(languageRef.current === "ru"
+            ? "Это сообщество больше недоступно."
+            : "This community is no longer available.");
+        }
+        document.dispatchEvent(new CustomEvent("polus:close-dialog", {
+          detail: { id: "profile-view-dialog" }
+        }));
+        document.dispatchEvent(new CustomEvent("polus:page-open-chat", { detail: { conversation } }));
+      } catch (cause) {
+        document.dispatchEvent(new CustomEvent("polus:notify", { detail: cause.message }));
+      }
     };
     const handlePopState = () => {
       const pathname = window.location.pathname;
       const settingsChannelId = activeChannelSettingsId;
+      const settingsGroupId = activeGroupSettingsId;
       setProfilePage(pathname === "/profile");
+      setContactsPage(pathname === "/contacts");
       setChannelProfileId(/^\/channels\/([^/]+)$/.exec(pathname)?.[1] || null);
       setChannelSettingsId(/^\/channels\/([^/]+)\/settings$/.exec(pathname)?.[1] || null);
+      setGroupSettingsId(/^\/groups\/([^/]+)\/settings$/.exec(pathname)?.[1] || null);
       setInviteToken(/^\/join\/([^/]+)$/.exec(pathname)?.[1] || null);
       if (!/^\/channels\/[^/]+\/settings$/.test(pathname)) activeChannelSettingsId = null;
+      if (!/^\/groups\/[^/]+\/settings$/.test(pathname)) activeGroupSettingsId = null;
       if (pathname === "/") {
         if (settingsChannelId && currentConversation?.id !== settingsChannelId) {
           void openChannelChat(settingsChannelId);
+        } else if (settingsGroupId && currentConversation?.id !== settingsGroupId) {
+          void openGroupChat(settingsGroupId);
         }
         window.setTimeout(() => void reportChatViewingState(), 0);
       }
     };
     const handleRealtimeMessageSound = (event) => {
-      if (event.detail?.authorId !== user.id) playNotificationSound();
+      if (event.detail?.authorId !== userRef.current.id) playNotificationSound();
     };
     const dispatchRealtimeEvent = (name, event) => {
       try {
@@ -4143,7 +5756,7 @@ function MessengerShell({ user, onSignOut }) {
     };
     const connectRealtime = () => {
       eventStream?.close();
-      const source = new EventSource("/api/stream");
+      const source = new EventSource(accountApiUrl("/api/stream", accountKey));
       eventStream = source;
       let hasOpened = false;
       source.addEventListener("open", () => {
@@ -4215,7 +5828,15 @@ function MessengerShell({ user, onSignOut }) {
           `/api/directs/${encodeURIComponent(event.detail.username)}`,
           { method: "POST", body: JSON.stringify({}) }
         );
+        window.history.replaceState({}, "", "/");
+        setContactsPage(false);
+        setProfilePage(false);
+        setChannelProfileId(null);
+        setChannelSettingsId(null);
+        setGroupSettingsId(null);
+        setInviteToken(null);
         document.dispatchEvent(new CustomEvent("polus:close-people-search"));
+        document.dispatchEvent(new CustomEvent("polus:close-user-picker"));
         document.dispatchEvent(new CustomEvent("polus:open-conversation", { detail: { conversation } }));
       } catch (cause) {
         document.dispatchEvent(new CustomEvent("polus:notify", {
@@ -4347,11 +5968,15 @@ function MessengerShell({ user, onSignOut }) {
     document.addEventListener("polus:presence-stop", handlePresenceStop);
     document.addEventListener("polus:open-profile-settings", handleOpenProfilePage);
     document.addEventListener("polus:open-own-profile", handleOpenProfilePage);
+    document.addEventListener("polus:open-contacts", handleOpenContacts);
     document.addEventListener("polus:profile-page-back", handleProfileBack);
     document.addEventListener("polus:channel-settings-profile", handleChannelSettingsProfile);
     document.addEventListener("polus:open-channel-profile", handleOpenChannelProfile);
     document.addEventListener("polus:open-channel-settings", handleOpenChannelSettings);
+    document.addEventListener("polus:open-group-settings", handleOpenGroupSettings);
+    document.addEventListener("polus:exit-group-settings", handleExitGroupSettings);
     document.addEventListener("polus:page-open-chat", handleOpenPageChat);
+    document.addEventListener("polus:open-profile-community", handleOpenProfileCommunity);
     document.addEventListener("polus:realtime-message", handleRealtimeMessageSound);
     window.addEventListener("popstate", handlePopState);
     document.addEventListener("polus:composer-state", handlePresenceConversation);
@@ -4377,11 +6002,15 @@ function MessengerShell({ user, onSignOut }) {
       document.removeEventListener("polus:presence-stop", handlePresenceStop);
       document.removeEventListener("polus:open-profile-settings", handleOpenProfilePage);
       document.removeEventListener("polus:open-own-profile", handleOpenProfilePage);
+      document.removeEventListener("polus:open-contacts", handleOpenContacts);
       document.removeEventListener("polus:profile-page-back", handleProfileBack);
       document.removeEventListener("polus:channel-settings-profile", handleChannelSettingsProfile);
       document.removeEventListener("polus:open-channel-profile", handleOpenChannelProfile);
       document.removeEventListener("polus:open-channel-settings", handleOpenChannelSettings);
+      document.removeEventListener("polus:open-group-settings", handleOpenGroupSettings);
+      document.removeEventListener("polus:exit-group-settings", handleExitGroupSettings);
       document.removeEventListener("polus:page-open-chat", handleOpenPageChat);
+      document.removeEventListener("polus:open-profile-community", handleOpenProfileCommunity);
       document.removeEventListener("polus:realtime-message", handleRealtimeMessageSound);
       window.removeEventListener("popstate", handlePopState);
       document.removeEventListener("polus:composer-state", handlePresenceConversation);
@@ -4398,7 +6027,7 @@ function MessengerShell({ user, onSignOut }) {
       document.removeEventListener("polus:delete-message", handleDeleteMessage);
       disposeController?.();
     };
-  }, [onSignOut]);
+  }, []);
 
   useEffect(() => {
     document.documentElement.lang = language;
@@ -4408,7 +6037,8 @@ function MessengerShell({ user, onSignOut }) {
   return (
     <>
     <main id="messenger-view" className="messenger-shell" hidden={
-      profilePage || Boolean(channelProfileId) || Boolean(channelSettingsId) || Boolean(inviteToken)
+      hidden || profilePage || contactsPage || Boolean(channelProfileId) || Boolean(channelSettingsId)
+      || Boolean(groupSettingsId) || Boolean(inviteToken)
     }>
       <aside id="chat-sidebar" className="sidebar">
         <header className="sidebar-header">
@@ -4426,7 +6056,16 @@ function MessengerShell({ user, onSignOut }) {
           </button>
           <SidebarSearch />
         </header>
-        <SidebarMenu open={menuOpen} onClose={() => setMenuOpen(false)} />
+        <SidebarMenu
+          open={menuOpen}
+          onClose={() => setMenuOpen(false)}
+          accounts={accounts}
+          activeAccountKey={activeAccountKey}
+          onSwitchAccount={onSwitchAccount}
+          onAddAccount={onAddAccount}
+          onManageAccounts={() => setAccountsDialogOpen(true)}
+          onOpenContacts={() => document.dispatchEvent(new CustomEvent("polus:open-contacts"))}
+        />
         <div id="chat-list-scroll" className="chat-list-scroll">
           <ConversationList userId={user.id} />
         </div>
@@ -4471,18 +6110,33 @@ function MessengerShell({ user, onSignOut }) {
         <MessageContextMenu />
         <ToastNotice />
         <Composer />
-        <ReactDialogs user={user} />
         <ChatDeleteDialog />
       </section>
     </main>
-    {profilePage && (
+    <ReactDialogs user={user} />
+    <UserPicker />
+    <ContactShareDialog />
+    <AccountManagementDialog
+      open={accountsDialogOpen}
+      onClose={() => setAccountsDialogOpen(false)}
+      accounts={accounts}
+      activeAccountKey={activeAccountKey}
+      onSwitchAccount={onSwitchAccount}
+      onRemoveAccount={onRemoveAccount}
+    />
+    {!hidden && contactsPage && (
+      <ContactsPage
+        onBack={() => document.dispatchEvent(new CustomEvent("polus:profile-page-back"))}
+      />
+    )}
+    {!hidden && profilePage && (
       <ProfileSettingsPage
         user={profileUser}
         onBack={() => document.dispatchEvent(new CustomEvent("polus:profile-page-back"))}
         onUserUpdate={updateProfileUser}
       />
     )}
-    {channelProfileId && (
+    {!hidden && channelProfileId && (
       <ChannelProfilePage
         channelId={channelProfileId}
         onBack={() => document.dispatchEvent(new CustomEvent("polus:profile-page-back"))}
@@ -4491,7 +6145,7 @@ function MessengerShell({ user, onSignOut }) {
         }))}
       />
     )}
-    {channelSettingsId && (
+    {!hidden && channelSettingsId && (
       <ChannelSettingsPage
         channelId={channelSettingsId}
         onBack={() => document.dispatchEvent(new CustomEvent("polus:profile-page-back", {
@@ -4502,7 +6156,15 @@ function MessengerShell({ user, onSignOut }) {
         }))}
       />
     )}
-    {inviteToken && (
+    {!hidden && groupSettingsId && (
+      <GroupSettingsPage
+        groupId={groupSettingsId}
+        onBack={() => document.dispatchEvent(new CustomEvent("polus:profile-page-back", {
+          detail: { groupId: groupSettingsId }
+        }))}
+      />
+    )}
+    {!hidden && inviteToken && (
       <InviteLandingPage
         token={inviteToken}
         onBack={() => document.dispatchEvent(new CustomEvent("polus:profile-page-back"))}
@@ -4515,7 +6177,7 @@ function MessengerShell({ user, onSignOut }) {
   );
 }
 
-function AuthScreen({ language, onLanguageChange, onAuthenticated }) {
+function AuthScreen({ language, onLanguageChange, onAuthenticated, accountKey, onCancel }) {
   const [mode, setMode] = useState("login");
   const [privacyVersion, setPrivacyVersion] = useState("");
   const [error, setError] = useState("");
@@ -4524,7 +6186,7 @@ function AuthScreen({ language, onLanguageChange, onAuthenticated }) {
   const text = translations[language];
 
   useEffect(() => {
-    requestJson("/api/config")
+    requestJson("/api/config", { accountKey: null })
       .then((config) => setPrivacyVersion(config.privacyVersion))
       .catch((cause) => setError(cause.message));
   }, []);
@@ -4549,9 +6211,10 @@ function AuthScreen({ language, onLanguageChange, onAuthenticated }) {
     try {
       const { user } = await requestJson(`/api/auth/${registering ? "register" : "login"}`, {
         method: "POST",
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload),
+        accountKey
       });
-      onAuthenticated(user);
+      onAuthenticated(user, accountKey);
     } catch (cause) {
       setError(cause.message);
     } finally {
@@ -4579,6 +6242,11 @@ function AuthScreen({ language, onLanguageChange, onAuthenticated }) {
             <option value="en">English</option>
           </select>
         </div>
+        {onCancel && (
+          <button className="text-button account-auth-cancel" type="button" onClick={onCancel}>
+            {language === "ru" ? "Вернуться в аккаунт" : "Back to account"}
+          </button>
+        )}
         <div className="auth-heading">
           <div className="eyebrow">{text.welcome}</div>
           <h1>{registering ? text.createAccount : text.signIn}</h1>
@@ -4674,8 +6342,14 @@ export default function App() {
   });
   const [messageSound, setMessageSound] = useState(() => localStorage.getItem("polus-message-sound") === "true");
   const [user, setUser] = useState(null);
+  const [accounts, setAccounts] = useState([]);
+  const [activeAccountKey, setActiveAccountKeyState] = useState(null);
+  const [pendingAccountKey, setPendingAccountKey] = useState(() => createAccountKey());
+  const [addingAccount, setAddingAccount] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const accountsRef = useRef(accounts);
+  accountsRef.current = accounts;
 
   useEffect(() => {
     const onRuntimeError = (event) => {
@@ -4732,27 +6406,193 @@ export default function App() {
 
   useEffect(() => {
     let active = true;
-    requestJson("/api/auth/me")
-      .then(({ user: currentUser }) => {
-        if (active) setUser(currentUser);
-      })
-      .catch((cause) => {
+    const restoreAccounts = async () => {
+      try {
+        const savedAccounts = getStoredAccounts();
+        if (savedAccounts.length) {
+          const checkedAccounts = await Promise.all(savedAccounts.map(async (account) => {
+            try {
+              const result = await requestJson("/api/auth/me", { accountKey: account.key });
+              if (!result.user) return null;
+              try {
+                const bootstrap = await requestJson("/api/bootstrap", { accountKey: account.key });
+                const unreadCount = [...bootstrap.channels, ...bootstrap.directs].reduce((total, chat) =>
+                  total + (Number.isSafeInteger(chat.unreadCount) ? chat.unreadCount : 0), 0);
+                return { ...account, user: bootstrap.user, unreadCount };
+              } catch (cause) {
+                if (cause.status === 401) return null;
+                return { ...account, user: result.user };
+              }
+            } catch (cause) {
+              if (cause.status === 401) return null;
+              return account;
+            }
+          }));
+          const validAccounts = checkedAccounts.filter(Boolean);
+          saveAccounts(validAccounts);
+          if (active) {
+            setAccounts(validAccounts);
+            const requestedUserId = getRequestedAccountUserId();
+            const savedActiveKey = localStorage.getItem("polus-active-account");
+            const selected = validAccounts.find((account) => account.user.id === requestedUserId)
+              || validAccounts.find((account) => account.key === savedActiveKey)
+              || validAccounts[0];
+            if (selected) {
+              setActiveAccountKey(selected.key);
+              setActiveAccountKeyState(selected.key);
+              setUser(selected.user);
+              if (requestedUserId) {
+                const url = new URL(window.location.href);
+                url.searchParams.delete("accountUserId");
+                window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
+              }
+            }
+          }
+          return;
+        }
+        const { user: legacyUser } = await requestJson("/api/auth/me", { accountKey: null });
+        if (!legacyUser || !active) return;
+        const key = createAccountKey();
+        const { user: attachedUser } = await requestJson("/api/auth/accounts/attach", {
+          method: "POST",
+          body: JSON.stringify({ accountKey: key }),
+          accountKey: null
+        });
+        if (!active) return;
+        const migratedAccounts = [{ key, user: attachedUser }];
+        saveAccounts(migratedAccounts);
+        setAccounts(migratedAccounts);
+        setActiveAccountKey(key);
+        setActiveAccountKeyState(key);
+        setUser(attachedUser);
+      } catch (cause) {
         if (active) setError(cause.message);
-      })
-      .finally(() => {
+      } finally {
         if (active) setLoading(false);
-      });
+      }
+    };
+    void restoreAccounts();
     return () => { active = false; };
   }, []);
 
-  const handleSignOut = useCallback((message = "") => {
-    if (message) {
-      setError(message);
-      setUser(null);
-      return;
-    }
-    window.location.reload();
+  const commitAccounts = useCallback((nextAccounts) => {
+    saveAccounts(nextAccounts);
+    setAccounts(nextAccounts);
   }, []);
+  const activateAccount = useCallback((key) => {
+    const selected = accounts.find((account) => account.key === key);
+    if (!selected) return;
+    setActiveAccountKey(key);
+    setActiveAccountKeyState(key);
+    setUser(selected.user);
+    setAddingAccount(false);
+    setError("");
+    setPendingAccountKey(createAccountKey());
+  }, [accounts]);
+  const removeAccount = useCallback((key) => {
+    const nextAccounts = accounts.filter((account) => account.key !== key);
+    commitAccounts(nextAccounts);
+    if (key !== activeAccountKey) return;
+    const next = nextAccounts[0];
+    if (next) {
+      setActiveAccountKey(next.key);
+      setActiveAccountKeyState(next.key);
+      setUser(next.user);
+    } else {
+      setActiveAccountKey(null);
+      setActiveAccountKeyState(null);
+      setUser(null);
+      setPendingAccountKey(createAccountKey());
+    }
+    setAddingAccount(false);
+  }, [accounts, activeAccountKey, commitAccounts]);
+  const handleSignOut = useCallback(() => {
+    if (activeAccountKey) removeAccount(activeAccountKey);
+  }, [activeAccountKey, removeAccount]);
+  useEffect(() => {
+    const invalidateAccount = (event) => {
+      const key = event.detail?.accountKey;
+      if (key && accounts.some((account) => account.key === key)) removeAccount(key);
+    };
+    document.addEventListener("polus:account-session-invalid", invalidateAccount);
+    return () => document.removeEventListener("polus:account-session-invalid", invalidateAccount);
+  }, [accounts, removeAccount]);
+  const handleAuthenticated = useCallback((authenticatedUser, key) => {
+    const account = { key: key || createAccountKey(), user: authenticatedUser, unreadCount: 0 };
+    const nextAccounts = [...accounts.filter((item) => item.key !== account.key), account];
+    commitAccounts(nextAccounts);
+    setActiveAccountKey(account.key);
+    setActiveAccountKeyState(account.key);
+    setUser(authenticatedUser);
+    setAddingAccount(false);
+    setError("");
+    setPendingAccountKey(createAccountKey());
+  }, [accounts, commitAccounts]);
+  useEffect(() => {
+    const updateCurrentUser = (event) => {
+      const currentUser = event.detail;
+      if (!currentUser || !activeAccountKey) return;
+      setUser(currentUser);
+      const nextAccounts = accounts.map((account) =>
+        account.key === activeAccountKey ? { ...account, user: currentUser } : account);
+      if (nextAccounts.some((account, index) => account !== accounts[index])) commitAccounts(nextAccounts);
+    };
+    const updateUnreadCount = (event) => {
+      if (!activeAccountKey || !Number.isSafeInteger(event.detail?.unreadCount)) return;
+      const nextAccounts = accounts.map((account) =>
+        account.key === activeAccountKey ? { ...account, unreadCount: event.detail.unreadCount } : account);
+      commitAccounts(nextAccounts);
+    };
+    document.addEventListener("polus:current-user-changed", updateCurrentUser);
+    document.addEventListener("polus:account-unread-count", updateUnreadCount);
+    return () => {
+      document.removeEventListener("polus:current-user-changed", updateCurrentUser);
+      document.removeEventListener("polus:account-unread-count", updateUnreadCount);
+    };
+  }, [accounts, activeAccountKey, commitAccounts]);
+  const accountKeys = accounts.map((account) => account.key).join(",");
+  useEffect(() => {
+    const sources = accountsRef.current
+      .filter((account) => account.key !== activeAccountKey)
+      .map((account) => {
+        const source = new EventSource(accountApiUrl("/api/stream", account.key));
+        source.addEventListener("message", (event) => {
+          let message;
+          try {
+            message = JSON.parse(event.data);
+          } catch (cause) {
+            console.error("Invalid message received for a background account:", cause);
+            return;
+          }
+          if (message.author?.id === account.user.id) return;
+          const nextAccounts = accountsRef.current.map((item) =>
+            item.key === account.key ? { ...item, unreadCount: (item.unreadCount || 0) + 1 } : item);
+          accountsRef.current = nextAccounts;
+          try {
+            saveAccounts(nextAccounts);
+            setAccounts(nextAccounts);
+          } catch (cause) {
+            console.error("Unable to save background account unread state:", cause);
+          }
+          if (typeof Notification !== "undefined" && Notification.permission === "granted"
+            && "serviceWorker" in navigator) {
+            void navigator.serviceWorker.ready.then((registration) =>
+              registration.showNotification(`${message.author?.fullName || message.author?.username || "Полюс"}`, {
+                body: language === "ru" ? "Новое сообщение" : "New message",
+                icon: "/logo.svg",
+                badge: "/logo.svg",
+                tag: `${account.user.id}:${message.conversationId || ""}`,
+                data: {
+                  conversationId: message.conversationId || "",
+                  accountUserId: account.user.id
+                }
+              })).catch((cause) => console.error("Unable to show a background account notification:", cause));
+          }
+        });
+        return source;
+      });
+    return () => sources.forEach((source) => source.close());
+  }, [activeAccountKey, accountKeys, language]);
 
   return (
     <LanguageContext.Provider value={{ language, setLanguage, theme, setTheme, messageSound, setMessageSound }}>
@@ -4760,15 +6600,42 @@ export default function App() {
         {loading
           ? <main className="auth-view" aria-busy="true">Загрузка Полюса…</main>
           : user
-            ? <MessengerShell user={user} onSignOut={handleSignOut} />
-            : (
-              <>
-                {error && <div className="form-error" role="alert">{error}</div>}
-                <AuthScreen
-                  language={language}
-                  onLanguageChange={setLanguage}
-                  onAuthenticated={(authenticatedUser) => { setError(""); setUser(authenticatedUser); }}
-                />
+              ? (
+                <>
+                  <MessengerShell
+                    key={activeAccountKey}
+                    user={user}
+                    onSignOut={handleSignOut}
+                    accounts={accounts}
+                    activeAccountKey={activeAccountKey}
+                    onSwitchAccount={activateAccount}
+                    onAddAccount={() => {
+                      setPendingAccountKey(createAccountKey());
+                      setAddingAccount(true);
+                    }}
+                    onRemoveAccount={removeAccount}
+                    hidden={addingAccount}
+                  />
+                  {addingAccount && (
+                    <AuthScreen
+                      language={language}
+                      onLanguageChange={setLanguage}
+                      accountKey={pendingAccountKey}
+                      onAuthenticated={handleAuthenticated}
+                      onCancel={() => setAddingAccount(false)}
+                    />
+                  )}
+                </>
+              )
+              : (
+                <>
+                  {error && <div className="form-error" role="alert">{error}</div>}
+                  <AuthScreen
+                    language={language}
+                    onLanguageChange={setLanguage}
+                    accountKey={pendingAccountKey}
+                    onAuthenticated={handleAuthenticated}
+                  />
               </>
             )}
       </AppErrorBoundary>

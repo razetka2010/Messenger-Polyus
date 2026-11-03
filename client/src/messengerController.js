@@ -78,18 +78,68 @@ const translations = {
     groupParticipants: "участников", accountUpdated: "Настройки аккаунта сохранены.",
     channelCreated: "Канал создан.", groupCreated: "Группа создана.",
     manageChat: "Управление чатом", chatMembers: "Участники чата", inviteMember: "Добавить участника",
+    groupSettings: "Настройки группы", groupManagement: "Управляйте названием, участниками и приглашениями.",
+    groupDetails: "Информация о группе", groupDescription: "Описание группы",
+    saveGroupDetails: "Сохранить изменения", groupSettingsSaved: "Настройки группы сохранены.",
+    contacts: "Контакты", addContact: "Добавить в контакты", removeContact: "Удалить из контактов",
+    contactAdded: "Контакт добавлен.", contactRemoved: "Контакт удалён.",
+    addToGroup: "Добавить в группу", inviteToChannel: "Пригласить в канал",
+    groupPrivacy: "Доступ к группе",
+    publicGroup: "Публичная — видна в поиске, вступить может любой",
+    privateGroup: "Приватная — только по приглашению",
+    groupAdministrators: "Администраторы группы",
+    searchGroupMembers: "Поиск по участникам", noGroupMembers: "Участники не найдены.",
+    noGroupAdmins: "В группе пока нет администраторов.",
+    confirmRemoveGroupMember: "Удалить участника из группы?",
+    confirmLeaveGroup: "Выйти из этой группы?",
+    groupTransferOwnershipHelp: "Передача владельца предоставит выбранному участнику полный контроль над группой.",
+    confirmTransferGroupOwnership: "Передать владение группой выбранному участнику?",
+    deleteGroupHeading: "Удалить группу", deleteGroupHelp: "Группа и история сообщений будут удалены для всех. Это действие нельзя отменить.",
+    deleteGroup: "Удалить группу", confirmDeleteGroup: "Удалить эту группу и всю её историю для всех участников? Это действие нельзя отменить.",
     channelPostIdentity: "Публиковать сообщения от имени",
     postAsChannel: "Канала", postAsPerson: "Автора", postIdentitySaved: "Режим публикации обновлён.",
     channelPrivacy: "Приватность канала", publicChannel: "Публичный — отображается в списке каналов",
     privateChannel: "Частный — доступен только по ссылке", inviteLink: "Пригласительная ссылка",
     channelDetails: "Основная информация", channelName: "Название канала",
     channelDescription: "Описание канала", saveChannelDetails: "Сохранить изменения",
+    saving: "Сохранение…", channelSettingsSaved: "Настройки канала сохранены.",
+    channelPrivacySaved: "Приватность канала обновлена.",
+    adminPermissionsSaved: "Права администратора обновлены.",
     invitationSettings: "Приглашения", invitationHelp: "Создайте ссылку или добавьте участника по имени пользователя.",
     noInviteLink: "Пригласительная ссылка ещё не создана.",
     rotateInviteLink: "Обновить ссылку", administration: "Управление каналом",
     createInviteLink: "Создать ссылку", copyInviteLink: "Скопировать ссылку",
     revokeInviteLink: "Отозвать ссылку", linkCopied: "Ссылка скопирована",
     usernamePlaceholder: "@username", makeAdmin: "Назначить администратором", removeAdmin: "Снять администратора",
+    subscribers: "Подписчики", administrators: "Администраторы",
+    appearance: "Внешний вид", appearanceUnavailable: "Настройки изображения и оформления канала пока не поддерживаются.",
+    publishing: "Управление публикациями",
+    postIdentityHelp: "Выберите, от чьего имени будут публиковаться сообщения администраторов.",
+    permissions: "Права доступа",
+    pinPostsUnavailable: "Закрепление публикаций в канале пока не поддерживается.",
+    notifications: "Уведомления", channelNotifications: "Уведомления об активности канала",
+    channelNotificationsHelp: "Настройка действует только для вашего аккаунта.",
+    notAvailable: "Эта возможность пока не поддерживается.",
+    ownerOnly: "Изменять эту настройку может только владелец канала.",
+    managersOnly: "Изменять эту настройку могут только владелец и администраторы канала.",
+    noAdministrators: "В канале пока нет администраторов.",
+    yourAdminPermissions: "Разрешения, назначенные вам владельцем канала.",
+    adminPermissionOptions: [
+      { id: "publish", label: "Публиковать сообщения", description: "Разрешить отправлять сообщения и файлы в канал." },
+      { id: "editMessages", label: "Редактировать сообщения", description: "Разрешить редактировать сообщения канала, в том числе опубликованные другими." },
+      { id: "deleteMessages", label: "Удалять сообщения", description: "Разрешить удалять сообщения канала, в том числе опубликованные другими." }
+    ],
+    searchSubscribers: "Поиск по подписчикам", noMatchingSubscribers: "Подписчики не найдены.",
+    selectSubscriber: "Выберите подписчика",
+    confirmRemoveMember: "Удалить этого подписчика из канала?",
+    confirmRevokeInvite: "Отозвать ссылку? Все, у кого она есть, потеряют возможность вступить по ней.",
+    transferOwnershipHelp: "Передача владельца предоставит выбранному участнику полный контроль над каналом.",
+    confirmTransferOwnership: "Передать владение выбранному участнику?",
+    confirmLeave: "Покинуть канал?",
+    deleteChannelHeading: "Удалить канал",
+    deleteChannelHelp: "Канал и его история будут удалены для всех участников. Это действие нельзя отменить.",
+    deleteChannel: "Удалить канал",
+    confirmDeleteChannel: "Удалить канал и всю его историю для всех участников? Это действие нельзя отменить.",
     transferOwnership: "Передать владение", leaveChat: "Покинуть чат", deleteChat: "Удалить чат",
     roleOwner: "Владелец", roleAdmin: "Администратор", roleMember: "Участник",
     ownershipTransferred: "Владение передано.", chatDeleted: "Чат удалён.",
@@ -107,7 +157,8 @@ const translations = {
     maxFileSize: "Размер файла не должен превышать 100 МБ.", muted: "Уведомления отключены",
     unmuted: "Уведомления включены", blockUser: "Заблокировать", unblockUser: "Разблокировать",
     writeToUser: "Написать", muteChat: "Отключить уведомления", unmuteChat: "Включить уведомления",
-    sharedChats: "Общие группы и каналы", sharedMedia: "Общие медиа",
+    sharedChats: "Общие группы и каналы", sharedGroup: "Группа", sharedChannel: "Канал",
+    sharedMedia: "Общие медиа", showAll: "Показать все", showLess: "Свернуть",
     channelSettings: "Настройки канала",
     tabMembers: "Участники", tabMedia: "Медиа", tabFiles: "Файлы", tabLinks: "Ссылки", preview: "Миниатюра",
     openMessage: "Перейти к сообщению", searchPromptChat: "Введите текст для поиска",
@@ -172,18 +223,68 @@ const translations = {
     groupParticipants: "members", accountUpdated: "Account settings saved.",
     channelCreated: "Channel created.", groupCreated: "Group created.",
     manageChat: "Manage chat", chatMembers: "Chat members", inviteMember: "Add member",
+    groupSettings: "Group settings", groupManagement: "Manage the group name, members, and invitations.",
+    groupDetails: "Group information", groupDescription: "Group description",
+    saveGroupDetails: "Save changes", groupSettingsSaved: "Group settings saved.",
+    contacts: "Contacts", addContact: "Add to contacts", removeContact: "Remove from contacts",
+    contactAdded: "Contact added.", contactRemoved: "Contact removed.",
+    addToGroup: "Add to group", inviteToChannel: "Invite to channel",
+    groupPrivacy: "Group access",
+    publicGroup: "Public — discoverable and open to join",
+    privateGroup: "Private — invite only",
+    groupAdministrators: "Group administrators",
+    searchGroupMembers: "Search members", noGroupMembers: "No members found.",
+    noGroupAdmins: "There are no group administrators yet.",
+    confirmRemoveGroupMember: "Remove this member from the group?",
+    confirmLeaveGroup: "Leave this group?",
+    groupTransferOwnershipHelp: "Transferring ownership gives the selected member full control of the group.",
+    confirmTransferGroupOwnership: "Transfer group ownership to the selected member?",
+    deleteGroupHeading: "Delete group", deleteGroupHelp: "The group and its message history will be deleted for everyone. This cannot be undone.",
+    deleteGroup: "Delete group", confirmDeleteGroup: "Delete this group and its entire history for everyone? This cannot be undone.",
     channelPostIdentity: "Post messages as",
     postAsChannel: "Channel", postAsPerson: "Author", postIdentitySaved: "Posting identity updated.",
     channelPrivacy: "Channel privacy", publicChannel: "Public — shown in the channel list",
     privateChannel: "Private — available only by invite link", inviteLink: "Invite link",
     channelDetails: "Channel details", channelName: "Channel name",
     channelDescription: "Channel description", saveChannelDetails: "Save changes",
+    saving: "Saving…", channelSettingsSaved: "Channel settings saved.",
+    channelPrivacySaved: "Channel privacy updated.",
+    adminPermissionsSaved: "Administrator permissions updated.",
     invitationSettings: "Invitations", invitationHelp: "Create an invite link or add a member by username.",
     noInviteLink: "No invite link has been created yet.",
     rotateInviteLink: "Refresh link", administration: "Channel administration",
     createInviteLink: "Create link", copyInviteLink: "Copy link",
     revokeInviteLink: "Revoke link", linkCopied: "Link copied",
     usernamePlaceholder: "@username", makeAdmin: "Make administrator", removeAdmin: "Remove administrator",
+    subscribers: "Subscribers", administrators: "Administrators",
+    appearance: "Appearance", appearanceUnavailable: "Channel image and appearance settings are not supported yet.",
+    publishing: "Publishing",
+    postIdentityHelp: "Choose whose identity administrators use when publishing messages.",
+    permissions: "Permissions",
+    pinPostsUnavailable: "Pinning channel posts is not supported yet.",
+    notifications: "Notifications", channelNotifications: "Channel activity notifications",
+    channelNotificationsHelp: "This setting applies only to your account.",
+    notAvailable: "This feature is not available yet.",
+    ownerOnly: "Only the channel owner can change this setting.",
+    managersOnly: "Only the owner and channel administrators can change this setting.",
+    noAdministrators: "There are no channel administrators yet.",
+    yourAdminPermissions: "Permissions assigned to you by the channel owner.",
+    adminPermissionOptions: [
+      { id: "publish", label: "Publish messages", description: "Allow sending messages and files to the channel." },
+      { id: "editMessages", label: "Edit messages", description: "Allow editing channel messages, including those published by others." },
+      { id: "deleteMessages", label: "Delete messages", description: "Allow deleting channel messages, including those published by others." }
+    ],
+    searchSubscribers: "Search subscribers", noMatchingSubscribers: "No subscribers found.",
+    selectSubscriber: "Select a subscriber",
+    confirmRemoveMember: "Remove this subscriber from the channel?",
+    confirmRevokeInvite: "Revoke this link? Anyone who has it will no longer be able to join with it.",
+    transferOwnershipHelp: "Transferring ownership gives the selected member full control of the channel.",
+    confirmTransferOwnership: "Transfer ownership to the selected member?",
+    confirmLeave: "Leave this channel?",
+    deleteChannelHeading: "Delete channel",
+    deleteChannelHelp: "The channel and its history will be deleted for everyone. This cannot be undone.",
+    deleteChannel: "Delete channel",
+    confirmDeleteChannel: "Delete this channel and its entire history for everyone? This cannot be undone.",
     transferOwnership: "Transfer ownership", leaveChat: "Leave chat", deleteChat: "Delete chat",
     roleOwner: "Owner", roleAdmin: "Administrator", roleMember: "Member",
     ownershipTransferred: "Ownership transferred.", chatDeleted: "Chat deleted.",
@@ -201,7 +302,8 @@ const translations = {
     maxFileSize: "Files cannot exceed 100 MB.", muted: "Notifications muted",
     unmuted: "Notifications enabled", blockUser: "Block", unblockUser: "Unblock",
     writeToUser: "Message", muteChat: "Mute notifications", unmuteChat: "Unmute notifications",
-    sharedChats: "Shared groups and channels", sharedMedia: "Shared media",
+    sharedChats: "Shared groups and channels", sharedGroup: "Group", sharedChannel: "Channel",
+    sharedMedia: "Shared media", showAll: "Show all", showLess: "Show less",
     channelSettings: "Channel settings",
     tabMembers: "Members", tabMedia: "Media", tabFiles: "Files", tabLinks: "Links", preview: "Preview",
     openMessage: "Go to message", searchPromptChat: "Enter text to search",
@@ -373,6 +475,9 @@ function getTranslatedConversationName(conversation) {
 }
 
 function renderConversations() {
+  const unreadCount = [...channels, ...directs].reduce((total, conversation) =>
+    total + (Number.isSafeInteger(conversation.unreadCount) ? conversation.unreadCount : 0), 0);
+  document.dispatchEvent(new CustomEvent("polus:account-unread-count", { detail: { unreadCount } }));
   window.dispatchEvent(new CustomEvent("polus:conversations-changed", {
     detail: {
       channels,
@@ -568,6 +673,7 @@ function publishChatInfo() {
         members: t("tabMembers"),
         memberCountUnit: t("members"),
         channelSettings: t("channelSettings"),
+        groupSettings: t("groupSettings"),
         media: t("tabMedia"),
         files: t("tabFiles"),
         links: t("tabLinks"),
@@ -667,6 +773,7 @@ async function searchChat(queryValue) {
 
 async function openUserProfile(username) {
   if (username.toLowerCase() === currentUser.username.toLowerCase()) {
+    closeDialog("profile-view-dialog");
     document.dispatchEvent(new CustomEvent("polus:open-own-profile"));
     return;
   }
@@ -685,6 +792,12 @@ async function openUserProfile(username) {
       muted: targetDirect ? targetDirect.muted : null,
       labels: {
         writeToUser: t("writeToUser"),
+        addContact: t("addContact"),
+        removeContact: t("removeContact"),
+        contactAdded: t("contactAdded"),
+        contactRemoved: t("contactRemoved"),
+        addToGroup: t("addToGroup"),
+        inviteToChannel: t("inviteToChannel"),
         blockUser: t("blockUser"),
         unblockUser: t("unblockUser"),
         muteChat: t("muteChat"),
@@ -693,6 +806,10 @@ async function openUserProfile(username) {
         noAbout: t("noAbout"),
         registered: t("registered"),
         sharedChats: t("sharedChats"),
+        sharedGroup: t("sharedGroup"),
+        sharedChannel: t("sharedChannel"),
+        showAll: t("showAll"),
+        showLess: t("showLess"),
         noSharedChats: t("noSharedChats"),
         sharedMedia: t("sharedMedia"),
         noSharedMedia: t("noSharedMedia")
@@ -1015,11 +1132,13 @@ async function openChatManagement(chatId = currentConversation?.id, requireCurre
     return;
   }
   try {
-    const { chat, inviteUrl, members: chatMembers } = await api(`/api/chats/${encodeURIComponent(chatId)}`);
+    const { chat, inviteUrl, members: chatMembers, adminPermissions } =
+      await api(`/api/chats/${encodeURIComponent(chatId)}`);
     if (requireCurrent && currentConversation?.id !== chatId) return;
     document.dispatchEvent(new CustomEvent("polus:chat-management-changed", {
       detail: {
         chat: { ...chat, inviteUrl },
+        adminPermissions,
         members: chatMembers.map((member) => ({
           ...member,
           roleLabel: t(`role${member.role[0].toUpperCase()}${member.role.slice(1)}`)
@@ -1027,6 +1146,27 @@ async function openChatManagement(chatId = currentConversation?.id, requireCurre
         currentUserId: currentUser.id,
         labels: {
           chatMembers: t("chatMembers"),
+          groupManagement: t("groupManagement"),
+          groupDetails: t("groupDetails"),
+          groupDescription: t("groupDescription"),
+          groupName: t("groupName"),
+          saveGroupDetails: t("saveGroupDetails"),
+          groupSettingsSaved: t("groupSettingsSaved"),
+          groupPrivacy: t("groupPrivacy"),
+          publicGroup: t("publicGroup"),
+          privateGroup: t("privateGroup"),
+          groupAdministrators: t("groupAdministrators"),
+          searchGroupMembers: t("searchGroupMembers"),
+          noGroupMembers: t("noGroupMembers"),
+          noGroupAdmins: t("noGroupAdmins"),
+          confirmRemoveGroupMember: t("confirmRemoveGroupMember"),
+          confirmLeaveGroup: t("confirmLeaveGroup"),
+          groupTransferOwnershipHelp: t("groupTransferOwnershipHelp"),
+          confirmTransferGroupOwnership: t("confirmTransferGroupOwnership"),
+          deleteGroupHeading: t("deleteGroupHeading"),
+          deleteGroupHelp: t("deleteGroupHelp"),
+          deleteGroup: t("deleteGroup"),
+          confirmDeleteGroup: t("confirmDeleteGroup"),
           makeAdmin: t("makeAdmin"),
           removeAdmin: t("removeAdmin"),
           remove: t("remove"),
@@ -1046,11 +1186,42 @@ async function openChatManagement(chatId = currentConversation?.id, requireCurre
           channelName: t("channelName"),
           channelDescription: t("channelDescription"),
           saveChannelDetails: t("saveChannelDetails"),
+          saving: t("saving"),
           invitationSettings: t("invitationSettings"),
           invitationHelp: t("invitationHelp"),
+          linkCopied: t("linkCopied"),
           noInviteLink: t("noInviteLink"),
           rotateInviteLink: t("rotateInviteLink"),
           administration: t("administration"),
+          subscribers: t("subscribers"),
+          administrators: t("administrators"),
+          appearance: t("appearance"),
+          appearanceUnavailable: t("appearanceUnavailable"),
+          publishing: t("publishing"),
+          postIdentityHelp: t("postIdentityHelp"),
+          permissions: t("permissions"),
+          pinPostsUnavailable: t("pinPostsUnavailable"),
+          notifications: t("notifications"),
+          channelNotifications: t("channelNotifications"),
+          channelNotificationsHelp: t("channelNotificationsHelp"),
+          notAvailable: t("notAvailable"),
+          ownerOnly: t("ownerOnly"),
+          managersOnly: t("managersOnly"),
+          noAdministrators: t("noAdministrators"),
+          yourAdminPermissions: t("yourAdminPermissions"),
+          adminPermissionOptions: t("adminPermissionOptions"),
+          searchSubscribers: t("searchSubscribers"),
+          noMatchingSubscribers: t("noMatchingSubscribers"),
+          selectSubscriber: t("selectSubscriber"),
+          confirmRemoveMember: t("confirmRemoveMember"),
+          confirmRevokeInvite: t("confirmRevokeInvite"),
+          transferOwnershipHelp: t("transferOwnershipHelp"),
+          confirmTransferOwnership: t("confirmTransferOwnership"),
+          confirmLeave: t("confirmLeave"),
+          deleteChannelHeading: t("deleteChannelHeading"),
+          deleteChannelHelp: t("deleteChannelHelp"),
+          deleteChannel: t("deleteChannel"),
+          confirmDeleteChannel: t("confirmDeleteChannel"),
           transferOwnership: t("transferOwnership"),
           deleteChat: t("deleteChat"),
           leaveChat: t("leaveChat")
@@ -1063,9 +1234,11 @@ async function openChatManagement(chatId = currentConversation?.id, requireCurre
   }
 }
 
-async function handleChatManagementAction({ action, chatId, memberId, makeAdmin, postAs, isPrivate, username, name, description }) {
+async function handleChatManagementAction({ action, chatId, memberId, makeAdmin, postAs, isPrivate, isPublic, muted, permissions, username, name, description }) {
   const selectedChat = currentConversation;
-  const settingsPageOpen = window.location.pathname === `/channels/${encodeURIComponent(chatId)}/settings`;
+  const settingsPageOpen = window.location.pathname === `/channels/${encodeURIComponent(chatId)}/settings`
+    || window.location.pathname === `/groups/${encodeURIComponent(chatId)}/settings`;
+  const groupSettingsPageOpen = window.location.pathname === `/groups/${encodeURIComponent(chatId)}/settings`;
   if ((!selectedChat || selectedChat.id !== chatId || !["channel", "group"].includes(selectedChat.type))
     && !settingsPageOpen) {
     closeDialog("chat-info-dialog");
@@ -1073,7 +1246,7 @@ async function handleChatManagementAction({ action, chatId, memberId, makeAdmin,
   }
   const refreshDialog = async () => {
     await refreshMessengerState();
-    if (window.location.pathname === `/channels/${encodeURIComponent(chatId)}/settings`) {
+    if (settingsPageOpen) {
       await openChatManagement(chatId, false);
     } else if (currentConversation?.id === chatId) await openChatInfo(currentInfoTab);
     else closeDialog("chat-info-dialog");
@@ -1083,6 +1256,11 @@ async function handleChatManagementAction({ action, chatId, memberId, makeAdmin,
       await api(`/api/chats/${encodeURIComponent(chatId)}/admins/${encodeURIComponent(memberId)}`,
         jsonOptions("PUT", { role: makeAdmin ? "admin" : "member" }));
       await refreshDialog();
+    } else if (action === "set-admin-permissions") {
+      await api(`/api/chats/${encodeURIComponent(chatId)}/admins/${encodeURIComponent(memberId)}`,
+        jsonOptions("PUT", { permissions }));
+      await refreshDialog();
+      notify(t("adminPermissionsSaved"));
     } else if (action === "remove-member") {
       await api(`/api/chats/${encodeURIComponent(chatId)}/members/${encodeURIComponent(memberId)}`,
         { method: "DELETE" });
@@ -1094,9 +1272,25 @@ async function handleChatManagementAction({ action, chatId, memberId, makeAdmin,
     } else if (action === "set-channel-privacy") {
       await api(`/api/chats/${encodeURIComponent(chatId)}/settings`, jsonOptions("PUT", { isPrivate }));
       await refreshDialog();
+      notify(t("channelPrivacySaved"));
     } else if (action === "save-channel-details") {
       await api(`/api/chats/${encodeURIComponent(chatId)}/settings`, jsonOptions("PUT", { name, description }));
       await refreshDialog();
+      notify(t("channelSettingsSaved"));
+    } else if (action === "save-group-details") {
+      await api(`/api/chats/${encodeURIComponent(chatId)}/settings`, jsonOptions("PUT", { name, description }));
+      await refreshDialog();
+      notify(t("groupSettingsSaved"));
+    } else if (action === "set-group-privacy") {
+      await api(`/api/chats/${encodeURIComponent(chatId)}/settings`, jsonOptions("PUT", { isPublic }));
+      await refreshDialog();
+      notify(t("groupSettingsSaved"));
+    } else if (action === "toggle-channel-notifications") {
+      const result = await api(`/api/chats/${encodeURIComponent(chatId)}/mute`, {
+        method: muted ? "POST" : "DELETE"
+      });
+      await refreshDialog();
+      notify(t(result.muted ? "muted" : "unmuted"));
     } else if (action === "create-invite-link") {
       await api(`/api/chats/${encodeURIComponent(chatId)}/invite`, { method: "POST" });
       await refreshDialog();
@@ -1111,20 +1305,26 @@ async function handleChatManagementAction({ action, chatId, memberId, makeAdmin,
       await refreshDialog();
       notify(t("ownershipTransferred"));
     } else if (action === "delete-chat") {
-      if (!window.confirm(`${t("deleteChat")}?`)) {
-        await openChatInfo(currentInfoTab);
+      const confirmMessage = selectedChat?.type === "group" || groupSettingsPageOpen
+        ? t("confirmDeleteGroup")
+        : t("confirmDeleteChannel");
+      if (!window.confirm(confirmMessage)) {
+        if (settingsPageOpen) await openChatManagement(chatId, false);
+        else await openChatInfo(currentInfoTab);
         return;
       }
       await api(`/api/chats/${encodeURIComponent(chatId)}`, { method: "DELETE" });
       closeDialog("chat-info-dialog");
       await refreshMessengerState();
-      if (settingsPageOpen) document.dispatchEvent(new CustomEvent("polus:profile-page-back"));
+      if (groupSettingsPageOpen) document.dispatchEvent(new CustomEvent("polus:exit-group-settings"));
+      else if (settingsPageOpen) document.dispatchEvent(new CustomEvent("polus:profile-page-back"));
       notify(t("chatDeleted"));
     } else if (action === "leave-chat") {
       await api(`/api/chats/${encodeURIComponent(chatId)}/leave`, { method: "POST" });
       closeDialog("chat-info-dialog");
       await refreshMessengerState();
-      if (settingsPageOpen) document.dispatchEvent(new CustomEvent("polus:profile-page-back"));
+      if (groupSettingsPageOpen) document.dispatchEvent(new CustomEvent("polus:exit-group-settings"));
+      else if (settingsPageOpen) document.dispatchEvent(new CustomEvent("polus:profile-page-back"));
     }
   } catch (error) {
     notify(localizeError(error.message));
@@ -1143,7 +1343,6 @@ async function signOut() {
     await api("/api/auth/logout", jsonOptions("POST", {
       pushEndpoint: subscription?.endpoint || ""
     }));
-    if (subscription) await subscription.unsubscribe();
     setPushEnabled(false);
     currentUser = null;
     document.dispatchEvent(new CustomEvent("polus:current-user-changed", { detail: null }));
@@ -1179,10 +1378,10 @@ async function togglePushNotifications() {
       : Promise.resolve(Notification.permission);
     const registration = await navigator.serviceWorker.ready;
     const current = await registration.pushManager.getSubscription();
-    if (current) {
+    if (current && getPushPreference() !== false) {
       await api("/api/push/subscribe", jsonOptions("DELETE", { endpoint: current.endpoint }));
-      await current.unsubscribe();
       setPushEnabled(false);
+      savePushPreference(false);
       notify(t("pushDisabled"));
       return;
     }
@@ -1199,12 +1398,13 @@ async function togglePushNotifications() {
       notify(t("unavailablePush"));
       return;
     }
-    const subscription = await registration.pushManager.subscribe({
+    const subscription = current || await registration.pushManager.subscribe({
       userVisibleOnly: true,
       applicationServerKey: decodeBase64Url(pushKey)
     });
     await api("/api/push/subscribe", jsonOptions("POST", { subscription: subscription.toJSON() }));
     setPushEnabled(true);
+    savePushPreference(true);
     notify(t("pushEnabled"));
   } catch (error) {
     notify(localizeError(error.message));
@@ -1216,10 +1416,35 @@ async function checkPushSubscription() {
     || !("Notification" in window) || !window.isSecureContext) return;
   try {
     const registration = await navigator.serviceWorker.ready;
-    const enabled = Boolean(await registration.pushManager.getSubscription());
-    setPushEnabled(enabled);
+    const subscription = await registration.pushManager.getSubscription();
+    const enabled = Boolean(subscription) && getPushPreference() !== false;
+    if (enabled && Notification.permission === "granted") {
+      await api("/api/push/subscribe", jsonOptions("POST", { subscription: subscription.toJSON() }));
+      setPushEnabled(true);
+      savePushPreference(true);
+    } else {
+      setPushEnabled(enabled);
+    }
   } catch (error) {
     console.error("Unable to read push subscription:", error);
+  }
+}
+
+function getPushPreference() {
+  try {
+    const value = localStorage.getItem(`polus-push-enabled:${currentUser.id}`);
+    return value === null ? null : value === "true";
+  } catch (error) {
+    console.error("Unable to read the notification preference:", error);
+    return null;
+  }
+}
+
+function savePushPreference(enabled) {
+  try {
+    localStorage.setItem(`polus-push-enabled:${currentUser.id}`, String(enabled));
+  } catch {
+    throw new Error("Unable to save the notification preference on this device.");
   }
 }
 
@@ -1245,6 +1470,22 @@ function registerControllerListeners() {
       if (action === "message") {
         closeDialog("profile-view-dialog");
         document.dispatchEvent(new CustomEvent("polus:request-direct-message", { detail: { username } }));
+        return;
+      }
+      if (action === "toggle-contact") {
+        const { user } = await api(`/api/users/${encodeURIComponent(username)}/profile`);
+        await api(`/api/contacts/${encodeURIComponent(username)}`, {
+          method: user.isContact ? "DELETE" : "PUT"
+        });
+        document.dispatchEvent(new CustomEvent("polus:contacts-changed"));
+        await openUserProfile(username);
+        notify(t(user.isContact ? "contactRemoved" : "contactAdded"));
+        return;
+      }
+      if (action === "share-to-group" || action === "share-to-channel") {
+        document.dispatchEvent(new CustomEvent("polus:open-contact-share", {
+          detail: { username, type: action === "share-to-group" ? "group" : "channel" }
+        }));
         return;
       }
       if (action === "toggle-block") {
@@ -1285,6 +1526,9 @@ function registerControllerListeners() {
   });
   listen(document, "polus:chat-management-action", (event) => {
     void handleChatManagementAction(event.detail || {});
+  });
+  listen(document, "polus:request-chat-management", (event) => {
+    void openChatManagement(event.detail?.chatId, false);
   });
   listen(document, "polus:chat-row-action", (event) => {
     const { action, conversation } = event.detail || {};

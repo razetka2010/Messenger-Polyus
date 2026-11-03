@@ -11,7 +11,10 @@ self.addEventListener("push", (event) => {
       icon: "/logo.svg",
       badge: "/logo.svg",
       tag: payload.conversationId || "polus-message",
-      data: { conversationId: payload.conversationId || "" }
+      data: {
+        conversationId: payload.conversationId || "",
+        accountUserId: payload.accountUserId || ""
+      }
     });
   })());
 });
@@ -19,8 +22,10 @@ self.addEventListener("push", (event) => {
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   const conversationId = event.notification.data?.conversationId || "";
+  const accountUserId = event.notification.data?.accountUserId || "";
   const target = new URL("/", self.location.origin);
   if (conversationId) target.searchParams.set("conversation", conversationId);
+  if (accountUserId) target.searchParams.set("accountUserId", accountUserId);
   event.waitUntil((async () => {
     const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
     for (const client of windows) {

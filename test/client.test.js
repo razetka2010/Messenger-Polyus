@@ -33,6 +33,23 @@ test("JSON API client sends same-origin JSON requests", async () => {
   assert.equal(request.options.headers["X-Test"], "yes");
 });
 
+test("JSON API client binds each request and returned API resources to its account", async () => {
+  const { accountApiUrl, requestJson } = await apiClientPromise;
+  const accountKey = "a".repeat(32);
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return new Response(JSON.stringify({
+      user: { avatarUrl: "/api/avatars/user-1?v=avatar" }
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+
+  const response = await requestJson("/api/auth/me", { accountKey });
+  assert.equal(request.options.headers["X-Polus-Account"], accountKey);
+  assert.equal(new URLSearchParams(response.user.avatarUrl.split("?")[1]).get("accountKey"), accountKey);
+  assert.equal(accountApiUrl("/api/stream", accountKey), `/api/stream?accountKey=${accountKey}`);
+});
+
 test("JSON API client preserves server errors and response status", async () => {
   const { ApiError, requestJson } = await apiClientPromise;
   globalThis.fetch = async () => new Response(JSON.stringify({
@@ -57,6 +74,32 @@ test("JSON API client reports invalid successful responses", async () => {
   await assert.rejects(requestJson("/api/test"), {
     message: "The server returned an invalid response."
   });
+});
+
+test("privacy page exposes bilingual policy sections and in-page navigation", async () => {
+  const [page, script, styles] = await Promise.all([
+    fs.readFile(require.resolve("../public/privacy.html"), "utf8"),
+    fs.readFile(require.resolve("../public/privacy.js"), "utf8"),
+    fs.readFile(require.resolve("../public/styles.css"), "utf8")
+  ]);
+  assert.match(page, /id="privacy-navigation"/);
+  assert.match(page, /id="privacy-summary-copy"/);
+  assert.match(script, /title: "Политика конфиденциальности"/);
+  assert.match(script, /title: "Privacy policy"/);
+  assert.equal((script.match(/title: "/g) || []).length, 14);
+  assert.match(script, /IntersectionObserver/);
+  assert.match(script, /aria-current", "location"/);
+  assert.match(styles, /\.privacy-layout\s*\{[\s\S]*grid-template-columns: 220px/);
+  assert.match(styles, /:root\[data-theme="dark"\] \.privacy-page/);
+});
+
+test("keeps account slots when a realtime stream disconnects", async () => {
+  const [app, api] = await Promise.all([
+    fs.readFile(require.resolve("../client/src/App.jsx"), "utf8"),
+    fs.readFile(require.resolve("../client/src/apiClient.mjs"), "utf8")
+  ]);
+  assert.doesNotMatch(app, /EventSource\.CLOSED[\s\S]{0,300}polus:account-session-invalid/);
+  assert.match(api, /response\.status === 401[\s\S]{0,220}polus:account-session-invalid/);
 });
 
 test("creates client IDs in browsers without crypto.randomUUID", async () => {
@@ -103,6 +146,80 @@ test("opens joined channel headers in chat info and keeps discover channels on t
   assert.match(appSource, /if \(event\.detail\.replaceHistory\) \{\s*window\.history\.replaceState\(\{\}, "", "\/"\);/);
 });
 
+test("exposes group settings backed by existing group-management APIs", async () => {
+  const [app, controller, server] = await Promise.all([
+    fs.readFile(require.resolve("../client/src/App.jsx"), "utf8"),
+    fs.readFile(require.resolve("../client/src/messengerController.js"), "utf8"),
+    fs.readFile(require.resolve("../server.js"), "utf8")
+  ]);
+  assert.match(app, /snapshot\?\.chatType === "group"[\s\S]*snapshot\.labels\.groupSettings/);
+  assert.match(app, /function GroupSettingsPage\(\{ groupId, onBack \}\)[\s\S]*useState\("info"\)[\s\S]*polus:request-chat-management[\s\S]*Group settings sections[\s\S]*<ChatManagementContent \/>/);
+  assert.match(app, /className="community-page channel-settings-page group-settings-page"/);
+  assert.match(app, /function ChannelSettingsPage\([\s\S]*?<main className="community-page channel-settings-page">/);
+  assert.match(app, /function ChatManagementContent\(\)[\s\S]*activeSection === "info"[\s\S]*save-group-details[\s\S]*activeSection === "members"[\s\S]*polus:open-user-picker[\s\S]*activeSection === "administrators"[\s\S]*toggle-admin[\s\S]*activeSection === "invites"[\s\S]*activeSection === "additional"[\s\S]*transfer-ownership[\s\S]*delete-chat/);
+  assert.match(app, /\/groups\/\$\{encodeURIComponent\(groupId\)\}\/settings/);
+  assert.match(app, /polus:open-group-settings/);
+  assert.match(controller, /polus:request-chat-management/);
+  assert.match(controller, /action === "save-group-details"[\s\S]*\/settings[\s\S]*groupSettingsSaved/);
+  assert.match(server, /if \(chatType === "group"\) \{[\s\S]*requireChatRole\(chat, user\.id, \["owner"\]\)[\s\S]*Invalid group settings\./);
+  const styles = await fs.readFile(require.resolve("../public/styles.css"), "utf8");
+  assert.match(styles, /\.group-settings-page \.channel-settings-layout\s*\{\s*grid-template-columns: 220px minmax\(0, 1fr\);/);
+  assert.match(styles, /\.channel-settings-layout\s*\{\s*display: grid;\s*grid-template-columns: 220px minmax\(0, 1fr\);/);
+});
+
+test("integrates contacts navigation, profiles, and reusable group/channel member selection", async () => {
+  const [app, server, styles] = await Promise.all([
+    fs.readFile(require.resolve("../client/src/App.jsx"), "utf8"),
+    fs.readFile(require.resolve("../server.js"), "utf8"),
+    fs.readFile(require.resolve("../public/styles.css"), "utf8")
+  ]);
+  assert.match(app, /function ContactsPage\(/);
+  assert.match(app, /onOpenContacts=\{\(\) => document\.dispatchEvent\(new CustomEvent\("polus:open-contacts"\)\)\}/);
+  assert.match(app, /setContactsPage\(pathname === "\/contacts"\)/);
+  assert.match(app, /requestJson\("\/api\/contacts"\)/);
+  assert.match(app, /polus:request-direct-message/);
+  assert.match(app, /function UserPicker\(\)/);
+  assert.match(app, /polus:open-user-picker/);
+  assert.match(app, /<\/main>\s*<ReactDialogs user=\{user\} \/>/);
+  assert.match(app, /close\(\);\s*window\.setTimeout\(\(\) => document\.dispatchEvent\(new CustomEvent\("polus:open-profile"/);
+  assert.match(app, /excludeUserIds: members\.map\(\(member\) => member\.id\)/);
+  assert.match(app, /body: JSON\.stringify\(\{ usernames: selectedContacts\.map\(\(contact\) => contact\.username\) \}\)/);
+  assert.match(app, /function ContactShareDialog\(\)/);
+  assert.match(server, /request\.method === "GET" && url\.pathname === "\/api\/contacts"/);
+  assert.match(server, /isContact: \(user\.contactIds \|\| \[\]\)\.includes\(candidate\.id\)/);
+  assert.match(styles, /\.contacts-page/);
+  assert.match(styles, /:root\[data-theme="dark"\] \.contacts-page/);
+  assert.match(styles, /@media \(max-width: 760px\) \{\s*\.contacts-page-header/);
+});
+
+test("presents other-user profiles with accessible actions and openable shared communities", async () => {
+  const [app, controller, styles] = await Promise.all([
+    fs.readFile(require.resolve("../client/src/App.jsx"), "utf8"),
+    fs.readFile(require.resolve("../client/src/messengerController.js"), "utf8"),
+    fs.readFile(require.resolve("../public/styles.css"), "utf8")
+  ]);
+  assert.match(app, /function UserProfileContent\(\)[\s\S]*user-profile-dialog-header[\s\S]*profile-message-button/);
+  assert.match(app, /profile-secondary-actions[\s\S]*user\.isContact \? labels\.removeContact : labels\.addContact/);
+  assert.match(app, /<details className="profile-more-actions">[\s\S]*confirmBlock/);
+  assert.match(app, /user\.blocked && \([\s\S]*labels\.unblockUser/);
+  assert.match(app, /user\.about \? \([\s\S]*labels\.noAbout/);
+  assert.match(app, /sharedChats\.length > 0 && \([\s\S]*showAllSharedChats/);
+  assert.match(app, /polus:open-profile-community/);
+  assert.match(app, /handleOpenProfileCommunity[\s\S]*bootstrap\.channels : bootstrap\.directs/);
+  assert.match(controller, /sharedGroup: t\("sharedGroup"\)[\s\S]*showAll: t\("showAll"\)/);
+  assert.match(styles, /\.profile-view-dialog \{[^}]*overflow-x: hidden;/);
+  assert.match(styles, /:root\[data-theme="dark"\] \.profile-secondary-actions/);
+  assert.match(styles, /@media \(max-width: 520px\) \{\s*\.profile-view-dialog/);
+});
+
+test("closes every native modal when the user clicks outside its dialog bounds", async () => {
+  const app = await fs.readFile(require.resolve("../client/src/App.jsx"), "utf8");
+  assert.match(app, /const closeOnBackdropClick = \(event\) => \{\s*const dialog = event\.target;\s*if \(dialog\?\.tagName !== "DIALOG" \|\| !dialog\.open \|\| event\.detail === 0\) return;/);
+  assert.match(app, /event\.clientX < bounds\.left \|\| event\.clientX > bounds\.right[\s\S]*event\.clientY < bounds\.top \|\| event\.clientY > bounds\.bottom[\s\S]*dialog\.close\(\)/);
+  assert.match(app, /document\.addEventListener\("click", closeOnBackdropClick, true\)/);
+  assert.match(app, /document\.removeEventListener\("click", closeOnBackdropClick, true\)/);
+});
+
 test("pins Saved Messages above chats and hides unavailable controls in previews", async () => {
   const { getConversationHeaderControls, orderConversations } = await conversationListPromise;
   const chats = [
@@ -129,7 +246,8 @@ test("pins Saved Messages above chats and hides unavailable controls in previews
   const stylesSource = await fs.readFile(require.resolve("../public/styles.css"), "utf8");
   assert.doesNotMatch(appSource, /id="manage-chat"|id="chat-info"/);
   assert.doesNotMatch(appSource, /id="chat-management-dialog"/);
-  assert.match(appSource, /<ChatInfoDialogContent \/>\s*<ChatManagementContent \/>/);
+  assert.match(appSource, /<ChatInfoDialogContent \/>\s*<\/dialog>/);
+  assert.match(appSource, /<GroupSettingsPage[\s\S]*groupId=\{groupSettingsId\}/);
   assert.match(appSource, /id="chat-management-content" className="chat-profile-management"/);
   assert.match(appSource, /saved-bookmark-icon/);
   assert.match(appSource, /className="channel-preview-join"/);
@@ -137,6 +255,17 @@ test("pins Saved Messages above chats and hides unavailable controls in previews
   assert.match(appSource, /conversation\.pinned && !saved && !discover/);
   assert.match(appSource, /className="chat-row-pinned"/);
   assert.match(stylesSource, /\.chat-row-pinned svg/);
+  assert.match(appSource, /function ConversationList\(\{ userId \}\)/);
+  assert.match(appSource, /people-search-section/);
+  assert.match(appSource, /<DiscoverySearchResults/);
+  assert.match(appSource, /\/api\/discover\?q=\$\{encodeURIComponent\(query\)\}/);
+  assert.match(appSource, /Public channels|Публичные каналы/);
+  assert.match(appSource, /Public groups|Публичные группы/);
+  assert.match(appSource, /polus:open-people-search/);
+  assert.match(appSource, /searchRef\.current\?\.focus\(\)/);
+  assert.doesNotMatch(appSource, /function PeopleDirectoryDialog|id="directory-dialog"/);
+  assert.match(appSource, /name="isPublic"[\s\S]*public.*invite only|name="isPublic"[\s\S]*Публичная/);
+  assert.match(appSource, /polus:set-group-privacy|set-group-privacy/);
   assert.match(controllerSource, /listen\(document, "polus:join-channel"/);
   assert.doesNotMatch(controllerSource, /if \(!conversation\.joined && conversation\.type === "channel"\)/);
   assert.match(appSource, /LanguageContext\.Provider value=\{\{ language, setLanguage, theme, setTheme, messageSound, setMessageSound \}\}/);
@@ -197,7 +326,12 @@ test("pins Saved Messages above chats and hides unavailable controls in previews
   assert.match(appSource, /title=\{language === "ru" \? "Действия с чатом" : "Chat actions"\}/);
   assert.match(stylesSource, /\.community-page/);
   assert.match(stylesSource, /\.chat-row-menu/);
-  assert.match(stylesSource, /\.chat-row\[aria-current="page"\] \+ \.chat-row-menu-trigger\s*\{\s*color: #fff;/);
+  assert.match(stylesSource, /\.chat-row\[aria-current="page"\] \+ \.chat-row-menu-trigger\s*\{\s*color: #426b91;/);
+  assert.match(appSource, /className="chat-row-meta"/);
+  assert.match(appSource, /<time className="chat-row-time" dateTime=\{lastTime\}>/);
+  assert.match(stylesSource, /\.chat-row-meta\s*\{[^}]*display: grid;[^}]*justify-items: end;/);
+  assert.match(stylesSource, /\.conversation-row-wrapper:hover \.chat-row-menu-trigger/);
+  assert.match(stylesSource, /\.chat-row\[aria-current="page"\] \{[^}]*background: #eaf2fa;/);
   assert.match(stylesSource, /\.profile-page-layout/);
   assert.match(stylesSource, /\.profile-page-sidebar/);
   assert.match(stylesSource, /\.profile-page-sidebar \{[^}]*position: sticky;[^}]*top: 68px;/s);
@@ -303,6 +437,7 @@ test("provides reaction, reply, and searchable message-forwarding controls", asy
   assert.match(appSource, /polus:reply-target-changed/);
   assert.match(appSource, /replyToId: replyTarget\.message\.id/);
   assert.match(appSource, /polus:refresh-messenger-state/);
+  assert.match(appSource, /requestJson\(`\/api\/discover\?q=\$\{encodeURIComponent\(query\)\}`\)/);
   assert.match(appSource, /MESSAGE_REACTION_EMOJIS/);
   assert.match(appSource, /function PushOnboardingDialog\(\{ user \}\)/);
   assert.match(appSource, /polus-push-onboarding-dismissed:\$\{user\.id\}/);

@@ -1,3 +1,5 @@
+import { accountApiUrl, getActiveAccountKey } from "./apiClient.mjs";
+
 function upload(url, body, contentType, signal, onProgress, headers = {}) {
   return new Promise((resolve, reject) => {
     if (signal.aborted) {
@@ -5,13 +7,19 @@ function upload(url, body, contentType, signal, onProgress, headers = {}) {
       return;
     }
     const request = new XMLHttpRequest();
-    request.open("POST", url);
+    const accountKey = getActiveAccountKey();
+    request.open("POST", accountApiUrl(url, accountKey));
     request.setRequestHeader("Content-Type", contentType || "application/octet-stream");
+    if (accountKey) request.setRequestHeader("X-Polus-Account", accountKey);
     for (const [name, value] of Object.entries(headers)) request.setRequestHeader(name, value);
     request.upload.addEventListener("progress", (event) => {
       if (event.lengthComputable) onProgress(Math.round(event.loaded / event.total * 100));
     });
     request.addEventListener("load", () => {
+      if (accountKey && getActiveAccountKey() !== accountKey) {
+        reject(new DOMException("The active account changed during the upload.", "AbortError"));
+        return;
+      }
       let payload;
       try {
         payload = JSON.parse(request.responseText);

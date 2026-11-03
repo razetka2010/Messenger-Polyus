@@ -3,26 +3,60 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="theme-color" content="#071735">
+    <meta name="theme-color" content="#f5f7fb">
+    <meta name="description" content="Политика конфиденциальности Полюса: какие данные обрабатываются и как управлять своими настройками.">
     <title>Конфиденциальность — Полюс</title>
     <link rel="icon" href="/logo.svg" type="image/svg+xml">
     <link rel="stylesheet" href="/styles.css">
     <script src="/privacy.js" defer></script>
   </head>
   <body class="privacy-page">
-    <main class="privacy-card">
-      <a class="brand privacy-brand" href="/">
+    <header class="privacy-topbar">
+      <a class="brand privacy-brand" href="/" aria-label="Полюс — на главную">
         <img class="brand-logo" src="/logo.svg" alt="">
         <span>ПОЛЮС<span class="brand-dot">.</span></span>
       </a>
-      <label class="language-control privacy-language">
-        <span class="visually-hidden">Language</span>
-        <select id="privacy-language" class="language-select" aria-label="Language">
-          <option value="ru">Русский</option>
-          <option value="en">English</option>
-        </select>
-      </label>
-      <article id="privacy-content" class="privacy-content"></article>
+      <div class="privacy-topbar-actions">
+        <span class="privacy-breadcrumb" id="privacy-breadcrumb">Документы <span aria-hidden="true">/</span> Конфиденциальность</span>
+        <label class="language-control privacy-language">
+          <span class="visually-hidden">Язык страницы</span>
+          <select id="privacy-language" class="language-select" aria-label="Язык страницы">
+            <option value="ru">Русский</option>
+            <option value="en">English</option>
+          </select>
+        </label>
+      </div>
+    </header>
+    <main class="privacy-layout">
+      <aside class="privacy-toc" aria-label="Содержание документа">
+        <details class="privacy-toc-details" open>
+          <summary id="privacy-toc-title">В этом документе</summary>
+          <nav id="privacy-navigation" aria-label="Разделы политики"></nav>
+        </details>
+      </aside>
+      <article class="privacy-document">
+        <header class="privacy-hero">
+          <div class="privacy-eyebrow" id="privacy-eyebrow">ПОЛИТИКА · ПОЛЮС</div>
+          <h1 id="privacy-title">Политика конфиденциальности</h1>
+          <p class="privacy-lead" id="privacy-lead"></p>
+          <div class="privacy-meta">
+            <span class="privacy-meta-icon" aria-hidden="true">✓</span>
+            <span id="privacy-version"></span>
+          </div>
+        </header>
+        <section class="privacy-summary" aria-labelledby="privacy-summary-title">
+          <span class="privacy-summary-icon" aria-hidden="true">i</span>
+          <div>
+            <h2 id="privacy-summary-title">Коротко о главном</h2>
+            <p id="privacy-summary-copy"></p>
+          </div>
+        </section>
+        <div id="privacy-content" class="privacy-content"></div>
+        <footer class="privacy-footer">
+          <span id="privacy-footer-note"></span>
+          <a class="privacy-back" href="/" id="privacy-back">← Вернуться в Полюс</a>
+        </footer>
+      </article>
     </main>
   </body>
 </html>

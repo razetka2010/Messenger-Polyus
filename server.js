@@ -248,6 +248,8 @@ function normalizeStore(input) {
   for (const user of base.users) {
     user.pinnedChatIds = Array.isArray(user.pinnedChatIds) ? user.pinnedChatIds : [];
     user.hiddenChatIds = Array.isArray(user.hiddenChatIds) ? user.hiddenChatIds : [];
+    user.contactIds = Array.isArray(user.contactIds) ? [...new Set(user.contactIds.filter((id) =>
+      typeof id === "string" && id !== user.id))] : [];
   }
   base.uploadUsage = Array.isArray(store.uploadUsage) ? store.uploadUsage : [];
   base.vapidKeys = store.vapidKeys && typeof store.vapidKeys.publicKey === "string"
@@ -271,6 +273,16 @@ function normalizeStore(input) {
     channel.isPrivate = channel.isPrivate === true;
     channel.memberIds = Array.isArray(channel.memberIds) ? channel.memberIds : [];
     channel.adminIds = Array.isArray(channel.adminIds) ? channel.adminIds : [];
+    const storedAdminPermissions = channel.adminPermissions && typeof channel.adminPermissions === "object"
+      && !Array.isArray(channel.adminPermissions) ? channel.adminPermissions : {};
+    channel.adminPermissions = Object.fromEntries(channel.adminIds.map((adminId) => [
+      adminId,
+      {
+        publish: storedAdminPermissions[adminId]?.publish !== false,
+        editMessages: storedAdminPermissions[adminId]?.editMessages !== false,
+        deleteMessages: storedAdminPermissions[adminId]?.deleteMessages !== false
+      }
+    ]));
     channel.postAs = channel.postAs === "channel" ? "channel" : "person";
     channel.unreadCounts = channel.unreadCounts || {};
     channel.lastReadMessageIds = channel.lastReadMessageIds || {};
@@ -281,6 +293,7 @@ function normalizeStore(input) {
     conversation.type ||= conversation.memberIds.length === 2
       ? "direct"
       : conversation.memberIds.length === 1 ? "saved" : "group";
+    if (conversation.type === "group") conversation.isPublic = conversation.isPublic === true;
     conversation.adminIds = Array.isArray(conversation.adminIds) ? conversation.adminIds : [];
     conversation.unreadCounts = conversation.unreadCounts || {};
     conversation.lastReadMessageIds = conversation.lastReadMessageIds || {};
@@ -510,7 +523,8 @@ function createSqliteSchema(database) {
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
       token_hash TEXT NOT NULL,
-      expires_at INTEGER NOT NULL
+      expires_at INTEGER NOT NULL,
+      account_key_hash TEXT
     );
     CREATE INDEX IF NOT EXISTS sessions_user_id ON sessions(user_id);
     CREATE TABLE IF NOT EXISTS chats (
@@ -568,6 +582,11 @@ function createSqliteSchema(database) {
     );
     CREATE INDEX IF NOT EXISTS upload_usage_user_id_created_at ON upload_usage(user_id, created_at);
   `);
+  const sessionColumns = new Set(database.prepare("PRAGMA table_info(sessions)").all()
+    .map((column) => column.name));
+  if (!sessionColumns.has("account_key_hash")) {
+    database.exec("ALTER TABLE sessions ADD COLUMN account_key_hash TEXT");
+  }
 }
 
 function withoutProperties(value, properties) {
@@ -588,7 +607,7 @@ function serializeSqliteStore(store) {
   ]));
   setRows("sessions", store.sessions.map((session) => [
     session.id,
-    [session.id, session.userId, session.tokenHash, session.expiresAt]
+    [session.id, session.userId, session.tokenHash, session.expiresAt, session.accountKeyHash || null]
   ]));
 
   const chats = [...store.channels, ...store.conversations];
@@ -660,8 +679,9 @@ const SQLITE_TABLES = {
     remove: "DELETE FROM users WHERE id = ?"
   },
   sessions: {
-    upsert: `INSERT INTO sessions (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET user_id=excluded.user_id, token_hash=excluded.token_hash, expires_at=excluded.expires_at`,
+    upsert: `INSERT INTO sessions (id, user_id, token_hash, expires_at, account_key_hash) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET user_id=excluded.user_id, token_hash=excluded.token_hash,
+      expires_at=excluded.expires_at, account_key_hash=excluded.account_key_hash`,
     remove: "DELETE FROM sessions WHERE id = ?"
   },
   chats: {
@@ -728,8 +748,15 @@ function readNormalizedSqliteStore(database) {
   const store = createEmptyStore();
   store.users = database.prepare("SELECT id, username, password_hash, data FROM users").all()
     .map((row) => ({ ...JSON.parse(row.data), id: row.id, username: row.username, passwordHash: row.password_hash }));
-  store.sessions = database.prepare("SELECT id, user_id, token_hash, expires_at FROM sessions").all()
-    .map((row) => ({ id: row.id, userId: row.user_id, tokenHash: row.token_hash, expiresAt: row.expires_at }));
+  store.sessions = database.prepare(`SELECT id, user_id, token_hash, expires_at, account_key_hash
+    FROM sessions`).all()
+    .map((row) => ({
+      id: row.id,
+      userId: row.user_id,
+      tokenHash: row.token_hash,
+      expiresAt: row.expires_at,
+      ...(row.account_key_hash ? { accountKeyHash: row.account_key_hash } : {})
+    }));
 
   const membersByChat = new Map();
   for (const row of database.prepare(`SELECT chat_id, user_id, role, last_read_message_id,
@@ -872,10 +899,16 @@ function publicUser(user) {
 }
 
 function getSession(request, store) {
-  const token = cookieValue(request, "polus_session");
+  const url = new URL(request.url, "http://localhost");
+  const accountKey = request.headers["x-polus-account"] || url.searchParams.get("accountKey") || "";
+  if (accountKey && !/^[a-f0-9]{32}$/.test(accountKey)) return null;
+  const cookieName = accountKey ? `polus_session_${accountKey}` : "polus_session";
+  const token = cookieValue(request, cookieName);
   if (!token) return null;
   const hash = tokenHash(token);
-  const session = store.sessions.find((item) => item.tokenHash === hash && item.expiresAt > Date.now());
+  const accountKeyHash = accountKey ? tokenHash(accountKey) : null;
+  const session = store.sessions.find((item) => item.tokenHash === hash && item.expiresAt > Date.now()
+    && (item.accountKeyHash || null) === accountKeyHash);
   if (!session) return null;
   const user = store.users.find((item) => item.id === session.userId);
   return user ? { session, user } : null;
@@ -892,16 +925,21 @@ function cookieOptions(request) {
   return `Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}${secure ? "; Secure" : ""}`;
 }
 
-function makeSession(request, store, user) {
+function makeSession(request, store, user, accountKey = "") {
+  if (accountKey && !/^[a-f0-9]{32}$/.test(accountKey)) {
+    throw new HttpError(400, "Invalid account key.");
+  }
   const token = crypto.randomBytes(32).toString("base64url");
+  const cookieName = accountKey ? `polus_session_${accountKey}` : "polus_session";
   const session = {
     id: randomId(),
     tokenHash: tokenHash(token),
     userId: user.id,
+    ...(accountKey ? { accountKeyHash: tokenHash(accountKey) } : {}),
     expiresAt: Date.now() + SESSION_TTL_MS
   };
   store.sessions.push(session);
-  return { session, cookie: `polus_session=${encodeURIComponent(token)}; ${cookieOptions(request)}` };
+  return { session, cookie: `${cookieName}=${encodeURIComponent(token)}; ${cookieOptions(request)}` };
 }
 
 function getClientAddress(request) {
@@ -965,6 +1003,25 @@ function requireChatRole(chat, userId, allowedRoles) {
   if (!role) throw new HttpError(404, "Chat not found.");
   if (!allowedRoles.includes(role)) throw new HttpError(403, "You do not have permission to manage this chat.");
   return role;
+}
+
+const CHANNEL_ADMIN_PERMISSION_KEYS = ["publish", "editMessages", "deleteMessages"];
+
+function getChannelAdminPermissions(chat, userId) {
+  const permissions = chat.adminPermissions?.[userId] || {};
+  return Object.fromEntries(CHANNEL_ADMIN_PERMISSION_KEYS.map((key) => [key, permissions[key] !== false]));
+}
+
+function hasChannelPermission(chat, userId, permission) {
+  const role = getChatRole(chat, userId);
+  if (role === "owner") return true;
+  return role === "admin" && getChannelAdminPermissions(chat, userId)[permission] === true;
+}
+
+function requireChannelPermission(chat, userId, permission, action) {
+  if (!hasChannelPermission(chat, userId, permission)) {
+    throw new HttpError(403, `You do not have permission to ${action} in this channel.`);
+  }
 }
 
 function findDirectConversation(store, firstUserId, secondUserId) {
@@ -1329,7 +1386,7 @@ function conversationSummary(
     ...(type === "channel" ? {
       postAs: conversation.postAs === "channel" ? "channel" : "person",
       isPrivate: conversation.isPrivate === true
-    } : {})
+    } : type === "group" ? { isPublic: conversation.isPublic === true } : {})
   };
 }
 
@@ -1537,11 +1594,15 @@ function createMessengerServer({
         throw new HttpError(400, "JavaScript is required. Reload the page and try again.");
       }
 
-      if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/profile"
-        || /^\/channels\/[^/]+(?:\/settings)?$/.test(url.pathname) || /^\/join\/[^/]+$/.test(url.pathname)
+      if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/profile" || url.pathname === "/contacts"
+        || /^\/channels\/[^/]+(?:\/settings)?$/.test(url.pathname)
+        || /^\/groups\/[^/]+\/settings$/.test(url.pathname)
+        || /^\/join\/[^/]+$/.test(url.pathname)
         || PUBLIC_FILES.has(url.pathname))) {
-        const isAppPage = url.pathname === "/" || url.pathname === "/profile"
-          || /^\/channels\/[^/]+(?:\/settings)?$/.test(url.pathname) || /^\/join\/[^/]+$/.test(url.pathname);
+        const isAppPage = url.pathname === "/" || url.pathname === "/profile" || url.pathname === "/contacts"
+          || /^\/channels\/[^/]+(?:\/settings)?$/.test(url.pathname)
+          || /^\/groups\/[^/]+\/settings$/.test(url.pathname)
+          || /^\/join\/[^/]+$/.test(url.pathname);
         const [fallbackFileName, contentType] = isAppPage
           ? [path.join(__dirname, "client", "index.html"), "text/html; charset=utf-8"]
           : PUBLIC_FILES.get(url.pathname);
@@ -1574,6 +1635,24 @@ function createMessengerServer({
       if (request.method === "GET" && url.pathname === "/api/auth/me") {
         const auth = getSession(request, currentStore);
         sendJson(response, 200, { user: auth ? publicUser(auth.user) : null });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/auth/accounts/attach") {
+        const input = await readJsonBody(request);
+        const accountKey = typeof input.accountKey === "string" ? input.accountKey : "";
+        if (!/^[a-f0-9]{32}$/.test(accountKey)) throw new HttpError(400, "Invalid account key.");
+        const auth = requireAuth(request, currentStore);
+        const { session, cookie } = makeSession(request, currentStore, auth.user, accountKey);
+        currentStore.sessions = currentStore.sessions.filter((item) => item.id !== auth.session.id);
+        await persist();
+        closeSessionStreams(sessionStreams, auth.session.id);
+        sendJson(response, 200, { user: publicUser(auth.user) }, {
+          "Set-Cookie": [
+            cookie,
+            `polus_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${request.socket.encrypted || process.env.POLUS_COOKIE_SECURE === "true" ? "; Secure" : ""}`
+          ]
+        });
         return;
       }
 
@@ -1635,7 +1714,8 @@ function createMessengerServer({
           };
           currentStore.users.push(user);
           currentStore.conversations.push(createSavedConversation(user));
-          const { cookie } = makeSession(request, currentStore, user);
+          const accountKey = request.headers["x-polus-account"] || "";
+          const { cookie } = makeSession(request, currentStore, user, accountKey);
           await persist();
           sendJson(response, 201, { user: publicUser(user) }, { "Set-Cookie": cookie });
           return;
@@ -1664,7 +1744,8 @@ function createMessengerServer({
         }
         loginAttempts.delete(attemptKey);
         loginAttemptsByUsername.delete(username);
-        const { cookie } = makeSession(request, currentStore, user);
+        const accountKey = request.headers["x-polus-account"] || "";
+        const { cookie } = makeSession(request, currentStore, user, accountKey);
         await persist();
         sendJson(response, 200, { user: publicUser(user) }, { "Set-Cookie": cookie });
         return;
@@ -1682,8 +1763,11 @@ function createMessengerServer({
         currentStore.sessions = currentStore.sessions.filter((item) => item.id !== auth.session.id);
         await persist();
         closeSessionStreams(sessionStreams, auth.session.id);
+        const accountKey = request.headers["x-polus-account"] || new URL(request.url, "http://localhost").searchParams.get("accountKey") || "";
+        const cookieName = accountKey ? `polus_session_${accountKey}` : "polus_session";
+        const secureCookie = request.socket.encrypted || process.env.POLUS_COOKIE_SECURE === "true" ? "; Secure" : "";
         sendJson(response, 200, { ok: true }, {
-          "Set-Cookie": "polus_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
+          "Set-Cookie": `${cookieName}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secureCookie}`
         });
         return;
       }
@@ -1717,9 +1801,7 @@ function createMessengerServer({
       if (request.method === "POST" && uploadRoute) {
         const chatId = decodePathComponent(uploadRoute[1]);
         const { type, conversation } = findConversation(currentStore, chatId, user.id);
-        if (type === "channel" && !["owner", "admin"].includes(getChatRole(conversation, user.id))) {
-          throw new HttpError(403, "Only channel owners and administrators can upload to this channel.");
-        }
+        if (type === "channel") requireChannelPermission(conversation, user.id, "publish", "publish");
         const declaredSize = Number(request.headers["content-length"] || 0);
         if (declaredSize > MAX_ATTACHMENT_BYTES) throw new HttpError(413, "Files cannot exceed 100 MB.");
         const name = safeFileName(decodePathComponent(String(request.headers["x-file-name"] || "file")));
@@ -1809,9 +1891,7 @@ function createMessengerServer({
         const chatId = decodePathComponent(thumbnailRoute[1]);
         const attachmentId = decodePathComponent(thumbnailRoute[2]);
         const { type, conversation } = findConversation(currentStore, chatId, user.id);
-        if (type === "channel" && !["owner", "admin"].includes(getChatRole(conversation, user.id))) {
-          throw new HttpError(403, "Only channel owners and administrators can upload to this channel.");
-        }
+        if (type === "channel") requireChannelPermission(conversation, user.id, "publish", "publish");
         const attachment = currentStore.attachments.find((item) =>
           item.id === attachmentId && item.chatId === chatId
           && item.authorId === user.id && !item.messageId
@@ -2007,6 +2087,46 @@ function createMessengerServer({
       }
 
       const profileRoute = /^\/api\/users\/([^/]+)\/profile$/.exec(url.pathname);
+      if (request.method === "GET" && url.pathname === "/api/contacts") {
+        const contactIds = new Set(user.contactIds || []);
+        const contacts = currentStore.users
+          .filter((contact) => contactIds.has(contact.id))
+          .map((contact) => ({
+            ...publicUser(contact),
+            online: contact.showOnlineStatus !== false
+              && !(contact.blockedUserIds || []).includes(user.id)
+              && Boolean(connectedUsers.get(contact.id)?.size),
+            lastSeenAt: contact.showOnlineStatus === false || (contact.blockedUserIds || []).includes(user.id)
+              ? null
+              : contact.lastSeenAt || null,
+            blocked: (user.blockedUserIds || []).includes(contact.id)
+              || (contact.blockedUserIds || []).includes(user.id)
+          }))
+          .sort((left, right) => left.fullName.localeCompare(right.fullName));
+        sendJson(response, 200, contacts);
+        return;
+      }
+
+      const contactRoute = /^\/api\/contacts\/([^/]+)$/.exec(url.pathname);
+      if (contactRoute && ["PUT", "DELETE"].includes(request.method)) {
+        const username = decodePathComponent(contactRoute[1]).replace(/^@/, "").toLowerCase();
+        const target = currentStore.users.find((candidate) => candidate.username === username);
+        if (!target) throw new HttpError(404, "User not found.");
+        if (target.id === user.id) throw new HttpError(400, "You cannot add yourself to contacts.");
+        user.contactIds = Array.isArray(user.contactIds) ? user.contactIds : [];
+        if (request.method === "PUT" && !user.contactIds.includes(target.id)) {
+          user.contactIds.push(target.id);
+        } else if (request.method === "DELETE") {
+          user.contactIds = user.contactIds.filter((contactId) => contactId !== target.id);
+        }
+        await persist();
+        sendJson(response, 200, {
+          contact: request.method === "PUT" ? publicUser(target) : null,
+          isContact: user.contactIds.includes(target.id)
+        });
+        return;
+      }
+
       if (request.method === "GET" && profileRoute) {
         const username = decodePathComponent(profileRoute[1]).replace(/^@/, "").toLowerCase();
         const target = currentStore.users.find((candidate) => candidate.username === username);
@@ -2031,6 +2151,7 @@ function createMessengerServer({
           user: {
             ...publicUser(target),
             createdAt: target.createdAt,
+            isContact: (user.contactIds || []).includes(target.id),
             blocked,
             online: target.showOnlineStatus !== false
               && !(target.blockedUserIds || []).includes(user.id)
@@ -2382,6 +2503,11 @@ function createMessengerServer({
         if (request.method === "GET" && !section) {
           sendJson(response, 200, {
             chat: chatSummary(chat, user.id),
+            adminPermissions: chatType === "channel"
+              ? role === "owner"
+                ? chat.adminPermissions
+                : role === "admin" ? { [user.id]: getChannelAdminPermissions(chat, user.id) } : {}
+              : {},
             inviteUrl: ["owner", "admin"].includes(role) && chat.inviteToken
               ? `/join/${chat.inviteToken}` : null,
             members: chat.memberIds.map((memberId) => {
@@ -2393,12 +2519,38 @@ function createMessengerServer({
         }
 
         if (request.method === "PUT" && section === "settings" && !targetId) {
-          requireChatRole(chat, user.id, ["owner"]);
-          if (chatType !== "channel") throw new HttpError(400, "Only channel settings can be changed here.");
           const input = await readJsonBody(request);
+          if (chatType === "group") {
+            requireChatRole(chat, user.id, ["owner"]);
+            if (Object.keys(input).some((key) => !["name", "description", "isPublic"].includes(key))) {
+              throw new HttpError(400, "Invalid group settings.");
+            }
+            if (input.isPublic !== undefined && typeof input.isPublic !== "boolean") {
+              throw new HttpError(400, "Invalid group settings.");
+            }
+            const name = input.name === undefined ? undefined : cleanText(input.name, 50);
+            if (name !== undefined && Array.from(name).length < 2) {
+              throw new HttpError(400, "Group name is too short.");
+            }
+            if (input.description !== undefined && typeof input.description !== "string") {
+              throw new HttpError(400, "Group description must be text.");
+            }
+            if (name !== undefined) chat.name = name;
+            if (input.description !== undefined) chat.description = cleanText(input.description, 160);
+            if (typeof input.isPublic === "boolean") chat.isPublic = input.isPublic;
+            await persist();
+            broadcastChatMembers(chat, "chat-updated", { chatId, action: "settings-changed" }, broadcast);
+            sendJson(response, 200, { chat: chatSummary(chat, user.id) });
+            return;
+          }
+          if (chatType !== "channel") throw new HttpError(400, "Only channels and groups have settings.");
           if (input.postAs !== undefined && input.postAs !== "channel" && input.postAs !== "person") {
             throw new HttpError(400, "Post identity must be channel or person.");
           }
+          const changesChannelDetails = input.name !== undefined
+            || input.description !== undefined || input.isPrivate !== undefined;
+          if (changesChannelDetails) requireChatRole(chat, user.id, ["owner"]);
+          else requireChatRole(chat, user.id, ["owner", "admin"]);
           const name = input.name === undefined ? undefined : cleanText(input.name, 50);
           if (name !== undefined && Array.from(name).length < 2) {
             throw new HttpError(400, "Channel name is too short.");
@@ -2419,25 +2571,52 @@ function createMessengerServer({
         if (request.method === "POST" && section === "members" && !targetId) {
           requireChatRole(chat, user.id, ["owner", "admin"]);
           const input = await readJsonBody(request);
-          const username = cleanText(input.username, 32).replace(/^@/, "").toLowerCase();
-          const invitee = currentStore.users.find((candidate) => candidate.username === username);
-          if (!invitee) throw new HttpError(404, "User not found.");
-          if (chat.memberIds.includes(invitee.id)) {
+          const usernames = Array.isArray(input.usernames)
+            ? input.usernames.map((value) => cleanText(value, 32).replace(/^@/, "").toLowerCase())
+            : [cleanText(input.username, 32).replace(/^@/, "").toLowerCase()];
+          const uniqueUsernames = [...new Set(usernames.filter(Boolean))];
+          if (!uniqueUsernames.length || uniqueUsernames.length > 199) {
+            throw new HttpError(400, "Choose between 1 and 199 users.");
+          }
+          const invitees = uniqueUsernames.map((username) =>
+            currentStore.users.find((candidate) => candidate.username === username));
+          if (invitees.some((invitee) => !invitee)) throw new HttpError(404, "User not found.");
+          if (invitees.some((invitee) => invitee.id === user.id)) {
+            throw new HttpError(400, "You cannot add yourself to a chat.");
+          }
+          if (invitees.some((invitee) => (user.blockedUserIds || []).includes(invitee.id)
+            || (invitee.blockedUserIds || []).includes(user.id))) {
+            throw new HttpError(403, "Blocked users cannot be added to a chat.");
+          }
+          if (!Array.isArray(input.usernames) && chat.memberIds.includes(invitees[0].id)) {
             sendJson(response, 200, { chat: chatSummary(chat, user.id), added: false });
             return;
           }
-          if (chatType === "group" && chat.memberIds.length >= 200) {
+          if (invitees.some((invitee) => chat.memberIds.includes(invitee.id))) {
+            throw new HttpError(409, "One or more selected users are already chat members.");
+          }
+          if (chatType === "channel" && !chat.isPrivate) {
+            throw new HttpError(400, "Invite users to public channels with an invite link.");
+          }
+          if (chatType === "group" && chat.memberIds.length + invitees.length > 200) {
             throw new HttpError(409, "Groups cannot have more than 200 participants.");
           }
-          chat.memberIds.push(invitee.id);
           chat.unreadCounts = chat.unreadCounts || {};
-          chat.unreadCounts[invitee.id] = 0;
           chat.lastReadMessageIds = chat.lastReadMessageIds || {};
-          chat.lastReadMessageIds[invitee.id] = latestMessageId(currentStore, chat.id);
+          const latestId = latestMessageId(currentStore, chat.id);
+          for (const invitee of invitees) {
+            chat.memberIds.push(invitee.id);
+            chat.unreadCounts[invitee.id] = 0;
+            chat.lastReadMessageIds[invitee.id] = latestId;
+            invitee.hiddenChatIds = (invitee.hiddenChatIds || []).filter((id) => id !== chat.id);
+          }
           await persist();
-          const event = { chatId, action: "member-added", userId: invitee.id };
+          const event = { chatId, action: "members-added", userIds: invitees.map((invitee) => invitee.id) };
           broadcastChatMembers(chat, "chat-updated", event, broadcast);
-          sendJson(response, 201, { chat: chatSummary(chat, user.id), added: true });
+          sendJson(response, 201, {
+            chat: chatSummary(chat, user.id),
+            added: invitees.map((invitee) => publicUser(invitee))
+          });
           return;
         }
 
@@ -2455,6 +2634,7 @@ function createMessengerServer({
           chat.adminIds = (chat.adminIds || []).filter((adminId) => adminId !== targetId);
           if (chat.unreadCounts) delete chat.unreadCounts[targetId];
           if (chat.lastReadMessageIds) delete chat.lastReadMessageIds[targetId];
+          if (chat.adminPermissions) delete chat.adminPermissions[targetId];
           await persist();
           const event = { chatId, action: "member-removed", userId: targetId };
           broadcastChatMembers(chat, "chat-updated", event, broadcast);
@@ -2468,10 +2648,41 @@ function createMessengerServer({
           if (targetId === chat.ownerId) throw new HttpError(400, "The owner cannot be an administrator.");
           if (!chat.memberIds.includes(targetId)) throw new HttpError(404, "Chat member not found.");
           const input = await readJsonBody(request);
+          if (input.permissions !== undefined) {
+            if (chatType !== "channel") {
+              throw new HttpError(400, "Custom administrator permissions are only supported for channels.");
+            }
+            if (input.role !== undefined) throw new HttpError(400, "Update the role or permissions separately.");
+            if (getChatRole(chat, targetId) !== "admin") {
+              throw new HttpError(400, "Only administrators can have custom permissions.");
+            }
+            if (!input.permissions || typeof input.permissions !== "object"
+              || Array.isArray(input.permissions)
+              || CHANNEL_ADMIN_PERMISSION_KEYS.some((key) => typeof input.permissions[key] !== "boolean")
+              || Object.keys(input.permissions).some((key) => !CHANNEL_ADMIN_PERMISSION_KEYS.includes(key))) {
+              throw new HttpError(400, "Invalid administrator permissions.");
+            }
+            chat.adminPermissions = chat.adminPermissions || {};
+            chat.adminPermissions[targetId] = Object.fromEntries(
+              CHANNEL_ADMIN_PERMISSION_KEYS.map((key) => [key, input.permissions[key]])
+            );
+            await persist();
+            broadcastChatMembers(chat, "chat-updated", { chatId, action: "permissions-changed", userId: targetId }, broadcast);
+            sendJson(response, 200, {
+              chat: chatSummary(chat, user.id),
+              permissions: chat.adminPermissions[targetId]
+            });
+            return;
+          }
           if (input.role === "admin") {
             if (!chat.adminIds.includes(targetId)) chat.adminIds.push(targetId);
+            if (chatType === "channel") {
+              chat.adminPermissions = chat.adminPermissions || {};
+              chat.adminPermissions[targetId] = getChannelAdminPermissions(chat, targetId);
+            }
           } else if (input.role === "member") {
             chat.adminIds = chat.adminIds.filter((adminId) => adminId !== targetId);
+            if (chat.adminPermissions) delete chat.adminPermissions[targetId];
           } else {
             throw new HttpError(400, "Role must be admin or member.");
           }
@@ -2493,6 +2704,7 @@ function createMessengerServer({
           chat.ownerId = newOwner.id;
           chat.createdBy = newOwner.id;
           chat.adminIds = (chat.adminIds || []).filter((adminId) => adminId !== newOwner.id);
+          if (chat.adminPermissions) delete chat.adminPermissions[newOwner.id];
           await persist();
           broadcastChatMembers(chat, "chat-updated", { chatId, action: "owner-changed", userId: newOwner.id }, broadcast);
           sendJson(response, 200, { chat: chatSummary(chat, user.id) });
@@ -2503,6 +2715,7 @@ function createMessengerServer({
           if (role === "owner") throw new HttpError(409, "Transfer ownership or delete the chat before leaving.");
           chat.memberIds = chat.memberIds.filter((memberId) => memberId !== user.id);
           chat.adminIds = (chat.adminIds || []).filter((adminId) => adminId !== user.id);
+          if (chat.adminPermissions) delete chat.adminPermissions[user.id];
           if (chat.unreadCounts) delete chat.unreadCounts[user.id];
           if (chat.lastReadMessageIds) delete chat.lastReadMessageIds[user.id];
           await persist();
@@ -2598,13 +2811,57 @@ function createMessengerServer({
       }
 
       if (request.method === "GET" && url.pathname === "/api/users") {
-        const query = cleanText(url.searchParams.get("q") || "", 25).replace(/^@/, "").toLowerCase();
+        const query = cleanText(url.searchParams.get("q") || "", 50).replace(/^@/, "").toLowerCase();
         const users = query.length < 2 ? [] : currentStore.users
           .filter((candidate) => candidate.id !== user.id
-            && (candidate.username.includes(query) || candidate.fullName.toLowerCase().includes(query)))
+            && (candidate.username.includes(query) || candidate.fullName.toLowerCase().includes(query)
+              || candidate.id.toLowerCase().includes(query)))
+          .slice(0, 20)
+          .map((candidate) => ({
+            ...publicUser(candidate),
+            isContact: (user.contactIds || []).includes(candidate.id)
+          }));
+        sendJson(response, 200, users);
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/discover") {
+        const query = cleanText(url.searchParams.get("q") || "", 50).replace(/^@/, "").toLocaleLowerCase();
+        if (query.length < 2) {
+          sendJson(response, 200, { users: [], channels: [], groups: [] });
+          return;
+        }
+        const matches = (value) => String(value || "").toLocaleLowerCase().includes(query);
+        const users = currentStore.users
+          .filter((candidate) => candidate.id !== user.id
+            && (matches(candidate.username) || matches(candidate.fullName)))
           .slice(0, 20)
           .map(publicUser);
-        sendJson(response, 200, users);
+        const channels = currentStore.channels
+          .filter((channel) => !channel.isPrivate
+            && (matches(channel.name) || matches(channel.description)))
+          .slice(0, 20)
+          .map((channel) => ({
+            id: channel.id,
+            type: "channel",
+            name: channel.name,
+            description: channel.description || "",
+            memberCount: channel.memberIds.length,
+            joined: channel.memberIds.includes(user.id)
+          }));
+        const groups = currentStore.conversations
+          .filter((conversation) => conversation.type === "group" && conversation.isPublic === true
+            && (matches(conversation.name) || matches(conversation.description)))
+          .slice(0, 20)
+          .map((conversation) => ({
+            id: conversation.id,
+            type: "group",
+            name: conversation.name,
+            description: conversation.description || "",
+            memberCount: conversation.memberIds.length,
+            joined: conversation.memberIds.includes(user.id)
+          }));
+        sendJson(response, 200, { users, channels, groups });
         return;
       }
 
@@ -2637,11 +2894,15 @@ function createMessengerServer({
       if (request.method === "POST" && url.pathname === "/api/groups") {
         const input = await readJsonBody(request);
         const name = cleanText(input.name, 50);
+        if (input.isPublic !== undefined && typeof input.isPublic !== "boolean") {
+          throw new HttpError(400, "Invalid group settings.");
+        }
+        const isPublic = input.isPublic === true;
         const usernames = Array.isArray(input.usernames)
           ? input.usernames.map((value) => cleanText(value, 32).replace(/^@/, "").toLowerCase()).filter(Boolean)
           : [];
         if (Array.from(name).length < 2) throw new HttpError(400, "Group name is too short.");
-        if (!usernames.length || usernames.length > 199) {
+        if ((!isPublic && !usernames.length) || usernames.length > 199) {
           throw new HttpError(400, "Add between 2 and 199 other participants.");
         }
         const users = usernames.map((username) =>
@@ -2649,11 +2910,13 @@ function createMessengerServer({
         );
         if (users.some((participant) => !participant)) throw new HttpError(404, "One or more usernames were not found.");
         const memberIds = [...new Set([user.id, ...users.map((participant) => participant.id)])];
-        if (memberIds.length < 2) throw new HttpError(400, "A group must have at least one other member.");
+        if (!isPublic && memberIds.length < 2) throw new HttpError(400, "A group must have at least one other member.");
         const conversation = {
           id: `group_${randomId()}`,
           type: "group",
           name,
+          description: cleanText(input.description, 160),
+          isPublic,
           memberIds,
           adminIds: [],
           ownerId: user.id,
@@ -2665,6 +2928,27 @@ function createMessengerServer({
         currentStore.conversations.push(conversation);
         await persist();
         sendJson(response, 201, chatSummary(conversation, user.id));
+        return;
+      }
+
+      if (request.method === "POST" && /^\/api\/groups\/[^/]+\/join$/.test(url.pathname)) {
+        const id = decodePathComponent(url.pathname.split("/")[3]);
+        const group = currentStore.conversations.find((item) => item.id === id && item.type === "group");
+        if (!group || !group.isPublic) throw new HttpError(404, "Group not found.");
+        if (!group.memberIds.includes(user.id)) {
+          if (group.memberIds.length >= 200) {
+            throw new HttpError(409, "Groups cannot have more than 200 participants.");
+          }
+          group.memberIds.push(user.id);
+          group.unreadCounts = group.unreadCounts || {};
+          group.unreadCounts[user.id] = 0;
+          group.lastReadMessageIds = group.lastReadMessageIds || {};
+          group.lastReadMessageIds[user.id] = latestMessageId(currentStore, group.id);
+          user.hiddenChatIds = (user.hiddenChatIds || []).filter((hiddenId) => hiddenId !== group.id);
+          await persist();
+          broadcastChatMembers(group, "chat-updated", { chatId: id, action: "member-added", userId: user.id }, broadcast);
+        }
+        sendJson(response, 200, chatSummary(group, user.id));
         return;
       }
 
@@ -2847,9 +3131,7 @@ function createMessengerServer({
             throw new HttpError(404, "Reply target not found.");
           }
         }
-        if (type === "channel" && !["owner", "admin"].includes(getChatRole(conversation, user.id))) {
-          throw new HttpError(403, "Only channel owners and administrators can post.");
-        }
+        if (type === "channel") requireChannelPermission(conversation, user.id, "publish", "publish");
         if (type === "direct") {
           const otherUserId = conversation.memberIds.find((memberId) => memberId !== user.id);
           const otherUser = currentStore.users.find((candidate) => candidate.id === otherUserId);
@@ -3079,9 +3361,7 @@ function createMessengerServer({
 
         const { type: targetType, conversation: targetChat } =
           findConversation(currentStore, targetChatId, user.id);
-        if (targetType === "channel" && !["owner", "admin"].includes(getChatRole(targetChat, user.id))) {
-          throw new HttpError(403, "Only channel owners and administrators can post.");
-        }
+        if (targetType === "channel") requireChannelPermission(targetChat, user.id, "publish", "publish");
         if (targetType === "direct") {
           const otherUserId = targetChat.memberIds.find((memberId) => memberId !== user.id);
           const otherUser = currentStore.users.find((candidate) => candidate.id === otherUserId);
@@ -3230,7 +3510,17 @@ function createMessengerServer({
           throw new HttpError(404, "Message not found.");
         }
         if (targetMessage.deleted) throw new HttpError(400, "Deleted messages cannot be edited.");
-        if (targetMessage.authorId !== user.id) throw new HttpError(403, "You can only edit your own messages.");
+        const { type: targetType, conversation: targetChat } =
+          findConversation(currentStore, targetChatId, user.id);
+        const targetRole = getChatRole(targetChat, user.id);
+        if (targetType === "channel" && targetRole === "admin") {
+          requireChannelPermission(targetChat, user.id, "editMessages", "edit messages");
+        }
+        const canEditOtherChannelMessages = targetType === "channel" && targetRole === "admin"
+          && hasChannelPermission(targetChat, user.id, "editMessages");
+        if (targetMessage.authorId !== user.id && !canEditOtherChannelMessages) {
+          throw new HttpError(403, "You can only edit your own messages.");
+        }
         const createdAt = Date.parse(targetMessage.createdAt || targetMessage.sentAt);
         if (!Number.isFinite(createdAt) || Date.now() - createdAt > MESSAGE_EDIT_WINDOW_MS) {
           throw new HttpError(403, "Messages can only be edited within 48 hours.");
@@ -3277,8 +3567,14 @@ function createMessengerServer({
         const { type, conversation } = findConversation(
           currentStore, message.conversationId || message.room, user.id
         );
-        const isModerator = ["channel", "group"].includes(type)
-          && ["owner", "admin"].includes(getChatRole(conversation, user.id));
+        const role = getChatRole(conversation, user.id);
+        if (type === "channel" && role === "admin") {
+          requireChannelPermission(conversation, user.id, "deleteMessages", "delete messages");
+        }
+        const isModerator = type === "group"
+          ? ["owner", "admin"].includes(role)
+          : type === "channel" && (role === "owner"
+            || role === "admin" && hasChannelPermission(conversation, user.id, "deleteMessages"));
         if (message.authorId !== user.id && !isModerator) {
           throw new HttpError(403, "You can only delete your own messages.");
         }
@@ -3423,13 +3719,14 @@ function createMessengerServer({
   return server;
 }
 
-function createPushPayload(message, { hideContent = false } = {}) {
+function createPushPayload(message, { hideContent = false, recipientId = "" } = {}) {
   const authorName = message.author?.fullName || `@${message.author?.username || "user"}`;
   const text = typeof message.text === "string" ? message.text.trim() : "";
   return {
     title: `${authorName} · Полюс`,
     body: hideContent ? "Новое сообщение" : Array.from(text || "Вложение").slice(0, 100).join(""),
-    conversationId: String(message.conversationId || message.chatId || "")
+    conversationId: String(message.conversationId || message.chatId || ""),
+    accountUserId: String(recipientId)
   };
 }
 
@@ -3443,7 +3740,10 @@ async function sendPushToUser(
   const subscriptions = store.pushSubscriptions.filter((item) => item.userId === userId);
   await Promise.all(subscriptions.map(async ({ subscription }) => {
     try {
-      await sendNotification(subscription, JSON.stringify(createPushPayload(message, { hideContent })));
+      await sendNotification(subscription, JSON.stringify(createPushPayload(message, {
+        hideContent,
+        recipientId: userId
+      })));
     } catch (error) {
       if (error.statusCode === 404 || error.statusCode === 410) {
         store.pushSubscriptions = store.pushSubscriptions.filter(
