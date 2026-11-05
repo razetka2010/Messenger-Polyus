@@ -2261,8 +2261,39 @@ button { color: inherit; }
 .profile-more-actions summary::-webkit-details-marker { display: none; }
 .profile-more-actions summary::after { margin-left: 6px; content: "⌄"; }
 .profile-more-actions[open] summary::after { content: "⌃"; }
-.profile-more-menu { display: flex; justify-content: flex-start; padding-top: 7px; }
+.profile-more-actions[open] { position: relative; }
+.profile-more-menu {
+  position: absolute;
+  z-index: 9;
+  right: 0;
+  display: grid;
+  gap: 8px;
+  min-width: 180px;
+  padding: 10px;
+  color: #f3f7ff;
+  background: #1b2b40;
+  border: 1px solid #415873;
+  border-radius: 12px;
+  box-shadow: 0 14px 35px rgb(0 0 0 / 30%);
+}
 .profile-more-menu .danger-button { min-height: 34px; padding: 0 10px; font-size: 11px; }
+.profile-more-menu .text-button {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  min-height: 34px;
+  padding: 0 10px;
+  color: #eaf4ff;
+  background: transparent;
+  border-radius: 8px;
+  font-size: 11px;
+  text-align: left;
+}
+.profile-more-menu .text-button:hover {
+  color: #fff;
+  background: rgb(255 255 255 / 8%);
+  text-decoration: none;
+}
 .user-profile-blocked { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 15px; padding: 10px 12px; color: #8e5457; background: #fff3f2; border-radius: 9px; font-size: 11px; }
 .user-profile-blocked .text-button { flex: 0 0 auto; color: #a53d43; font-size: 11px; }
 .profile-no-about { margin: 0; padding: 2px 0 14px; color: #929eae; font-size: 11px; }
@@ -2381,13 +2412,13 @@ button { color: inherit; }
 .public-profile-card {
   position: relative;
   z-index: 1;
-  overflow: hidden;
+  overflow: visible;
   background: #172335;
   border: 1px solid rgb(222 237 255 / 12%);
   border-radius: 25px;
   box-shadow: 0 28px 90px rgb(0 0 0 / 28%);
 }
-.public-profile-cover { position: relative; height: clamp(190px, 31vw, 330px); overflow: hidden; background: linear-gradient(var(--profile-gradient-angle, 145deg), var(--profile-gradient-start, #173651), var(--profile-gradient-end, #5663bd)); }
+.public-profile-cover { position: relative; height: clamp(190px, 31vw, 330px); overflow: hidden; background: linear-gradient(var(--profile-gradient-angle, 145deg), var(--profile-gradient-start, #173651), var(--profile-gradient-end, #5663bd)); border-radius: 24px 24px 0 0; }
 .public-profile-cover > img,
 .public-profile-cover > video,
 .public-profile-cover-art { position: absolute; width: 100%; height: 100%; object-fit: cover; }
@@ -2412,11 +2443,67 @@ button { color: inherit; }
 .public-profile-actions > .primary-button { min-height: 42px; color: #fff; background: linear-gradient(120deg, var(--profile-accent, #4d83d1), color-mix(in srgb, var(--profile-accent, #4d83d1) 65%, #263c9d)); box-shadow: 0 7px 20px color-mix(in srgb, var(--profile-accent, #4d83d1) 34%, transparent); }
 .public-profile-actions > .secondary-button { color: #edf5ff; background: #263a52; border: 1px solid #405672; }
 .public-profile-actions > .secondary-button:hover { color: #fff; background: #344c68; border-color: #597594; transform: translateY(-1px); }
-.public-profile-actions .profile-more-actions summary { display: inline-flex; min-height: 40px; align-items: center; padding: 0 12px; color: #dce8f5; background: #263a52; border: 1px solid #405672; border-radius: 10px; font-size: 12px; font-weight: 650; }
+.public-profile-actions .profile-more-actions summary {
+  display: inline-flex;
+  min-height: 40px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 12px;
+  color: #dce8f5;
+  background: #263a52;
+  border: 1px solid #405672;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1;
+  white-space: nowrap;
+  list-style: none;
+  cursor: pointer;
+}
+.public-profile-actions .profile-more-actions summary::-webkit-details-marker { display: none; }
+.public-profile-actions .profile-more-actions summary::marker { display: none; }
+.public-profile-actions .profile-more-actions summary::after {
+  margin-left: 1px;
+  content: "▾";
+  font-size: 11px;
+  line-height: 1;
+  opacity: 0.9;
+}
+.public-profile-actions .profile-more-actions[open] summary::after { content: "▴"; }
 .public-profile-actions .profile-more-actions summary:hover { background: #344c68; }
-.public-profile-actions .profile-more-actions[open] { position: relative; }
-.public-profile-actions .profile-more-menu { position: absolute; z-index: 3; right: 0; min-width: 180px; padding: 10px; background: #1b2b40; border: 1px solid #415873; border-radius: 12px; box-shadow: 0 14px 35px rgb(0 0 0 / 30%); }
-.public-profile-actions .profile-more-menu .text-button { color: #dce8f5; }
+.public-profile-actions .profile-more-actions[open] { position: relative; z-index: 4; }
+.public-profile-actions .profile-more-menu {
+  position: absolute;
+  z-index: 3;
+  right: 0;
+  display: grid;
+  gap: 8px;
+  min-width: 180px;
+  padding: 10px;
+  color: #f3f7ff;
+  background: #1b2b40;
+  border: 1px solid #415873;
+  border-radius: 12px;
+  box-shadow: 0 14px 35px rgb(0 0 0 / 30%);
+}
+.public-profile-actions .profile-more-menu .text-button {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  min-height: 34px;
+  padding: 0 10px;
+  color: #eaf4ff;
+  background: transparent;
+  border-radius: 8px;
+  font-size: 11px;
+  text-align: left;
+}
+.public-profile-actions .profile-more-menu .text-button:hover {
+  color: #fff;
+  background: rgb(255 255 255 / 8%);
+  text-decoration: none;
+}
 .profile-theme-ocean .public-profile-actions > .secondary-button,
 .profile-theme-sunset .public-profile-actions > .secondary-button { color: #26384b; background: #fff; border-color: #cbd9e6; }
 .profile-theme-ocean .public-profile-actions .profile-more-actions summary,
@@ -2427,6 +2514,46 @@ button { color: inherit; }
 .profile-theme-sunset .public-profile-actions .profile-more-menu .text-button { color: #344b65; }
 .public-profile-actions .profile-more-actions { border: 0; }
 .public-profile-actions .profile-more-menu { display: grid; gap: 8px; }
+.public-profile-card > .user-profile-blocked {
+  margin: 0 34px 20px;
+  padding: 12px 14px;
+  color: #e8b8bd;
+  background: rgb(180 65 78 / 10%);
+  border: 1px solid rgb(226 105 112 / 22%);
+  border-radius: 12px;
+  font-size: 12px;
+}
+.public-profile-card > .user-profile-blocked .text-button {
+  min-height: 34px;
+  padding: 0 11px;
+  color: #ffc0c3;
+  background: rgb(226 105 112 / 10%);
+  border: 1px solid rgb(226 105 112 / 24%);
+  border-radius: 9px;
+  font-size: 11px;
+  font-weight: 650;
+}
+.public-profile-card > .user-profile-blocked .text-button:hover {
+  color: #fff;
+  background: rgb(226 105 112 / 22%);
+}
+.profile-theme-ocean .public-profile-card > .user-profile-blocked,
+.profile-theme-sunset .public-profile-card > .user-profile-blocked {
+  color: #83434a;
+  background: #fff3f2;
+  border-color: #f0d4d3;
+}
+.profile-theme-ocean .public-profile-card > .user-profile-blocked .text-button,
+.profile-theme-sunset .public-profile-card > .user-profile-blocked .text-button {
+  color: #9e3f47;
+  background: #fff;
+  border-color: #e8c4c4;
+}
+.profile-theme-ocean .public-profile-card > .user-profile-blocked .text-button:hover,
+.profile-theme-sunset .public-profile-card > .user-profile-blocked .text-button:hover {
+  color: #832f38;
+  background: #ffe9e8;
+}
 .public-profile-section { margin: 0 34px; padding: 24px 0; border-top: 1px solid rgb(222 237 255 / 12%); animation: profile-section-in 450ms ease-out both; }
 .public-profile-section h2 { margin: 0; color: #e9f2fb; font-size: 14px; }
 .public-profile-section:nth-of-type(2) { animation-delay: 80ms; }
@@ -2519,6 +2646,7 @@ button { color: inherit; }
   .public-profile-identity { padding-top: 10px; }
   .public-profile-identity h1 { font-size: 22px; }
   .public-profile-page .user-profile-handle { font-size: 12px; }
+  .public-profile-card > .user-profile-blocked { margin: 0 16px 16px; }
   .public-profile-actions { grid-column: 1 / -1; justify-content: flex-start; }
   .public-profile-actions > .primary-button { flex: 1 1 100%; }
   .public-profile-actions > .secondary-button,

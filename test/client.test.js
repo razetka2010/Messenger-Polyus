@@ -788,6 +788,12 @@ test("presents public user profiles as themed pages with accessible actions and 
   assert.match(app, /handleOpenProfileCommunity[\s\S]*bootstrap\.channels : bootstrap\.directs/);
   assert.match(controller, /sharedGroup: t\("sharedGroup"\)[\s\S]*showAll: t\("showAll"\)/);
   assert.match(styles, /\.public-profile-page \{/);
+  assert.match(styles, /\.public-profile-card \{[^}]*overflow: visible;/);
+  assert.match(styles, /\.public-profile-cover \{[^}]*overflow: hidden;[^}]*border-radius: 24px 24px 0 0;/);
+  assert.match(styles, /\.public-profile-actions \.profile-more-actions\[open\] \{ position: relative; z-index: 4; \}/);
+  assert.match(styles, /\.public-profile-card > \.user-profile-blocked \{\s*margin: 0 34px 20px;[\s\S]*background: rgb\(180 65 78 \/ 10%\);/);
+  assert.match(styles, /\.public-profile-card > \.user-profile-blocked \.text-button \{\s*min-height: 34px;[\s\S]*border-radius: 9px;/);
+  assert.match(styles, /\.public-profile-card > \.user-profile-blocked \{ margin: 0 16px 16px; \}/);
   assert.match(styles, /\.public-profile-actions > \.secondary-button \{ color: #edf5ff; background: #263a52;/);
   assert.match(styles, /\.profile-theme-ocean \.public-profile-actions > \.secondary-button/);
   assert.match(styles, /\.public-profile-cover/);
