@@ -2,12 +2,16 @@ const crypto = require("node:crypto");
 const fs = require("node:fs/promises");
 const http = require("node:http");
 const net = require("node:net");
-const os = require("node:os");
 const path = require("node:path");
 const { pipeline } = require("node:stream/promises");
-const Database = require("better-sqlite3");
 const express = require("express");
 const webpush = require("web-push");
+
+try {
+  process.loadEnvFile(path.join(__dirname, ".env"));
+} catch (error) {
+  if (error.code !== "ENOENT") throw error;
+}
 
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || "0.0.0.0";
@@ -21,7 +25,6 @@ const ORPHAN_ATTACHMENT_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_BODY_BYTES = 64 * 1024;
 const PRIVACY_VERSION = "2026-10-31";
 const USERNAME_PATTERN = /^[a-zA-Z0-9_]{3,32}$/;
-const LEGACY_CHANNEL_IDS = new Set(["general", "introductions", "off-topic"]);
 const PUBLIC_FILES = new Map([
   ["/styles.css", ["styles.css", "text/css; charset=utf-8"]],
   ["/privacy.js", ["privacy.js", "text/javascript; charset=utf-8"]],
@@ -46,8 +49,15 @@ const loginAttemptsCleanup = setInterval(() => {
   }
 }, 60 * 1000);
 loginAttemptsCleanup.unref();
+function normalizeIpAddress(address) {
+  const value = String(address || "").trim().toLowerCase();
+  const mappedIpv4 = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(value);
+  if (mappedIpv4 && net.isIP(mappedIpv4[1]) === 4) return mappedIpv4[1];
+  return net.isIP(value) ? value : "";
+}
+
 const trustedProxyAddresses = new Set((process.env.POLUS_TRUSTED_PROXIES || "")
-  .split(",").map((address) => address.trim()).filter((address) => net.isIP(address)));
+  .split(",").map(normalizeIpAddress).filter(Boolean));
 const MAX_LOGIN_FAILURES = 10;
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const MAX_MESSAGES_PER_MINUTE = 20;
@@ -62,6 +72,7 @@ const MESSAGE_REACTIONS = new Set([
   "🤮", "😷", "💩", "🐱", "🐶", "🍕", "☕", "⚡", "🚀", "🎈", "🌟", "💡"
 ]);
 const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
+const MAX_ENCRYPTED_ATTACHMENT_OVERHEAD_BYTES = 16 * Math.ceil(MAX_ATTACHMENT_BYTES / (1024 * 1024));
 const MAX_THUMBNAIL_BYTES = 2 * 1024 * 1024;
 const MAX_ATTACHMENTS_PER_MESSAGE = 10;
 const DAILY_UPLOAD_LIMIT = process.env.POLUS_DAILY_UPLOAD_LIMIT
@@ -195,6 +206,7 @@ async function verifyPassword(password, savedHash) {
   return actualKey.length === expectedKey.length && crypto.timingSafeEqual(actualKey, expectedKey);
 }
 
+<<<<<<< Updated upstream
 function createEmptyStore() {
   return {
     version: 1,
@@ -884,6 +896,18 @@ function createSqliteStoreWriter(database, initialStore = createEmptyStore()) {
   };
   return saveStore;
 }
+=======
+const {
+  createEmptyStore,
+  createSavedConversation,
+  createSqliteStoreWriter,
+  getLanAddresses,
+  loadSqliteStore,
+  loadStore,
+  migrateLegacyChannelData,
+  normalizeStore
+} = require("./server/store");
+>>>>>>> Stashed changes
 
 function publicUser(user) {
   return {
@@ -894,13 +918,58 @@ function publicUser(user) {
     avatarUrl: user.avatarId
       ? `/api/avatars/${encodeURIComponent(user.id)}?v=${encodeURIComponent(user.avatarId)}`
       : null,
+    profileCoverUrl: user.profileCoverId
+      ? `/api/profile-covers/${encodeURIComponent(user.id)}?v=${encodeURIComponent(user.profileCoverId)}`
+      : null,
+    profileCoverMimeType: user.profileCoverId ? user.profileCoverMimeType || null : null,
+    profileDesign: normalizeProfileDesign(user.profileDesign),
     showOnlineStatus: user.showOnlineStatus !== false
   };
 }
 
+function normalizeProfileDesign(value) {
+  const design = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const theme = ["aurora", "ocean", "sunset"].includes(design.theme) ? design.theme : "aurora";
+  const gradientDefaults = theme === "ocean"
+    ? { start: "#dff7f8", end: "#b9dbe8" }
+    : theme === "sunset"
+      ? { start: "#fff0df", end: "#e9c2c9" }
+      : { start: "#101927", end: "#344f82" };
+  return {
+    theme,
+    accentColor: typeof design.accentColor === "string" && /^#[\da-f]{6}$/i.test(design.accentColor)
+      ? design.accentColor.toLowerCase()
+      : "#4d83d1",
+    font: ["system", "serif", "rounded"].includes(design.font) ? design.font : "system",
+    motionEnabled: design.motionEnabled !== false,
+    gradientStart: typeof design.gradientStart === "string" && /^#[\da-f]{6}$/i.test(design.gradientStart)
+      ? design.gradientStart.toLowerCase()
+      : gradientDefaults.start,
+    gradientEnd: typeof design.gradientEnd === "string" && /^#[\da-f]{6}$/i.test(design.gradientEnd)
+      ? design.gradientEnd.toLowerCase()
+      : gradientDefaults.end,
+    gradientDirection: ["diagonal", "horizontal", "vertical"].includes(design.gradientDirection)
+      ? design.gradientDirection
+      : "diagonal",
+    effects: ["none", "glow", "particles"].includes(design.effects) ? design.effects : "glow",
+    avatarFrame: ["gradient", "glow", "double", "none"].includes(design.avatarFrame)
+      ? design.avatarFrame
+      : "gradient",
+    animation: ["subtle", "float", "gradient", "none"].includes(design.animation)
+      ? design.animation
+      : "subtle",
+    backgroundImageEnabled: design.backgroundImageEnabled === true,
+    coverParallax: design.coverParallax === true
+  };
+}
+
 function getSession(request, store) {
+<<<<<<< Updated upstream
   const url = new URL(request.url, "http://localhost");
   const accountKey = request.headers["x-polus-account"] || url.searchParams.get("accountKey") || "";
+=======
+  const accountKey = request.headers["x-polus-account"] || "";
+>>>>>>> Stashed changes
   if (accountKey && !/^[a-f0-9]{32}$/.test(accountKey)) return null;
   const cookieName = accountKey ? `polus_session_${accountKey}` : "polus_session";
   const token = cookieValue(request, cookieName);
@@ -925,6 +994,28 @@ function cookieOptions(request) {
   return `Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}${secure ? "; Secure" : ""}`;
 }
 
+<<<<<<< Updated upstream
+=======
+function expiredSessionCookie(request, accountKey) {
+  const cookieName = accountKey ? `polus_session_${accountKey}` : "polus_session";
+  const secure = request.socket.encrypted || process.env.POLUS_COOKIE_SECURE === "true";
+  return `${cookieName}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secure ? "; Secure" : ""}`;
+}
+
+async function secureDataDirectory(directoryPath) {
+  await fs.mkdir(directoryPath, { recursive: true, mode: 0o700 });
+  if (process.platform !== "win32") await fs.chmod(directoryPath, 0o700);
+}
+
+async function secureDataFile(filePath) {
+  try {
+    if (process.platform !== "win32") await fs.chmod(filePath, 0o600);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+}
+
+>>>>>>> Stashed changes
 function makeSession(request, store, user, accountKey = "") {
   if (accountKey && !/^[a-f0-9]{32}$/.test(accountKey)) {
     throw new HttpError(400, "Invalid account key.");
@@ -936,19 +1027,28 @@ function makeSession(request, store, user, accountKey = "") {
     tokenHash: tokenHash(token),
     userId: user.id,
     ...(accountKey ? { accountKeyHash: tokenHash(accountKey) } : {}),
+<<<<<<< Updated upstream
+=======
+    createdAt: Date.now(),
+>>>>>>> Stashed changes
     expiresAt: Date.now() + SESSION_TTL_MS
   };
   store.sessions.push(session);
   return { session, cookie: `${cookieName}=${encodeURIComponent(token)}; ${cookieOptions(request)}` };
 }
 
-function getClientAddress(request) {
-  const remoteAddress = request.socket.remoteAddress || "unknown";
-  if (!trustedProxyAddresses.has(remoteAddress)) return remoteAddress;
+function getClientAddress(request, trustedProxies = trustedProxyAddresses) {
+  const remoteAddress = normalizeIpAddress(request.socket.remoteAddress) || "unknown";
+  if (!trustedProxies.has(remoteAddress)) return remoteAddress;
   const forwarded = request.headers["x-forwarded-for"];
   if (typeof forwarded !== "string") return remoteAddress;
-  const addresses = forwarded.split(",").map((address) => address.trim()).filter((address) => net.isIP(address));
-  return addresses.at(-1) || remoteAddress;
+  const addresses = forwarded.split(",").map(normalizeIpAddress);
+  if (!addresses.length || addresses.some((address) => !address)) return remoteAddress;
+  let clientAddress = remoteAddress;
+  for (let index = addresses.length - 1; index >= 0 && trustedProxies.has(clientAddress); index -= 1) {
+    clientAddress = addresses[index];
+  }
+  return clientAddress;
 }
 
 function decodePathComponent(value) {
@@ -1157,6 +1257,74 @@ function canReadMessage(store, message, userId) {
   }
 }
 
+function validEncryptedMessage(text, conversation, store, authorId) {
+  const prefix = "polus-e2ee:v2:";
+  if (typeof text !== "string" || text.length > 150000 || !text.startsWith(prefix)) return false;
+  let packet;
+  try {
+    packet = JSON.parse(text.slice(prefix.length));
+  } catch {
+    return false;
+  }
+  const isBase64 = (value) => typeof value === "string" && /^[A-Za-z0-9+/]+={0,2}$/.test(value);
+  const envelopes = packet?.envelopes;
+  const context = packet?.context;
+  const author = store.users.find((candidate) => candidate.id === context?.senderId);
+  if (packet?.version !== 2 || context?.conversationId !== conversation.id
+    || context.senderId !== authorId
+    || !Number.isSafeInteger(context?.counter) || context.counter <= 0
+    || !author?.encryptionPublicKey || packet.senderPublicKey !== author.encryptionPublicKey
+    || !author.signingPublicKey || packet.signingPublicKey !== author.signingPublicKey
+    || !isBase64(packet?.iv) || Buffer.from(packet.iv, "base64").length !== 12
+    || !isBase64(packet?.ciphertext) || !isBase64(packet?.signature)
+    || Buffer.from(packet.signature, "base64").length !== 64
+    || !envelopes || typeof envelopes !== "object"
+    || Array.isArray(envelopes)) return false;
+  const recipientIds = Object.keys(envelopes);
+  if (recipientIds.length !== conversation.memberIds.length
+    || conversation.memberIds.some((memberId) =>
+      !store.users.some((candidate) => candidate.id === memberId
+        && candidate.encryptionPublicKey && candidate.signingPublicKey)
+      || !isBase64(envelopes[memberId])
+      || Buffer.from(envelopes[memberId], "base64").length !== 384)
+    || recipientIds.some((memberId) => !conversation.memberIds.includes(memberId))) return false;
+  try {
+    const signingKey = crypto.createPublicKey({
+      key: Buffer.from(packet.signingPublicKey, "base64"),
+      format: "der",
+      type: "spki"
+    });
+    if (signingKey.asymmetricKeyType !== "ec"
+      || signingKey.asymmetricKeyDetails?.namedCurve !== "prime256v1") return false;
+    const signedData = JSON.stringify({
+      version: packet.version,
+      context: packet.context,
+      iv: packet.iv,
+      ciphertext: packet.ciphertext,
+      envelopes: packet.envelopes,
+      senderPublicKey: packet.senderPublicKey,
+      signingPublicKey: packet.signingPublicKey
+    });
+    return crypto.verify(
+      "sha256",
+      Buffer.from(signedData),
+      { key: signingKey, dsaEncoding: "ieee-p1363" },
+      Buffer.from(packet.signature, "base64")
+    );
+  } catch {
+    return false;
+  }
+}
+
+function getEncryptedMessageContext(text) {
+  try {
+    const packet = JSON.parse(text.slice("polus-e2ee:v2:".length));
+    return packet.context;
+  } catch {
+    return null;
+  }
+}
+
 function visibleMessage(message, store, viewerId = null) {
   const author = store.users.find((user) => user.id === message.authorId);
   const conversationId = message.conversationId || message.room;
@@ -1177,7 +1345,9 @@ function visibleMessage(message, store, viewerId = null) {
     conversationId,
     chatId: conversationId,
     authorId: message.authorId,
+    ...(message.encrypted ? { signatureAuthorId: message.signatureAuthorId || message.authorId } : {}),
     ...(message.mediaType ? { mediaType: message.mediaType } : {}),
+    ...(message.encrypted ? { encrypted: true } : {}),
     author: author ? publicUser(author) : message.author || { id: "legacy", username: "system", fullName: "Слово" },
     ...(channel?.postAs === "channel"
       ? { displayAuthor: { id: channel.id, fullName: channel.name, avatarUrl: channel.avatarUrl || null, isChannel: true } }
@@ -1190,8 +1360,16 @@ function visibleMessage(message, store, viewerId = null) {
     seenByRecipient,
     replyTo: replyToMessage ? {
       id: replyToMessage.id,
+      conversationId: replyToMessage.conversationId || replyToMessage.room,
+      authorId: replyToMessage.authorId,
+      ...(replyToMessage.encrypted
+        ? { signatureAuthorId: replyToMessage.signatureAuthorId || replyToMessage.authorId }
+        : {}),
       author: replyAuthor ? publicUser(replyAuthor) : null,
       text: replyToMessage.deleted ? "" : replyToMessage.text,
+      sentAt: replyToMessage.createdAt || replyToMessage.sentAt,
+      createdAt: replyToMessage.createdAt || replyToMessage.sentAt,
+      ...(replyToMessage.encrypted ? { encrypted: true } : {}),
       deleted: Boolean(replyToMessage.deleted),
       attachments: replyToMessage.deleted ? [] : (replyToMessage.attachmentIds || [])
         .map((id) => store.attachments.find((attachment) => attachment.id === id))
@@ -1430,7 +1608,9 @@ function createMessengerServer({
   pushSender = sendPushToUser,
   queryUnreadCount = null,
   queryLastMessage = null,
-  maintenanceEnabled = false
+  allowLegacyPlaintext = false,
+  maintenanceEnabled = false,
+  encryptionKey = process.env.POLUS_ENCRYPTION_KEY || ""
 } = {}) {
   const connectedUsers = new Map();
   const sessionStreams = new Map();
@@ -1536,7 +1716,7 @@ function createMessengerServer({
     response.setHeader("X-Frame-Options", "DENY");
     response.setHeader("Cross-Origin-Resource-Policy", "same-origin");
     response.setHeader("Permissions-Policy", "camera=(), microphone=(self), geolocation=()");
-    response.setHeader("Content-Security-Policy", "default-src 'self'; connect-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'");
+    response.setHeader("Content-Security-Policy", "default-src 'self'; connect-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'");
     if (request.socket.encrypted || process.env.POLUS_COOKIE_SECURE === "true") {
       response.setHeader("Strict-Transport-Security", "max-age=31536000");
     }
@@ -1595,11 +1775,19 @@ function createMessengerServer({
       }
 
       if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/profile" || url.pathname === "/contacts"
+<<<<<<< Updated upstream
+=======
+        || /^\/users\/[^/]+$/.test(url.pathname)
+>>>>>>> Stashed changes
         || /^\/channels\/[^/]+(?:\/settings)?$/.test(url.pathname)
         || /^\/groups\/[^/]+\/settings$/.test(url.pathname)
         || /^\/join\/[^/]+$/.test(url.pathname)
         || PUBLIC_FILES.has(url.pathname))) {
         const isAppPage = url.pathname === "/" || url.pathname === "/profile" || url.pathname === "/contacts"
+<<<<<<< Updated upstream
+=======
+          || /^\/users\/[^/]+$/.test(url.pathname)
+>>>>>>> Stashed changes
           || /^\/channels\/[^/]+(?:\/settings)?$/.test(url.pathname)
           || /^\/groups\/[^/]+\/settings$/.test(url.pathname)
           || /^\/join\/[^/]+$/.test(url.pathname);
@@ -1667,6 +1855,9 @@ function createMessengerServer({
         const password = typeof input.password === "string" ? input.password : "";
 
         if (url.pathname === "/api/auth/register") {
+          if (Buffer.byteLength(encryptionKey, "utf8") < 32) {
+            throw new HttpError(503, "The server encryption key is not configured. Set POLUS_ENCRYPTION_KEY in .env.");
+          }
           const now = Date.now();
           const registrationCutoff = now - 60 * 60 * 1000;
           const recentRegistrations = (registrationAttempts.get(ip) || [])
@@ -1763,17 +1954,212 @@ function createMessengerServer({
         currentStore.sessions = currentStore.sessions.filter((item) => item.id !== auth.session.id);
         await persist();
         closeSessionStreams(sessionStreams, auth.session.id);
+<<<<<<< Updated upstream
         const accountKey = request.headers["x-polus-account"] || new URL(request.url, "http://localhost").searchParams.get("accountKey") || "";
         const cookieName = accountKey ? `polus_session_${accountKey}` : "polus_session";
         const secureCookie = request.socket.encrypted || process.env.POLUS_COOKIE_SECURE === "true" ? "; Secure" : "";
         sendJson(response, 200, { ok: true }, {
           "Set-Cookie": `${cookieName}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secureCookie}`
         });
+=======
+        const accountKey = request.headers["x-polus-account"] || "";
+        sendJson(response, 200, { ok: true }, { "Set-Cookie": expiredSessionCookie(request, accountKey) });
+>>>>>>> Stashed changes
         return;
       }
 
       const auth = requireAuth(request, currentStore);
       const user = auth.user;
+
+      if (request.method === "GET" && url.pathname === "/api/account/encryption-config") {
+        if (Buffer.byteLength(encryptionKey, "utf8") < 32) {
+          throw new HttpError(503, "The server encryption key is not configured. Set POLUS_ENCRYPTION_KEY in .env.");
+        }
+        sendJson(response, 200, { wrappingKey: encryptionKey });
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/account/encryption-key") {
+        sendJson(response, 200, {
+          userId: user.id,
+          publicKey: user.encryptionPublicKey || null,
+          sealedPrivateKey: user.sealedEncryptionPrivateKey || null,
+          signingPublicKey: user.signingPublicKey || null,
+          sealedSigningPrivateKey: user.sealedSigningPrivateKey || null
+        });
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/account/sessions") {
+        const sessions = currentStore.sessions
+          .filter((session) => session.userId === user.id && session.expiresAt > Date.now())
+          .map((session) => ({
+            id: session.id,
+            createdAt: new Date(session.createdAt || session.expiresAt - SESSION_TTL_MS).toISOString(),
+            expiresAt: new Date(session.expiresAt).toISOString(),
+            isCurrent: session.id === auth.session.id
+          }))
+          .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+        sendJson(response, 200, { sessions });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/account/sessions/revoke-all") {
+        const input = await readJsonBody(request);
+        const currentPassword = typeof input.currentPassword === "string" ? input.currentPassword : "";
+        if (!await verifyPassword(currentPassword, user.passwordHash)) {
+          throw new HttpError(401, "Current password is incorrect.");
+        }
+        const accountKey = request.headers["x-polus-account"] || "";
+        const revokedSessionIds = currentStore.sessions
+          .filter((session) => session.userId === user.id)
+          .map((session) => session.id);
+        currentStore.sessions = currentStore.sessions.filter((session) => session.userId !== user.id);
+        await persist();
+        for (const sessionId of revokedSessionIds) closeSessionStreams(sessionStreams, sessionId);
+        sendJson(response, 200, { ok: true, revokedCount: revokedSessionIds.length }, {
+          "Set-Cookie": expiredSessionCookie(request, accountKey)
+        });
+        return;
+      }
+
+      if (request.method === "PUT" && url.pathname === "/api/account/encryption-key") {
+        const input = await readJsonBody(request);
+        const publicKey = input.publicKey;
+        const sealed = input.sealedPrivateKey;
+        const signingPublicKey = input.signingPublicKey;
+        const sealedSigning = input.sealedSigningPrivateKey;
+        const base64Pattern = /^[A-Za-z0-9+/]+={0,2}$/;
+        const validSealedKey = (key, maxCiphertextLength) => {
+          if (!key || typeof key !== "object"
+            || typeof key.salt !== "string" || !base64Pattern.test(key.salt)
+            || typeof key.iv !== "string" || !base64Pattern.test(key.iv)
+            || typeof key.ciphertext !== "string" || key.ciphertext.length > maxCiphertextLength
+            || !base64Pattern.test(key.ciphertext)) return false;
+          if (key.keyVersion === undefined || key.keyVersion === 2) return key.iterations === 310000;
+          if (key.keyVersion === 3) return key.iterations === 600000;
+          return false;
+        };
+        const sealingStrength = (key) => key?.keyVersion === 3 && key.iterations === 600000
+          ? 3
+          : key?.keyVersion === 2 && key.iterations === 310000
+            ? 2
+            : key && key.keyVersion === undefined && key.iterations === 310000
+              ? 1
+              : 0;
+        let publicKeysValid = true;
+        if (signingPublicKey !== undefined) {
+          try {
+            const encryptionKey = crypto.createPublicKey({
+              key: Buffer.from(publicKey, "base64"),
+              format: "der",
+              type: "spki"
+            });
+            const signingKey = crypto.createPublicKey({
+              key: Buffer.from(signingPublicKey, "base64"),
+              format: "der",
+              type: "spki"
+            });
+            publicKeysValid = encryptionKey.asymmetricKeyType === "rsa"
+              && encryptionKey.asymmetricKeyDetails?.modulusLength === 3072
+              && signingKey.asymmetricKeyType === "ec"
+              && signingKey.asymmetricKeyDetails?.namedCurve === "prime256v1";
+          } catch {
+            publicKeysValid = false;
+          }
+        }
+        if (typeof publicKey !== "string" || publicKey.length > 2000
+          || !base64Pattern.test(publicKey)
+          || !validSealedKey(sealed, 4000)
+          || ((signingPublicKey === undefined) !== (sealedSigning === undefined))
+          || (signingPublicKey !== undefined && (typeof signingPublicKey !== "string"
+            || signingPublicKey.length > 500 || !base64Pattern.test(signingPublicKey)
+            || Buffer.from(signingPublicKey, "base64").length > 300
+            || !validSealedKey(sealedSigning, 1000)))
+          || !publicKeysValid) {
+          throw new HttpError(400, "Invalid encryption key data.");
+        }
+        if (user.encryptionPublicKey || user.sealedEncryptionPrivateKey) {
+          if (user.encryptionPublicKey !== publicKey) {
+            throw new HttpError(409, "An encryption identity is already registered for this account.");
+          }
+          const sameEncryptionSeal = JSON.stringify(user.sealedEncryptionPrivateKey) === JSON.stringify(sealed);
+          const sameSigningIdentity = user.signingPublicKey === signingPublicKey
+            && JSON.stringify(user.sealedSigningPrivateKey) === JSON.stringify(sealedSigning);
+          if (sameEncryptionSeal && sameSigningIdentity) {
+            sendJson(response, 200, { ok: true });
+            return;
+          }
+          if (sameEncryptionSeal && !user.signingPublicKey && signingPublicKey) {
+            user.signingPublicKey = signingPublicKey;
+            user.sealedSigningPrivateKey = sealedSigning;
+            await persist();
+            sendJson(response, 200, { ok: true });
+            return;
+          }
+          const sameSigningPublicKey = user.signingPublicKey === signingPublicKey;
+          const encryptionUpgrade = sealingStrength(sealed) > sealingStrength(user.sealedEncryptionPrivateKey);
+          const signingUpgrade = Boolean(user.sealedSigningPrivateKey && sealedSigning
+            && sealingStrength(sealedSigning) > sealingStrength(user.sealedSigningPrivateKey));
+          const noKeyDowngrade = sealingStrength(sealed) >= sealingStrength(user.sealedEncryptionPrivateKey)
+            && (!user.sealedSigningPrivateKey
+              || sealingStrength(sealedSigning) >= sealingStrength(user.sealedSigningPrivateKey));
+          if (sameSigningPublicKey && noKeyDowngrade && (encryptionUpgrade || signingUpgrade)) {
+            user.sealedEncryptionPrivateKey = sealed;
+            if (user.sealedSigningPrivateKey) user.sealedSigningPrivateKey = sealedSigning;
+            await persist();
+            sendJson(response, 200, { ok: true });
+            return;
+          }
+          throw new HttpError(409, "An encryption identity is already registered for this account.");
+        }
+        user.encryptionPublicKey = publicKey;
+        user.sealedEncryptionPrivateKey = sealed;
+        if (signingPublicKey) {
+          user.signingPublicKey = signingPublicKey;
+          user.sealedSigningPrivateKey = sealedSigning;
+        }
+        await persist();
+        sendJson(response, 201, { ok: true });
+        return;
+      }
+
+      const userEncryptionKeyRoute = /^\/api\/users\/([^/]+)\/encryption-key$/.exec(url.pathname);
+      if (request.method === "GET" && userEncryptionKeyRoute) {
+        const username = decodePathComponent(userEncryptionKeyRoute[1]).replace(/^@/, "").toLowerCase();
+        const recipient = currentStore.users.find((candidate) => candidate.username === username);
+        if (!recipient || recipient.id === user.id
+          || (user.blockedUserIds || []).includes(recipient.id)
+          || (recipient.blockedUserIds || []).includes(user.id)) {
+          throw new HttpError(404, "User not found.");
+        }
+        sendJson(response, 200, {
+          userId: recipient.id,
+          publicKey: recipient.encryptionPublicKey || null,
+          signingPublicKey: recipient.signingPublicKey || null
+        });
+        return;
+      }
+
+      const conversationEncryptionKeysRoute = /^\/api\/chats\/([^/]+)\/encryption-keys$/.exec(url.pathname);
+      if (request.method === "GET" && conversationEncryptionKeysRoute) {
+        const conversationId = decodePathComponent(conversationEncryptionKeysRoute[1]);
+        const { conversation } = findReadableConversation(currentStore, conversationId, user.id);
+        if (!conversation.memberIds.includes(user.id)) {
+          throw new HttpError(403, "Join this chat to access encryption keys.");
+        }
+        sendJson(response, 200, {
+          keys: conversation.memberIds.map((memberId) => {
+            const member = currentStore.users.find((candidate) => candidate.id === memberId);
+            return {
+              id: memberId,
+              publicKey: member?.encryptionPublicKey || null,
+              signingPublicKey: member?.signingPublicKey || null
+            };
+          })
+        });
+        return;
+      }
 
       if (request.method === "POST" && url.pathname === "/api/presence/chat") {
         const input = await readJsonBody(request);
@@ -1802,8 +2188,14 @@ function createMessengerServer({
         const chatId = decodePathComponent(uploadRoute[1]);
         const { type, conversation } = findConversation(currentStore, chatId, user.id);
         if (type === "channel") requireChannelPermission(conversation, user.id, "publish", "publish");
+<<<<<<< Updated upstream
+=======
+        const encryptedUpload = request.headers["x-polus-encrypted"] === "true";
+        const uploadLimit = MAX_ATTACHMENT_BYTES
+          + (encryptedUpload ? MAX_ENCRYPTED_ATTACHMENT_OVERHEAD_BYTES : 0);
+>>>>>>> Stashed changes
         const declaredSize = Number(request.headers["content-length"] || 0);
-        if (declaredSize > MAX_ATTACHMENT_BYTES) throw new HttpError(413, "Files cannot exceed 100 MB.");
+        if (declaredSize > uploadLimit) throw new HttpError(413, "Files cannot exceed 100 MB.");
         const name = safeFileName(decodePathComponent(String(request.headers["x-file-name"] || "file")));
         const attachmentId = randomId();
         const uploadsRoot = path.resolve(dataDirectory, "uploads");
@@ -1821,8 +2213,9 @@ function createMessengerServer({
         if (bytesUploadedToday >= DAILY_UPLOAD_LIMIT) {
           throw new HttpError(429, "Daily upload limit reached.");
         }
-        await fs.mkdir(chatDirectory, { recursive: true });
-        const file = await fs.open(filePath, "wx");
+        await fs.mkdir(chatDirectory, { recursive: true, mode: 0o700 });
+        if (process.platform !== "win32") await fs.chmod(chatDirectory, 0o700);
+        const file = await fs.open(filePath, "wx", 0o600);
         let size = 0;
         let tooLarge = false;
         const signature = [];
@@ -1830,7 +2223,7 @@ function createMessengerServer({
           for await (const chunkValue of request) {
             const chunk = Buffer.from(chunkValue);
             size += chunk.length;
-            if (size > MAX_ATTACHMENT_BYTES) {
+            if (size > uploadLimit) {
               tooLarge = true;
               continue;
             }
@@ -1915,7 +2308,7 @@ function createMessengerServer({
         const bytesUploadedToday = currentStore.uploadUsage
           .filter((usage) => usage.userId === user.id && Date.parse(usage.createdAt) >= utcStart.getTime())
           .reduce((total, usage) => total + usage.size, 0);
-        const file = await fs.open(filePath, "wx");
+        const file = await fs.open(filePath, "wx", 0o600);
         let size = 0;
         let tooLarge = false;
         const signature = [];
@@ -2061,6 +2454,7 @@ function createMessengerServer({
         if (!target?.avatarId || !target.avatarMimeType?.startsWith("image/")) {
           throw new HttpError(404, "Avatar not found.");
         }
+
         const filePath = path.resolve(dataDirectory, "uploads", "profiles", target.id, target.avatarId);
         const profilesRoot = path.resolve(dataDirectory, "uploads", "profiles");
         if (!filePath.startsWith(`${profilesRoot}${path.sep}`)) throw new Error("Unsafe avatar path.");
@@ -2083,6 +2477,142 @@ function createMessengerServer({
         avatarStream.on("close", () => { void fileHandle.close().catch((error) => console.error("Avatar close failed:", error)); });
         response.on("close", () => avatarStream.destroy());
         avatarStream.pipe(response);
+        return;
+      }
+
+      const profileCoverRoute = /^\/api\/profile-covers\/([^/]+)$/.exec(url.pathname);
+      if (request.method === "GET" && profileCoverRoute) {
+        const target = currentStore.users.find((candidate) => candidate.id === decodePathComponent(profileCoverRoute[1]));
+        if (!target?.profileCoverId
+          || !(target.profileCoverMimeType?.startsWith("image/")
+            || ["video/mp4", "video/webm"].includes(target.profileCoverMimeType))) {
+          throw new HttpError(404, "Profile cover not found.");
+        }
+        const profilesRoot = path.resolve(dataDirectory, "uploads", "profiles");
+        const userDirectory = path.resolve(profilesRoot, target.id);
+        const filePath = path.resolve(userDirectory, target.profileCoverId);
+        if (!userDirectory.startsWith(`${profilesRoot}${path.sep}`)
+          || !filePath.startsWith(`${userDirectory}${path.sep}`)) throw new Error("Unsafe profile cover path.");
+        let fileHandle;
+        try {
+          fileHandle = await fs.open(filePath, "r");
+        } catch (error) {
+          if (error.code === "ENOENT") throw new HttpError(404, "Profile cover not found.");
+          throw error;
+        }
+        const stat = await fileHandle.stat();
+        response.writeHead(200, {
+          "Content-Type": target.profileCoverMimeType,
+          "Content-Length": stat.size,
+          "Content-Disposition": "inline",
+          "Cache-Control": "private, max-age=86400",
+          "X-Content-Type-Options": "nosniff"
+        });
+        const coverStream = fileHandle.createReadStream();
+        coverStream.on("close", () => { void fileHandle.close().catch((error) => console.error("Profile cover close failed:", error)); });
+        response.on("close", () => coverStream.destroy());
+        coverStream.pipe(response);
+        return;
+      }
+
+      if (request.method === "PATCH" && url.pathname === "/api/account/profile-design") {
+        const input = await readJsonBody(request);
+        if (!input || typeof input !== "object" || Array.isArray(input)
+          || !["aurora", "ocean", "sunset"].includes(input.theme)
+          || typeof input.accentColor !== "string" || !/^#[\da-f]{6}$/i.test(input.accentColor)
+          || !["system", "serif", "rounded"].includes(input.font)
+          || typeof input.motionEnabled !== "boolean"
+          || input.gradientStart !== undefined
+            && (typeof input.gradientStart !== "string" || !/^#[\da-f]{6}$/i.test(input.gradientStart))
+          || input.gradientEnd !== undefined
+            && (typeof input.gradientEnd !== "string" || !/^#[\da-f]{6}$/i.test(input.gradientEnd))
+          || input.gradientDirection !== undefined
+            && !["diagonal", "horizontal", "vertical"].includes(input.gradientDirection)
+          || input.effects !== undefined && !["none", "glow", "particles"].includes(input.effects)
+          || input.avatarFrame !== undefined && !["gradient", "glow", "double", "none"].includes(input.avatarFrame)
+          || input.animation !== undefined && !["subtle", "float", "gradient", "none"].includes(input.animation)
+          || input.backgroundImageEnabled !== undefined && typeof input.backgroundImageEnabled !== "boolean"
+          || input.coverParallax !== undefined && typeof input.coverParallax !== "boolean") {
+          throw new HttpError(400, "Invalid profile design.");
+        }
+        user.profileDesign = normalizeProfileDesign(input);
+        await persist();
+        sendJson(response, 200, { user: publicUser(user) });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/account/profile-cover") {
+        const declaredSize = Number(request.headers["content-length"] || 0);
+        const maxCoverBytes = 8 * 1024 * 1024;
+        if (declaredSize > maxCoverBytes) throw new HttpError(413, "Profile covers cannot exceed 8 MB.");
+        const coverId = `cover-${randomId()}`;
+        const profilesRoot = path.resolve(dataDirectory, "uploads", "profiles");
+        const userDirectory = path.resolve(profilesRoot, user.id);
+        const filePath = path.resolve(userDirectory, coverId);
+        if (!userDirectory.startsWith(`${profilesRoot}${path.sep}`)
+          || !filePath.startsWith(`${userDirectory}${path.sep}`)) throw new Error("Unsafe profile cover path.");
+        await fs.mkdir(userDirectory, { recursive: true, mode: 0o700 });
+        if (process.platform !== "win32") await fs.chmod(userDirectory, 0o700);
+        const file = await fs.open(filePath, "wx", 0o600);
+        const previousCover = {
+          id: user.profileCoverId,
+          mimeType: user.profileCoverMimeType,
+          size: user.profileCoverSize
+        };
+        let size = 0;
+        let tooLarge = false;
+        const signature = [];
+        try {
+          for await (const chunkValue of request) {
+            const chunk = Buffer.from(chunkValue);
+            size += chunk.length;
+            if (size > maxCoverBytes) {
+              tooLarge = true;
+              continue;
+            }
+            if (tooLarge) continue;
+            const signatureLength = signature.reduce((total, part) => total + part.length, 0);
+            if (signatureLength < 32) signature.push(chunk.subarray(0, 32 - signatureLength));
+            await file.writeFile(chunk);
+          }
+          if (tooLarge) throw new HttpError(413, "Profile covers cannot exceed 8 MB.");
+          const mimeType = sniffMimeType(Buffer.concat(signature).subarray(0, 32));
+          if (!(mimeType.startsWith("image/") || ["video/mp4", "video/webm"].includes(mimeType))) {
+            throw new HttpError(400, "Profile cover must be a supported image or MP4/WebM video.");
+          }
+          if (declaredSize && size !== declaredSize) throw new HttpError(400, "Upload size did not match Content-Length.");
+          user.profileCoverId = coverId;
+          user.profileCoverMimeType = mimeType;
+          user.profileCoverSize = size;
+          await persist();
+        } catch (error) {
+          user.profileCoverId = previousCover.id;
+          user.profileCoverMimeType = previousCover.mimeType;
+          user.profileCoverSize = previousCover.size;
+          await file.close();
+          await fs.rm(filePath, { force: true });
+          throw error;
+        }
+        await file.close();
+        if (previousCover.id) await fs.rm(path.resolve(userDirectory, previousCover.id), { force: true });
+        sendJson(response, 201, { user: publicUser(user) });
+        return;
+      }
+
+      if (request.method === "DELETE" && url.pathname === "/api/account/profile-cover") {
+        const oldCoverId = user.profileCoverId;
+        delete user.profileCoverId;
+        delete user.profileCoverMimeType;
+        delete user.profileCoverSize;
+        if (user.profileDesign) user.profileDesign.backgroundImageEnabled = false;
+        await persist();
+        if (oldCoverId) {
+          const profilesRoot = path.resolve(dataDirectory, "uploads", "profiles");
+          const userDirectory = path.resolve(profilesRoot, user.id);
+          const filePath = path.resolve(userDirectory, oldCoverId);
+          if (filePath.startsWith(`${userDirectory}${path.sep}`)) await fs.rm(filePath, { force: true });
+        }
+        sendJson(response, 200, { user: publicUser(user) });
         return;
       }
 
@@ -2194,8 +2724,9 @@ function createMessengerServer({
         const filePath = path.resolve(userDirectory, avatarId);
         if (!userDirectory.startsWith(`${profilesRoot}${path.sep}`)
           || !filePath.startsWith(`${userDirectory}${path.sep}`)) throw new Error("Unsafe avatar path.");
-        await fs.mkdir(userDirectory, { recursive: true });
-        const file = await fs.open(filePath, "wx");
+        await fs.mkdir(userDirectory, { recursive: true, mode: 0o700 });
+        if (process.platform !== "win32") await fs.chmod(userDirectory, 0o700);
+        const file = await fs.open(filePath, "wx", 0o600);
         let size = 0;
         let tooLarge = false;
         const signature = [];
@@ -2766,13 +3297,15 @@ function createMessengerServer({
         const input = await readJsonBody(request);
         const fullName = cleanText(input.fullName, 256);
         const about = cleanText(input.about, 1000);
+        const encryptionKeyUpdate = input.encryptionKeyUpdate;
         if (Array.from(fullName).length < 1 || Array.from(fullName).length > 50) {
           throw new HttpError(400, "Display name must be 1–50 characters.");
         }
         if (Array.from(about).length > 200) {
           throw new HttpError(400, "About must be at most 200 characters.");
         }
-        const revokedSessionIds = [];
+        let updatedPasswordHash;
+        let revokedSessionIds = [];
         if (input.newPassword) {
           if (typeof input.newPassword !== "string"
             || Array.from(input.newPassword).length < 8 || Array.from(input.newPassword).length > 128) {
@@ -2782,13 +3315,52 @@ function createMessengerServer({
           if (!await verifyPassword(currentPassword, user.passwordHash)) {
             throw new HttpError(401, "Current password is incorrect.");
           }
-          user.passwordHash = await passwordHash(input.newPassword);
-          revokedSessionIds.push(...currentStore.sessions
-            .filter((session) => session.userId === user.id && session.id !== auth.session.id)
-            .map((session) => session.id));
-          currentStore.sessions = currentStore.sessions.filter((session) =>
-            session.userId !== user.id || session.id === auth.session.id
-          );
+          if (user.sealedEncryptionPrivateKey
+            && user.sealedEncryptionPrivateKey.keyVersion === undefined
+            && encryptionKeyUpdate === undefined) {
+            throw new HttpError(409, "Migrate the legacy encryption key before changing the password.");
+          }
+          if (encryptionKeyUpdate !== undefined) {
+            const base64Pattern = /^[A-Za-z0-9+/]+={0,2}$/;
+            const validRewrappedKey = (key, maxCiphertextLength) => key && typeof key === "object"
+              && key.keyVersion === 3
+              && typeof key.salt === "string" && base64Pattern.test(key.salt)
+              && typeof key.iv === "string" && base64Pattern.test(key.iv)
+              && typeof key.ciphertext === "string" && key.ciphertext.length <= maxCiphertextLength
+              && base64Pattern.test(key.ciphertext)
+              && key.iterations === 600000;
+            if (!encryptionKeyUpdate || typeof encryptionKeyUpdate !== "object"
+              || Array.isArray(encryptionKeyUpdate)
+              || !user.encryptionPublicKey || !user.sealedEncryptionPrivateKey
+              || user.sealedEncryptionPrivateKey.keyVersion !== undefined
+              || !validRewrappedKey(encryptionKeyUpdate.sealedPrivateKey, 4000)) {
+              throw new HttpError(409, "The encryption key cannot be migrated in its current state.");
+            }
+            const needsSigningMigration = Boolean(user.signingPublicKey
+              && user.sealedSigningPrivateKey?.keyVersion === undefined);
+            if ((needsSigningMigration && !validRewrappedKey(encryptionKeyUpdate.sealedSigningPrivateKey, 1000))
+              || (encryptionKeyUpdate.sealedSigningPrivateKey !== undefined
+                && (!user.signingPublicKey || user.sealedSigningPrivateKey?.keyVersion !== undefined
+                  || !validRewrappedKey(encryptionKeyUpdate.sealedSigningPrivateKey, 1000)))) {
+              throw new HttpError(400, "Invalid rewrapped signing key.");
+            }
+          }
+          updatedPasswordHash = await passwordHash(input.newPassword);
+        } else if (encryptionKeyUpdate !== undefined) {
+          throw new HttpError(400, "Key migration requires a password change.");
+        }
+        if (updatedPasswordHash) {
+          user.passwordHash = updatedPasswordHash;
+          if (encryptionKeyUpdate) {
+            user.sealedEncryptionPrivateKey = encryptionKeyUpdate.sealedPrivateKey;
+            if (encryptionKeyUpdate.sealedSigningPrivateKey) {
+              user.sealedSigningPrivateKey = encryptionKeyUpdate.sealedSigningPrivateKey;
+            }
+          }
+          revokedSessionIds = currentStore.sessions
+            .filter((session) => session.userId === user.id)
+            .map((session) => session.id);
+          currentStore.sessions = currentStore.sessions.filter((session) => session.userId !== user.id);
         }
         user.fullName = fullName;
         user.about = about;
@@ -2805,8 +3377,11 @@ function createMessengerServer({
             ...publicUser(user),
             createdAt: user.createdAt,
             hideNotificationContent: user.hideNotificationContent === true
-          }
-        });
+          },
+          ...(updatedPasswordHash ? { sessionsRevoked: true } : {})
+        }, updatedPasswordHash
+          ? { "Set-Cookie": expiredSessionCookie(request, request.headers["x-polus-account"] || "") }
+          : {});
         return;
       }
 
@@ -3057,7 +3632,16 @@ function createMessengerServer({
         const input = await readJsonBody(request);
         const conversationId = cleanText(input.conversationId, 100);
         const recipientUsername = cleanText(input.recipientUsername, 32).replace(/^@/, "").toLowerCase();
-        const text = cleanMessageText(input.text);
+        const encrypted = input.encrypted === true;
+        if (input.encrypted !== undefined && typeof input.encrypted !== "boolean") {
+          throw new HttpError(400, "Invalid message encryption mode.");
+        }
+        const text = encrypted
+          ? (typeof input.text === "string" ? input.text : "")
+          : cleanMessageText(input.text);
+        if (!encrypted && !allowLegacyPlaintext) {
+          throw new HttpError(400, "End-to-end encryption is required for new messages.");
+        }
         const mediaType = input.mediaType === undefined || input.mediaType === null
           ? null
           : input.mediaType;
@@ -3067,8 +3651,12 @@ function createMessengerServer({
         if (mediaType !== null && mediaType !== "voice") {
           throw new HttpError(400, "Invalid message media type.");
         }
-        if ((!text && attachmentIds.length === 0) || Array.from(text).length > 4000) {
+        if ((!text && attachmentIds.length === 0)
+          || (encrypted ? text.length > 150000 : Array.from(text).length > 4000)) {
           throw new HttpError(400, "Message must contain 1–4000 characters.");
+        }
+        if (encrypted && !text.startsWith("polus-e2ee:v2:")) {
+          throw new HttpError(400, "Invalid encrypted message.");
         }
         if (attachmentIds.length > MAX_ATTACHMENTS_PER_MESSAGE) {
           throw new HttpError(400, "A message can contain at most 10 files.");
@@ -3139,6 +3727,18 @@ function createMessengerServer({
             || (otherUser?.blockedUserIds || []).includes(user.id);
           if (blockedByEither) throw new HttpError(403, "This user cannot receive your messages.");
         }
+        let cryptoContext = null;
+        if (encrypted) {
+          if (!validEncryptedMessage(text, conversation, currentStore, user.id)) {
+            throw new HttpError(409, "Set up end-to-end encryption for every chat participant before sending.");
+          }
+          cryptoContext = getEncryptedMessageContext(text);
+          if (currentStore.messages.some((item) =>
+            item.authorId === user.id && (item.conversationId || item.room) === chatId
+            && item.cryptoCounter === cryptoContext.counter)) {
+            throw new HttpError(409, "This message counter was already used. Retry sending.");
+          }
+        }
         const attachments = attachmentIds.map((id) =>
           currentStore.attachments.find((item) => item.id === id)
         );
@@ -3147,7 +3747,7 @@ function createMessengerServer({
           throw new HttpError(400, "One or more attachments are invalid.");
         }
         if (mediaType === "voice" && (attachments.length !== 1
-          || !attachments[0].mimeType.startsWith("audio/"))) {
+          || (!encrypted && !attachments[0].mimeType.startsWith("audio/")))) {
           throw new HttpError(400, "A voice message must contain one audio file.");
         }
         if (pendingDirect) currentStore.conversations.push(pendingDirect);
@@ -3158,6 +3758,8 @@ function createMessengerServer({
           conversationId: chatId,
           authorId: user.id,
           text,
+          ...(encrypted ? { encrypted: true } : {}),
+          ...(encrypted ? { cryptoCounter: cryptoContext.counter } : {}),
           ...(mediaType ? { mediaType } : {}),
           createdAt,
           sentAt: createdAt,
@@ -3166,7 +3768,7 @@ function createMessengerServer({
           ...(replyToId ? { replyToId } : {})
         };
         for (const attachment of attachments) attachment.messageId = message.id;
-        currentStore.links.push(...extractLinks(text).map((link) => ({
+        currentStore.links.push(...(encrypted ? [] : extractLinks(text)).map((link) => ({
           id: randomId(),
           chatId,
           messageId: message.id,
@@ -3194,7 +3796,7 @@ function createMessengerServer({
             && !isUserViewingChat(recipientId, conversation.id)) {
             const recipient = currentStore.users.find((candidate) => candidate.id === recipientId);
             pushSender(currentStore, recipientId, safeMessage, persist, {
-              hideContent: recipient?.hideNotificationContent === true
+              hideContent: recipient?.hideNotificationContent === true || message.encrypted === true
             }).catch((error) =>
               console.error("Push notification failed:", error)
             );
@@ -3217,6 +3819,7 @@ function createMessengerServer({
 
       const saveMessageRoute = /^\/api\/messages\/([^/]+)\/save$/.exec(url.pathname);
       if (request.method === "POST" && saveMessageRoute) {
+        const input = await readJsonBody(request, { allowEmpty: true });
         const sourceMessage = currentStore.messages.find((item) => item.id === Number(decodePathComponent(saveMessageRoute[1])));
         if (!sourceMessage || sourceMessage.deleted) throw new HttpError(404, "Message not found.");
         const sourceChatId = sourceMessage.conversationId || sourceMessage.room;
@@ -3234,6 +3837,23 @@ function createMessengerServer({
         const savedChat = currentStore.conversations.find((item) => item.id === `saved_${user.id}`);
         if (!savedChat || savedChat.type !== "saved" || savedChat.ownerId !== user.id) {
           throw new HttpError(404, "Chat not found.");
+        }
+        const encrypted = input.encrypted === true;
+        const text = encrypted && typeof input.text === "string" ? input.text : sourceMessage.text || "";
+        let cryptoContext = null;
+        if (sourceMessage.encrypted && !encrypted) {
+          throw new HttpError(400, "Encrypted messages must be re-encrypted before saving.");
+        }
+        if (encrypted) {
+          if (!validEncryptedMessage(text, savedChat, currentStore, user.id)) {
+            throw new HttpError(409, "Unable to verify the encrypted message for Saved Messages.");
+          }
+          cryptoContext = getEncryptedMessageContext(text);
+          if (currentStore.messages.some((item) =>
+            item.authorId === user.id && (item.conversationId || item.room) === savedChat.id
+            && item.cryptoCounter === cryptoContext.counter)) {
+            throw new HttpError(409, "This message counter was already used. Retry saving.");
+          }
         }
         const sourceAttachments = (sourceMessage.attachmentIds || []).map((attachmentId) =>
           currentStore.attachments.find((attachment) => attachment.id === attachmentId
@@ -3269,8 +3889,9 @@ function createMessengerServer({
           id: savedMessageId,
           conversationId: savedChat.id,
           authorId: user.id,
-          text: sourceMessage.text || "",
-          ...(sourceMessage.mediaType ? { mediaType: sourceMessage.mediaType } : {}),
+          text,
+          ...(encrypted ? { encrypted: true, cryptoCounter: cryptoContext.counter } : {}),
+          ...(!encrypted && sourceMessage.mediaType ? { mediaType: sourceMessage.mediaType } : {}),
           createdAt,
           sentAt: createdAt,
           deleted: false,
@@ -3313,6 +3934,13 @@ function createMessengerServer({
           throw new HttpError(404, "Message not found.");
         }
         const input = await readJsonBody(request);
+        const encrypted = input.encrypted === true;
+        if (input.encrypted !== undefined && typeof input.encrypted !== "boolean") {
+          throw new HttpError(400, "Invalid message encryption mode.");
+        }
+        if (!encrypted && !allowLegacyPlaintext) {
+          throw new HttpError(400, "End-to-end encryption is required for forwarded messages.");
+        }
         const conversationId = cleanText(input.conversationId, 100);
         const recipientUsername = cleanText(input.recipientUsername, 32).replace(/^@/, "").toLowerCase();
         if (Boolean(conversationId) === Boolean(recipientUsername)) {
@@ -3370,6 +3998,20 @@ function createMessengerServer({
             throw new HttpError(403, "This user cannot receive your messages.");
           }
         }
+        const forwardedText = encrypted
+          ? (typeof input.text === "string" ? input.text : "")
+          : sourceMessage.text || "";
+        const cryptoContext = encrypted ? getEncryptedMessageContext(forwardedText) : null;
+        if (!forwardedText || (encrypted
+          ? !validEncryptedMessage(forwardedText, targetChat, currentStore, user.id)
+          : Array.from(forwardedText).length > 4000)) {
+          throw new HttpError(409, "Set up end-to-end encryption for every chat participant before forwarding.");
+        }
+        if (encrypted && currentStore.messages.some((item) =>
+          item.authorId === user.id && (item.conversationId || item.room) === targetChatId
+          && item.cryptoCounter === cryptoContext.counter)) {
+          throw new HttpError(409, "This message counter was already used. Retry forwarding.");
+        }
         messageAttempts.set(user.id, [...recentAttempts, Date.now()]);
         const createdAt = new Date().toISOString();
         const forwardedMessageId = currentStore.nextMessageId++;
@@ -3399,8 +4041,10 @@ function createMessengerServer({
           id: forwardedMessageId,
           conversationId: targetChatId,
           authorId: user.id,
-          text: sourceMessage.text || "",
-          ...(sourceMessage.mediaType ? { mediaType: sourceMessage.mediaType } : {}),
+          text: forwardedText,
+          ...(encrypted ? { encrypted: true } : {}),
+          ...(encrypted ? { cryptoCounter: cryptoContext.counter } : {}),
+          ...(!encrypted && sourceMessage.mediaType ? { mediaType: sourceMessage.mediaType } : {}),
           createdAt,
           sentAt: createdAt,
           deleted: false,
@@ -3413,7 +4057,7 @@ function createMessengerServer({
           }
         };
         currentStore.attachments.push(...forwardedAttachments);
-        currentStore.links.push(...currentStore.links
+        currentStore.links.push(...(encrypted ? [] : currentStore.links)
           .filter((link) => link.messageId === sourceMessage.id && link.chatId === sourceChatId)
           .map((link) => ({
             ...link,
@@ -3526,14 +4170,36 @@ function createMessengerServer({
           throw new HttpError(403, "Messages can only be edited within 48 hours.");
         }
         const input = await readJsonBody(request);
-        const text = cleanMessageText(input.text);
-        if (!text || Array.from(text).length > 4000) {
+        const encrypted = input.encrypted === true;
+        if (!encrypted && !allowLegacyPlaintext) {
+          throw new HttpError(400, "End-to-end encryption is required for edited messages.");
+        }
+        const text = encrypted
+          ? (typeof input.text === "string" ? input.text : "")
+          : cleanMessageText(input.text);
+        if (!text || (encrypted ? text.length > 150000 : Array.from(text).length > 4000)
+          || (encrypted && !validEncryptedMessage(text, targetChat, currentStore, user.id))) {
           throw new HttpError(400, "Message must contain 1–4000 characters.");
         }
+        const cryptoContext = encrypted ? getEncryptedMessageContext(text) : null;
+        if (encrypted && currentStore.messages.some((item) =>
+          item.id !== targetMessage.id && item.authorId === user.id
+          && (item.conversationId || item.room) === targetChatId
+          && item.cryptoCounter === cryptoContext.counter)) {
+          throw new HttpError(409, "This message counter was already used. Retry editing.");
+        }
         targetMessage.text = text;
+        targetMessage.encrypted = encrypted;
+        if (encrypted) {
+          targetMessage.cryptoCounter = cryptoContext.counter;
+          targetMessage.signatureAuthorId = user.id;
+        } else {
+          delete targetMessage.cryptoCounter;
+          delete targetMessage.signatureAuthorId;
+        }
         targetMessage.editedAt = new Date().toISOString();
         currentStore.links = currentStore.links.filter((link) => link.messageId !== targetMessage.id);
-        currentStore.links.push(...extractLinks(text).map((link) => ({
+        currentStore.links.push(...(encrypted ? [] : extractLinks(text)).map((link) => ({
           id: randomId(),
           chatId: targetMessage.conversationId,
           messageId: targetMessage.id,
@@ -3783,15 +4449,19 @@ async function writeStoreAtomically(filePath, contents, {
 
   try {
     await fs.copyFile(filePath, backupTemporaryPath);
+    await secureDataFile(backupTemporaryPath);
     await retryFileOperation(() => renameFile(backupTemporaryPath, backupPath), retryDelay);
+    await secureDataFile(backupPath);
   } catch (error) {
     await fs.rm(backupTemporaryPath, { force: true });
     if (error.code !== "ENOENT") throw error;
   }
 
   try {
-    await fs.writeFile(temporaryPath, contents, "utf8");
+    await fs.writeFile(temporaryPath, contents, { encoding: "utf8", mode: 0o600 });
+    await secureDataFile(temporaryPath);
     await retryFileOperation(() => renameFile(temporaryPath, filePath), retryDelay);
+    await secureDataFile(filePath);
   } catch (error) {
     await fs.rm(temporaryPath, { force: true });
     throw error;
@@ -3809,8 +4479,17 @@ function createStoreWriter(filePath, options) {
 }
 
 async function start() {
-  await fs.mkdir(DATA_DIRECTORY, { recursive: true });
+  await secureDataDirectory(DATA_DIRECTORY);
   const { database, store } = await loadSqliteStore(DATABASE_FILE, LEGACY_DATA_FILE);
+  await Promise.all([
+    secureDataFile(DATABASE_FILE),
+    secureDataFile(`${DATABASE_FILE}-wal`),
+    secureDataFile(`${DATABASE_FILE}-shm`),
+    secureDataFile(LEGACY_DATA_FILE)
+  ]);
+  const uploadsDirectory = path.join(DATA_DIRECTORY, "uploads");
+  await fs.mkdir(uploadsDirectory, { recursive: true, mode: 0o700 });
+  if (process.platform !== "win32") await fs.chmod(uploadsDirectory, 0o700);
   if (!store.vapidKeys) store.vapidKeys = webpush.generateVAPIDKeys();
   const contact = process.env.POLUS_PUSH_CONTACT || "mailto:admin@example.com";
   webpush.setVapidDetails(contact, store.vapidKeys.publicKey, store.vapidKeys.privateKey);
@@ -3865,11 +4544,15 @@ module.exports = {
   createPushPayload,
   createSqliteStoreWriter,
   createStoreWriter,
+  getClientAddress,
   getLanAddresses,
+  validEncryptedMessage,
   migrateLegacyChannelData,
   normalizeStore,
   loadStore,
   loadSqliteStore,
+  secureDataDirectory,
+  secureDataFile,
   writeStoreAtomically,
   sendPushToUser,
   PRIVACY_VERSION

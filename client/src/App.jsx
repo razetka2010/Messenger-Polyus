@@ -1,11 +1,31 @@
 import { createRoot } from "react-dom/client";
 import { Component, createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+<<<<<<< Updated upstream
 import { accountApiUrl, getActiveAccountKey, requestJson, setActiveAccountKey } from "./apiClient.mjs";
 import { createAccountKey, getRequestedAccountUserId, getStoredAccounts, saveAccounts } from "./accounts.mjs";
 import { createImageThumbnail, uploadAttachment, uploadAttachmentThumbnail } from "./attachmentUploads.mjs";
+=======
+import { connectEventStream, getActiveAccountKey, requestJson, setActiveAccountKey } from "./apiClient.mjs";
+import { createAccountKey, getRequestedAccountUserId, getStoredAccounts, saveAccounts } from "./accounts.mjs";
+import { uploadAttachment } from "./attachmentUploads.mjs";
+import { formatAttachmentSize } from "./attachmentFormatting.mjs";
+import { MessageAttachment, MessageText } from "./components/MessageContent.jsx";
+import AuthenticatedImage, { AuthenticatedVideo } from "./components/AuthenticatedImage.jsx";
+>>>>>>> Stashed changes
 import { cropAvatar } from "./avatar.mjs";
 import { getConversationHeaderControls, orderConversations } from "./conversationList.mjs";
 import { clearClientDiagnostics, createClientId, getClientDiagnostics, logClientDiagnostic } from "./diagnostics.mjs";
+import {
+  encryptAttachment,
+  encryptMessagePayload,
+  ensureEncryptionIdentity,
+  getConversationEncryptionKeys,
+  getEncryptionPublicKey,
+  getOwnEncryptionPublicKey,
+  hasReadyEncryptionIdentity,
+  prepareEncryptionKeyPasswordChange,
+  trustChangedEncryptionKey
+} from "./encryption.mjs";
 import { initializeMessenger } from "./messengerController.js";
 
 const MESSAGE_REACTION_EMOJIS = [
@@ -180,7 +200,6 @@ const THEME_OPTIONS = [
   { id: "warm", labels: { ru: "Песочная", en: "Sand" }, colors: ["#f6efe5", "#fffaf2", "#b87935"] }
 ];
 let notificationAudioContext = null;
-let activeVoiceMessageAudio = null;
 
 function prepareNotificationSound() {
   const AudioContext = window.AudioContext || window.webkitAudioContext;
@@ -294,6 +313,28 @@ function localizeComposerError(message, language) {
   return errors[message] || message;
 }
 
+function getEncryptionKeyChangeNotice(error, language) {
+  const russian = language === "ru";
+  const details = russian
+    ? `Ключи пользователя ${error.recipientId} изменились. Ранее сохранённый отпечаток: ${error.previousFingerprint}. Новый отпечаток: ${error.newFingerprint}. Не отправляйте сообщения, пока не сверите новый отпечаток с собеседником по независимому доверенному каналу.`
+    : `The keys for user ${error.recipientId} changed. Previously saved fingerprint: ${error.previousFingerprint}. New fingerprint: ${error.newFingerprint}. Do not send messages until you verify the new fingerprint with the person through an independent trusted channel.`;
+  if (!window.confirm(`${details}\n\n${russian
+    ? "Вы сверили новый отпечаток по независимому каналу и хотите запомнить этот ключ?"
+    : "Have you verified the new fingerprint through an independent channel and want to trust this key?"}`)) {
+    return Promise.resolve(details);
+  }
+  return trustChangedEncryptionKey(
+    error.userId,
+    error.recipientId,
+    error.publicKey,
+    error.signingPublicKey,
+    error.previousFingerprint
+  ).then(() => russian
+    ? "Новый отпечаток сохранён. Повторите отправку после проверки ключа."
+    : "The new fingerprint was saved. Retry sending after verifying the key.")
+    .catch((cause) => cause.message);
+}
+
 function avatarTone(id) {
   let hash = 0;
   for (const character of String(id)) hash = (hash * 31 + character.codePointAt(0)) % 7;
@@ -387,7 +428,7 @@ function ReactConversationRow({ conversation, selected, discover, userId, langua
         {saved
           ? <svg className="saved-bookmark-icon" viewBox="0 0 24 24"><path d="M6 3.75h12v17l-6-4-6 4z" /></svg>
           : conversation.avatarUrl
-          ? <img src={conversation.avatarUrl} alt="" loading="lazy" />
+          ? <AuthenticatedImage src={conversation.avatarUrl} alt="" loading="lazy" />
           : initials(conversation.name)}
       </span>
       <span className="chat-row-body">
@@ -452,7 +493,11 @@ function SidebarSearch() {
   const [query, setQuery] = useState("");
   const searchRef = useRef(null);
   const language = useCurrentLanguage();
+<<<<<<< Updated upstream
   useLayoutEffect(() => {
+=======
+  useEffect(() => {
+>>>>>>> Stashed changes
     const clear = () => {
       setQuery("");
       document.dispatchEvent(new CustomEvent("polus:sidebar-search", { detail: { query: "" } }));
@@ -604,191 +649,6 @@ function formatMessageTime(value, language) {
   }).format(new Date(value));
 }
 
-function MessageText({ value }) {
-  const pattern = /https?:\/\/[^\s<>"']+/giu;
-  const parts = [];
-  let cursor = 0;
-  for (const match of value.matchAll(pattern)) {
-    const raw = match[0];
-    const href = raw.replace(/[),.!?;:]+$/g, "");
-    if (match.index > cursor) parts.push(value.slice(cursor, match.index));
-    parts.push(
-      <a key={`${match.index}-${href}`} href={href} target="_blank" rel="noopener noreferrer">{href}</a>,
-      raw.slice(href.length)
-    );
-    cursor = match.index + raw.length;
-  }
-  if (cursor < value.length) parts.push(value.slice(cursor));
-  return parts.map((part, index) => (
-    typeof part === "string" ? part.split("\n").flatMap((line, lineIndex) => (
-      lineIndex === 0 ? [line] : [<br key={`${index}-${lineIndex}`} />, line]
-    )) : part
-  ));
-}
-
-function formatMediaTime(seconds) {
-  const safeSeconds = Number.isFinite(seconds) ? Math.max(0, Math.floor(seconds)) : 0;
-  return `${Math.floor(safeSeconds / 60)}:${String(safeSeconds % 60).padStart(2, "0")}`;
-}
-
-function VoiceMessagePlayer({ attachment, text }) {
-  const audioRef = useRef(null);
-  const playbackRequestedRef = useRef(false);
-  const [playback, setPlayback] = useState({ playing: false, current: 0, duration: 0 });
-  const bars = Array.from({ length: 36 }, (_, index) => 8 + ((index * 17 + index * index * 3) % 25));
-  const progress = playback.duration ? playback.current / playback.duration : 0;
-  useEffect(() => () => {
-    const audio = audioRef.current;
-    audio?.pause();
-    if (activeVoiceMessageAudio === audio) activeVoiceMessageAudio = null;
-  }, []);
-
-  const togglePlayback = async () => {
-    const audio = audioRef.current;
-    if (!audio) return;
-    if (audio.paused) {
-      if (attachment.mimeType && audio.canPlayType(attachment.mimeType) === "") {
-        document.dispatchEvent(new CustomEvent("polus:notify", {
-          detail: text.unsupportedAudioFormat
-        }));
-        return;
-      }
-      if (activeVoiceMessageAudio && activeVoiceMessageAudio !== audio) {
-        activeVoiceMessageAudio.pause();
-      }
-      activeVoiceMessageAudio = audio;
-      playbackRequestedRef.current = true;
-      try {
-        await audio.play();
-      } catch (error) {
-        playbackRequestedRef.current = false;
-        if (activeVoiceMessageAudio === audio) activeVoiceMessageAudio = null;
-        console.error("Voice message playback failed:", error);
-        document.dispatchEvent(new CustomEvent("polus:notify", {
-          detail: text.playbackFailed
-        }));
-      }
-    } else {
-      audio.pause();
-    }
-  };
-
-  return (
-    <div className="voice-message-player">
-      <audio
-        ref={audioRef}
-        src={`/api/attachments/${encodeURIComponent(attachment.id)}`}
-        preload="auto"
-        onLoadedMetadata={(event) => {
-          const duration = event.currentTarget.duration;
-          setPlayback((current) => ({ ...current, duration }));
-        }}
-        onTimeUpdate={(event) => {
-          const current = event.currentTarget.currentTime;
-          setPlayback((playback) => ({ ...playback, current }));
-        }}
-        onPlaying={(event) => {
-          const audio = event.currentTarget;
-          playbackRequestedRef.current = false;
-          if (activeVoiceMessageAudio && activeVoiceMessageAudio !== audio) {
-            audio.pause();
-            return;
-          }
-          activeVoiceMessageAudio = audio;
-          setPlayback((current) => ({ ...current, playing: true }));
-        }}
-        onPause={(event) => {
-          playbackRequestedRef.current = false;
-          if (activeVoiceMessageAudio === event.currentTarget) activeVoiceMessageAudio = null;
-          setPlayback((current) => ({ ...current, playing: false }));
-        }}
-        onEnded={(event) => {
-          playbackRequestedRef.current = false;
-          if (activeVoiceMessageAudio === event.currentTarget) activeVoiceMessageAudio = null;
-          setPlayback((current) => ({ ...current, playing: false, current: 0 }));
-        }}
-        onError={() => {
-          if (!playbackRequestedRef.current) return;
-          playbackRequestedRef.current = false;
-          if (activeVoiceMessageAudio === audioRef.current) activeVoiceMessageAudio = null;
-          setPlayback((current) => ({ ...current, playing: false }));
-          document.dispatchEvent(new CustomEvent("polus:notify", {
-            detail: text.unsupportedAudioFormat
-          }));
-        }}
-      />
-      <button
-        type="button"
-        className="voice-message-play"
-        aria-label={playback.playing ? text.pause : text.play}
-        title={playback.playing ? text.pause : text.play}
-        onClick={() => void togglePlayback()}
-      >
-        {playback.playing
-          ? <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5h3v14H8zM15 5h3v14h-3z" /></svg>
-          : <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 11 7-11 7z" /></svg>}
-      </button>
-      <div className={`voice-message-wave${playback.playing ? " is-playing" : ""}`} aria-hidden="true">
-        {bars.map((height, index) => (
-          <span
-            key={index}
-            className={index / bars.length <= progress ? "is-played" : ""}
-            style={{ "--wave-height": `${height}%`, "--wave-delay": `${(index % 9) * -0.11}s` }}
-          />
-        ))}
-      </div>
-      <span className="voice-message-time">{formatMediaTime(playback.playing ? playback.current : playback.duration)}</span>
-    </div>
-  );
-}
-
-function MessageAttachment({ attachment, text, mediaType }) {
-  const url = `/api/attachments/${encodeURIComponent(attachment.id)}`;
-  const image = attachment.mimeType?.startsWith("image/");
-  const media = image || /^(audio|video)\//.test(attachment.mimeType || "");
-  if (mediaType === "voice") return <VoiceMessagePlayer attachment={attachment} text={text} />;
-
-  return (
-    <div className="message-attachment">
-      {image && (
-        <img
-          className="message-attachment-image"
-          src={attachment.thumbnailUrl || url}
-          alt={attachment.name}
-          loading="lazy"
-          onClick={() => document.dispatchEvent(new CustomEvent("polus:open-media", { detail: { attachmentId: attachment.id } }))}
-        />
-      )}
-      {!image && /^(audio|video)\//.test(attachment.mimeType || "") && (
-        attachment.mimeType.startsWith("audio/")
-          ? <audio controls preload="metadata" src={url} />
-          : <video controls preload="metadata" src={url} />
-      )}
-      <a className="file-card" href={`${url}?download=1`} download={attachment.name}>
-        <span className="file-card-icon">{media ? "▧" : "↧"}</span>
-        <span className="file-card-details">
-          <strong>{attachment.name}</strong>
-          <small>{formatAttachmentSize(attachment.size)}</small>
-        </span>
-        <span className="file-card-download">{text.download}</span>
-      </a>
-    </div>
-  );
-}
-
-function formatAttachmentSize(size) {
-  if (!Number.isFinite(size) || size <= 0) return "0 B";
-  if (size < 1024) return `${size} B`;
-  const units = ["KB", "MB", "GB"];
-  let value = size / 1024;
-  let unitIndex = 0;
-  while (value >= 1024 && unitIndex < units.length - 1) {
-    value /= 1024;
-    unitIndex += 1;
-  }
-  return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[unitIndex]}`;
-}
-
 function MessageRow({ message, conversation, currentUserId, previousMessage, language }) {
   const text = translations[language];
   const author = message.author || {};
@@ -827,13 +687,13 @@ function MessageRow({ message, conversation, currentUserId, previousMessage, lan
         ? (
           <span className={avatarClass} aria-label={displayAuthor.fullName}>
             {displayAuthor.avatarUrl
-              ? <img src={displayAuthor.avatarUrl} alt="" />
+              ? <AuthenticatedImage src={displayAuthor.avatarUrl} alt="" />
               : initials(displayAuthor.fullName)}
           </span>
         )
         : (
           <button type="button" className={avatarClass} aria-label={author.fullName || author.username || ""} onClick={openProfile}>
-            {author.avatarUrl ? <img src={author.avatarUrl} alt="" /> : initials(author.fullName || author.username)}
+            {author.avatarUrl ? <AuthenticatedImage src={author.avatarUrl} alt="" /> : initials(author.fullName || author.username)}
           </button>
         )}
       <div className="message-content">
@@ -866,6 +726,13 @@ function MessageRow({ message, conversation, currentUserId, previousMessage, lan
           {message.deleted ? text.deletedMessage : <MessageText value={message.text || ""} />}
           {!message.deleted && message.editedAt && <span className="visually-hidden"> ({language === "ru" ? "изменено" : "edited"})</span>}
         </p>
+        {!message.deleted && message.encrypted && message.signatureVerified === false && (
+          <div className="message-security-warning" role="note">
+            {language === "ru"
+              ? "Старое сообщение: подпись отправителя не проверена."
+              : "Legacy message: sender signature was not verified."}
+          </div>
+        )}
         {message.savedSource && !message.deleted && (
           <div className="saved-message-source">
             <span>{text.savedFrom}</span>
@@ -1026,7 +893,7 @@ function ConversationHeader() {
           >
             <span className={`conversation-icon${isDirect ? " is-direct" : ""}${conversation.avatarUrl ? " has-avatar" : ""}`} aria-hidden="true">
               {conversation.avatarUrl
-                ? <img src={conversation.avatarUrl} alt="" />
+                ? <AuthenticatedImage src={conversation.avatarUrl} alt="" />
                 : conversation.type === "channel" ? "#" : initials(conversation.name)}
             </span>
             <span className="chat-title-copy">
@@ -1041,7 +908,7 @@ function ConversationHeader() {
               {conversation.type === "saved"
                 ? <svg className="saved-bookmark-icon" viewBox="0 0 24 24"><path d="M6 3.75h12v17l-6-4-6 4z" /></svg>
                 : conversation.avatarUrl
-                  ? <img src={conversation.avatarUrl} alt="" />
+                  ? <AuthenticatedImage src={conversation.avatarUrl} alt="" />
                   : conversation.type === "channel" ? "#" : initials(conversation.name)}
             </span>
             <div className="chat-title-copy">
@@ -1541,7 +1408,7 @@ function DiscoverySearchResults({ query, conversations, onOpenConversation }) {
             }))}
           >
             <span className={`result-avatar avatar-tone-${avatarTone(user.id)}`}>
-              {user.avatarUrl ? <img src={user.avatarUrl} alt="" /> : initials(user.fullName)}
+              {user.avatarUrl ? <AuthenticatedImage src={user.avatarUrl} alt="" /> : initials(user.fullName)}
             </span>
             <span className="result-copy">
               <strong>{user.fullName}</strong>
@@ -1582,7 +1449,11 @@ function ContactsPage({ onBack }) {
     try {
       setContacts(await requestJson("/api/contacts"));
     } catch (cause) {
+<<<<<<< Updated upstream
       setError(cause.message);
+=======
+      showError(cause);
+>>>>>>> Stashed changes
     } finally {
       setLoading(false);
     }
@@ -1609,7 +1480,11 @@ function ContactsPage({ onBack }) {
         detail: russian ? "Контакт удалён." : "Contact removed."
       }));
     } catch (cause) {
+<<<<<<< Updated upstream
       setError(cause.message);
+=======
+      showError(cause);
+>>>>>>> Stashed changes
     }
   };
   const activity = (contact) => {
@@ -1678,7 +1553,11 @@ function ContactsPage({ onBack }) {
                   document.dispatchEvent(new CustomEvent("polus:open-profile", { detail: { username: contact.username } }))}>
                   <span className={`contact-avatar avatar-tone-${avatarTone(contact.id)}`}>
                     {contact.avatarUrl
+<<<<<<< Updated upstream
                       ? <img src={accountApiUrl(contact.avatarUrl, getActiveAccountKey())} alt="" />
+=======
+                      ? <AuthenticatedImage src={contact.avatarUrl} alt="" />
+>>>>>>> Stashed changes
                       : initials(contact.fullName)}
                     {contact.online && <i className="contact-online-dot" aria-label={russian ? "В сети" : "Online"} />}
                   </span>
@@ -1922,7 +1801,11 @@ function UserPicker() {
                     aria-label={`${user.fullName} @${user.username}`}
                     onChange={() => setSelectedIds([user.id])} />
                   <span className={`result-avatar avatar-tone-${avatarTone(user.id)}`}>
+<<<<<<< Updated upstream
                     {user.avatarUrl ? <img src={accountApiUrl(user.avatarUrl, getActiveAccountKey())} alt="" /> : initials(user.fullName)}
+=======
+                    {user.avatarUrl ? <AuthenticatedImage src={user.avatarUrl} alt="" /> : initials(user.fullName)}
+>>>>>>> Stashed changes
                   </span>
                   <span className="result-copy"><strong>{user.fullName}</strong><small>@{user.username}</small></span>
                   {user.isContact && <small>{russian ? "Уже в контактах" : "Already a contact"}</small>}
@@ -1953,7 +1836,11 @@ function UserPicker() {
               <label className="user-picker-row" key={contact.id}>
                 <input type="checkbox" checked={selectedIds.includes(contact.id)} onChange={() => toggle(contact.id)} />
                 <span className={`result-avatar avatar-tone-${avatarTone(contact.id)}`}>
+<<<<<<< Updated upstream
                   {contact.avatarUrl ? <img src={accountApiUrl(contact.avatarUrl, getActiveAccountKey())} alt="" /> : initials(contact.fullName)}
+=======
+                  {contact.avatarUrl ? <AuthenticatedImage src={contact.avatarUrl} alt="" /> : initials(contact.fullName)}
+>>>>>>> Stashed changes
                 </span>
                 <span className="result-copy"><strong>{contact.fullName}</strong><small>@{contact.username}</small></span>
               </label>
@@ -1974,6 +1861,7 @@ function UserPicker() {
                 : (russian ? "Добавить в группу" : "Add to group")}
         </button>
       </div>
+<<<<<<< Updated upstream
     </dialog>
   );
 }
@@ -2113,10 +2001,13 @@ function ContactShareDialog() {
           {busy ? "…" : russian ? "Продолжить" : "Continue"}
         </button>
       </div>
+=======
+>>>>>>> Stashed changes
     </dialog>
   );
 }
 
+<<<<<<< Updated upstream
 function UserProfileContent() {
   const [profile, setProfile] = useState(null);
   const [showAllSharedChats, setShowAllSharedChats] = useState(false);
@@ -2133,16 +2024,250 @@ function UserProfileContent() {
     document.addEventListener("polus:user-profile-changed", onProfile);
     return () => {
       document.removeEventListener("polus:user-profile-changed", onProfile);
-    };
-  }, []);
+=======
+function ContactShareDialog() {
+  const dialogRef = useRef(null);
+  const requestIdRef = useRef(0);
+  const [target, setTarget] = useState(null);
+  const [chats, setChats] = useState([]);
+  const [selectedId, setSelectedId] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [inviteUrl, setInviteUrl] = useState("");
+  const language = useCurrentLanguage();
+  const russian = language === "ru";
 
-  if (!profile) return <div id="profile-view-content" />;
+  useEffect(() => {
+    const open = async (event) => {
+      const next = event.detail || {};
+      const requestId = ++requestIdRef.current;
+      setTarget(next);
+      setSelectedId("");
+      setError("");
+      setInviteUrl("");
+      if (!dialogRef.current?.open) dialogRef.current?.showModal();
+      document.dispatchEvent(new CustomEvent("polus:dialog-open-state", { detail: { id: "contact-share-dialog", open: true } }));
+      try {
+        const [profile, bootstrap] = await Promise.all([
+          requestJson(`/api/users/${encodeURIComponent(next.username)}/profile`),
+          requestJson("/api/bootstrap")
+        ]);
+        if (requestIdRef.current !== requestId) return;
+        if (profile.user.blocked || !profile.canMessage) {
+          setError(russian ? "Это действие недоступно для этого пользователя." : "This action is unavailable for this user.");
+          setChats([]);
+          return;
+        }
+        const source = next.type === "group" ? bootstrap.directs : bootstrap.channels;
+        setChats(source.filter((chat) => (next.type === "group" ? chat.type === "group" : chat.type === "channel")
+          && chat.joined !== false && ["owner", "admin"].includes(chat.role)
+          && !chat.memberIds.includes(profile.user.id)));
+      } catch (cause) {
+        if (requestIdRef.current === requestId) setError(cause.message);
+      }
+>>>>>>> Stashed changes
+    };
+    const close = () => {
+      requestIdRef.current += 1;
+      dialogRef.current?.close();
+    };
+    document.addEventListener("polus:open-contact-share", open);
+    document.addEventListener("polus:close-contact-share", close);
+    return () => {
+      requestIdRef.current += 1;
+      document.removeEventListener("polus:open-contact-share", open);
+      document.removeEventListener("polus:close-contact-share", close);
+    };
+  }, [language, russian]);
+
+  const close = () => {
+    requestIdRef.current += 1;
+    dialogRef.current?.close();
+    document.dispatchEvent(new CustomEvent("polus:dialog-open-state", { detail: { id: "contact-share-dialog", open: false } }));
+  };
+  const confirm = async () => {
+    const chat = chats.find((item) => item.id === selectedId);
+    if (!chat || !target) return;
+    setBusy(true);
+    setError("");
+    try {
+      if (target.type === "channel" && !chat.isPrivate) {
+        const result = await requestJson(`/api/chats/${encodeURIComponent(chat.id)}/invite`, { method: "POST" });
+        const url = `${window.location.origin}${result.inviteUrl}`;
+        setInviteUrl(url);
+        try {
+          await navigator.clipboard.writeText(url);
+          document.dispatchEvent(new CustomEvent("polus:notify", {
+            detail: russian ? "Ссылка скопирована. Отправьте её контакту." : "Invite link copied. Share it with the contact."
+          }));
+          close();
+        } catch {
+          setError(russian ? "Скопируйте ссылку и отправьте её контакту." : "Copy this link and share it with the contact.");
+        }
+      } else {
+        await requestJson(`/api/chats/${encodeURIComponent(chat.id)}/members`, {
+          method: "POST",
+          body: JSON.stringify({ usernames: [target.username] })
+        });
+        document.dispatchEvent(new CustomEvent("polus:notify", {
+          detail: target.type === "group"
+            ? (russian ? "Контакт добавлен в группу." : "Contact added to the group.")
+            : (russian ? "Контакт приглашён в канал." : "Contact invited to the channel.")
+        }));
+        close();
+      }
+    } catch (cause) {
+      setError(cause.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <dialog id="contact-share-dialog" className="dialog user-picker-dialog" ref={dialogRef}
+      onClose={() => {
+        requestIdRef.current += 1;
+        document.dispatchEvent(new CustomEvent("polus:dialog-open-state", {
+          detail: { id: "contact-share-dialog", open: false }
+        }));
+      }}>
+      <div className="dialog-top">
+        <div><div className="eyebrow">{russian ? "КОНТАКТЫ" : "CONTACTS"}</div>
+          <h2>{target?.type === "group" ? (russian ? "Добавить в группу" : "Add to group") : (russian ? "Пригласить в канал" : "Invite to channel")}</h2>
+          {target && <p className="user-picker-hint">{target.username}</p>}
+        </div>
+        <button className="icon-button dialog-close" type="button" aria-label={russian ? "Закрыть" : "Close"} onClick={close}>×</button>
+      </div>
+      {inviteUrl && <input className="text-field" readOnly value={inviteUrl} onFocus={(event) => event.currentTarget.select()} />}
+      <div className="user-picker-list">
+        {chats.length === 0
+          ? <p className="contacts-empty">{error || (russian ? "Нет доступных чатов для этого действия." : "No chats are available for this action.")}</p>
+          : chats.map((chat) => (
+            <label className="user-picker-row" key={chat.id}>
+              <input type="radio" name="contact-share-chat" checked={selectedId === chat.id}
+                onChange={() => setSelectedId(chat.id)} />
+              <span className="discovery-avatar avatar-tone-5">{initials(chat.name)}</span>
+              <span className="result-copy"><strong>{chat.name}</strong>
+                <small>{chat.type === "channel" && !chat.isPrivate
+                  ? (russian ? "Публичный канал · приглашение по ссылке" : "Public channel · invite by link")
+                  : chat.type === "channel" ? (russian ? "Канал" : "Channel") : (russian ? "Группа" : "Group")}</small>
+              </span>
+            </label>
+          ))}
+      </div>
+      {error && chats.length > 0 && <div className="form-error" role="alert">{error}</div>}
+      <div className="user-picker-footer">
+        <button className="primary-button" type="button" disabled={busy || !selectedId} onClick={() => void confirm()}>
+          {busy ? "…" : russian ? "Продолжить" : "Continue"}
+        </button>
+      </div>
+    </dialog>
+  );
+}
+
+function UserProfileContent({ username, currentUserId, currentUsername, onBack }) {
+  const [profile, setProfile] = useState(null);
+  const [error, setError] = useState("");
+  const [showAllSharedChats, setShowAllSharedChats] = useState(false);
+  const [showAllSharedMedia, setShowAllSharedMedia] = useState(false);
+  const profilePageRef = useRef(null);
+  const language = useCurrentLanguage();
+  const russian = language === "ru";
+
+  useEffect(() => {
+    const onProfile = (event) => {
+      if (event.detail.user?.username?.toLowerCase() !== username.toLowerCase()) return;
+      setProfile(event.detail);
+      setError("");
+      setShowAllSharedChats(false);
+      setShowAllSharedMedia(false);
+    };
+    const onProfileError = (event) => {
+      if (event.detail.username?.toLowerCase() === username.toLowerCase()) {
+        setProfile(null);
+        setError(event.detail.message);
+      }
+    };
+    document.addEventListener("polus:user-profile-changed", onProfile);
+    document.addEventListener("polus:user-profile-error", onProfileError);
+    const timer = window.setTimeout(() => {
+      document.dispatchEvent(new CustomEvent("polus:load-user-profile", { detail: { username } }));
+    }, 0);
+    return () => {
+      window.clearTimeout(timer);
+      document.removeEventListener("polus:user-profile-changed", onProfile);
+      document.removeEventListener("polus:user-profile-error", onProfileError);
+    };
+  }, [username]);
+
+  useEffect(() => {
+    const page = profilePageRef.current;
+    if (!page || !profile?.user.profileDesign?.coverParallax || !profile.user.profileDesign.motionEnabled
+      || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return undefined;
+    let frame = 0;
+    const updateParallax = () => {
+      if (frame) return;
+      frame = window.requestAnimationFrame(() => {
+        frame = 0;
+        page.style.setProperty("--profile-parallax-offset", `${Math.min(page.scrollTop, 320) * 0.14}px`);
+      });
+    };
+    page.addEventListener("scroll", updateParallax, { passive: true });
+    return () => {
+      page.removeEventListener("scroll", updateParallax);
+      if (frame) window.cancelAnimationFrame(frame);
+      page.style.removeProperty("--profile-parallax-offset");
+    };
+  }, [profile?.user.profileDesign?.coverParallax, profile?.user.profileDesign?.motionEnabled]);
+
+  const backButton = (
+    <button className="icon-button profile-page-back" type="button" onClick={onBack}>
+      <span aria-hidden="true">←</span>{russian ? "Назад" : "Back"}
+    </button>
+  );
+  if (!profile) {
+    return (
+      <main className="public-profile-page">
+        <header className="public-profile-toolbar">{backButton}<span>ПОЛЮС</span></header>
+        <div className="public-profile-state" role={error ? "alert" : "status"}>
+          {error || (russian ? "Загрузка профиля…" : "Loading profile…")}
+        </div>
+      </main>
+    );
+  }
   const { user, sharedChats, sharedMedia, canMessage, labels, status, registered, muted } = profile;
+<<<<<<< Updated upstream
+=======
+  const design = { ...DEFAULT_PROFILE_DESIGN, ...(user.profileDesign || {}) };
+  const ownProfile = user.id === currentUserId
+    || user.username?.toLocaleLowerCase() === currentUsername?.toLocaleLowerCase();
+>>>>>>> Stashed changes
   const visibleSharedChats = showAllSharedChats ? sharedChats : sharedChats.slice(0, 4);
   const visibleSharedMedia = showAllSharedMedia ? sharedMedia : sharedMedia.slice(0, 8);
   const trigger = (action) => document.dispatchEvent(new CustomEvent("polus:user-profile-action", {
     detail: { action, username: user.username }
   }));
+<<<<<<< Updated upstream
+=======
+  const shareProfile = async () => {
+    const url = window.location.href;
+    try {
+      if (navigator.share) await navigator.share({ title: user.fullName, url });
+      else {
+        await navigator.clipboard.writeText(url);
+        document.dispatchEvent(new CustomEvent("polus:notify", {
+          detail: russian ? "Ссылка на профиль скопирована." : "Profile link copied."
+        }));
+      }
+    } catch (cause) {
+      if (cause.name !== "AbortError") {
+        document.dispatchEvent(new CustomEvent("polus:notify", {
+          detail: russian ? "Не удалось поделиться профилем." : "Unable to share this profile."
+        }));
+      }
+    }
+  };
+>>>>>>> Stashed changes
   const confirmBlock = () => {
     if (window.confirm(russian
       ? `Заблокировать пользователя @${user.username}?`
@@ -2151,6 +2276,7 @@ function UserProfileContent() {
     }
   };
   return (
+<<<<<<< Updated upstream
     <div id="profile-view-content">
       <header className="user-profile-dialog-header">
         <span>{russian ? "ПРОФИЛЬ" : "PROFILE"}</span>
@@ -2280,6 +2406,141 @@ function UserProfileContent() {
         </section>
       )}
     </div>
+=======
+    <main
+      ref={profilePageRef}
+      className={`public-profile-page profile-theme-${design.theme} profile-font-${design.font} profile-effects-${design.effects} profile-animation-${design.animation}${design.motionEnabled ? "" : " reduce-profile-motion"}`}
+      style={{
+        "--profile-accent": design.accentColor,
+        "--profile-gradient-start": design.gradientStart,
+        "--profile-gradient-end": design.gradientEnd,
+        "--profile-gradient-angle": design.gradientDirection === "horizontal" ? "90deg" : design.gradientDirection === "vertical" ? "180deg" : "145deg"
+      }}
+    >
+      {design.backgroundImageEnabled && user.profileCoverUrl && (
+        <AuthenticatedImage className="public-profile-backdrop" src={user.profileCoverUrl} alt="" aria-hidden="true" />
+      )}
+      <header className="public-profile-toolbar">{backButton}<span>ПОЛЮС</span></header>
+      <div className="public-profile-content">
+        <section className="public-profile-card">
+          <div className="public-profile-cover">
+            {user.profileCoverUrl && user.profileCoverMimeType?.startsWith("video/")
+              ? <AuthenticatedVideo src={user.profileCoverUrl} aria-hidden="true" autoPlay muted loop playsInline />
+              : user.profileCoverUrl
+                ? <AuthenticatedImage src={user.profileCoverUrl} alt="" aria-hidden="true" />
+                : <div className="public-profile-cover-art" aria-hidden="true" />}
+            <div className="public-profile-cover-glow" aria-hidden="true" />
+            {design.effects === "particles" && <div className="public-profile-particles" aria-hidden="true" />}
+          </div>
+          <div className="public-profile-main">
+            <div className={`public-profile-avatar profile-avatar-frame-${design.avatarFrame}`}>
+              {user.avatarUrl ? <AuthenticatedImage src={user.avatarUrl} alt="" /> : initials(user.fullName)}
+            </div>
+            <div className="public-profile-identity">
+              <div>
+                <h1>{user.fullName}</h1>
+                <span className="user-profile-handle">@{user.username}</span>
+              </div>
+              {status && <span className={`user-profile-status${user.online ? " is-online" : ""}`}>{status}</span>}
+              {registered && <span className="user-profile-joined">{labels.registered}: {registered}</span>}
+            </div>
+            <div className="public-profile-actions">
+              {ownProfile
+                ? <button className="primary-button" type="button" onClick={() => document.dispatchEvent(new CustomEvent("polus:open-own-profile", { detail: { section: "appearance" } }))}>
+                  {russian ? "Настроить профиль" : "Customize profile"}
+                </button>
+                : canMessage && <button className="primary-button" type="button" onClick={() => trigger("message")}>
+                  {labels.writeToUser}
+                </button>}
+              <button className="secondary-button" type="button" onClick={() => void shareProfile()}>
+                {russian ? "Поделиться" : "Share"}
+              </button>
+              {!ownProfile && canMessage && <button className="secondary-button" type="button" onClick={() => trigger("toggle-contact")}>
+                {user.isContact ? labels.removeContact : labels.addContact}
+              </button>}
+              {!ownProfile && !user.blocked && (
+                <details className="profile-more-actions">
+                  <summary>{russian ? "Дополнительно" : "More"}</summary>
+                  <div className="profile-more-menu">
+                    <button className="danger-button" type="button" onClick={confirmBlock}>{labels.blockUser}</button>
+                    {muted !== null && <button className="text-button" type="button" onClick={() => trigger("toggle-mute")}>
+                      {muted ? labels.unmuteChat : labels.muteChat}
+                    </button>}
+                  </div>
+                </details>
+              )}
+            </div>
+          </div>
+          {user.blocked && (
+            <div className="user-profile-blocked" role="status">
+              <span>{labels.blockedInfo}</span>
+              <button className="text-button" type="button" onClick={() => trigger("toggle-block")}>{labels.unblockUser}</button>
+            </div>
+          )}
+          {user.about && (
+            <section className="public-profile-section">
+              <h2>{labels.about}</h2>
+              <p className="profile-about-copy">{user.about}</p>
+            </section>
+          )}
+          {sharedChats.length > 0 && (
+            <section className="public-profile-section">
+              <div className="profile-shared-heading">
+                <h2>{labels.sharedChats}</h2>
+                {sharedChats.length > 4 && (
+                  <button className="text-button" type="button" onClick={() => setShowAllSharedChats((value) => !value)}>
+                    {showAllSharedChats ? labels.showLess : `${labels.showAll} (${sharedChats.length})`}
+                  </button>
+                )}
+              </div>
+              <div className="profile-shared-chats">
+                {visibleSharedChats.map((chat) => (
+                  <button
+                    className="profile-shared-chat"
+                    key={chat.id}
+                    type="button"
+                    onClick={() => document.dispatchEvent(new CustomEvent("polus:open-profile-community", {
+                      detail: { id: chat.id, type: chat.type }
+                    }))}
+                  >
+                    <span className={`profile-shared-chat-icon${chat.type === "channel" ? " is-channel" : ""}`}>
+                      {chat.type === "channel" ? "#" : initials(chat.name)}
+                    </span>
+                    <span className="profile-shared-chat-copy">
+                      <strong>{chat.name}</strong>
+                      <small>{chat.type === "channel" ? labels.sharedChannel : labels.sharedGroup}</small>
+                    </span>
+                    <span className="profile-shared-chat-arrow" aria-hidden="true">›</span>
+                  </button>
+                ))}
+              </div>
+            </section>
+          )}
+          {sharedMedia.length > 0 && (
+            <section className="public-profile-section">
+              <div className="profile-shared-heading">
+                <h2>{labels.sharedMedia}</h2>
+                {sharedMedia.length > 8 && (
+                  <button className="text-button" type="button" onClick={() => setShowAllSharedMedia((value) => !value)}>
+                    {showAllSharedMedia ? labels.showLess : `${labels.showAll} (${sharedMedia.length})`}
+                  </button>
+                )}
+              </div>
+              <div className="media-grid profile-media-grid">
+                {(showAllSharedMedia ? sharedMedia : sharedMedia.slice(0, 8)).map((attachment) => (
+                  <AuthenticatedImage
+                    key={attachment.id}
+                    src={attachment.thumbnailUrl || `/api/attachments/${encodeURIComponent(attachment.id)}`}
+                    alt={attachment.name}
+                  />
+                ))}
+              </div>
+            </section>
+          )}
+        </section>
+      </div>
+    </main>
+>>>>>>> Stashed changes
   );
 }
 
@@ -2423,7 +2684,7 @@ function ForwardMessageDialog() {
     try {
       await new Promise((resolve, reject) => {
         document.dispatchEvent(new CustomEvent("polus:forward-message-to-chat", {
-          detail: { messageId: snapshot.message.id, ...destination, resolve, reject }
+          detail: { message: snapshot.message, messageId: snapshot.message.id, ...destination, resolve, reject }
         }));
       });
       dialogRef.current?.close();
@@ -2470,7 +2731,7 @@ function ForwardMessageDialog() {
                 onClick={() => void forwardTo({ recipientUsername: user.username })}
               >
                 <span className="forward-target-avatar">
-                  {user.avatarUrl ? <img src={user.avatarUrl} alt="" /> : initials(user.fullName)}
+                  {user.avatarUrl ? <AuthenticatedImage src={user.avatarUrl} alt="" /> : initials(user.fullName)}
                 </span>
                 <span><strong>{user.fullName}</strong><small>@{user.username}</small></span>
               </button>
@@ -2493,7 +2754,7 @@ function ForwardMessageDialog() {
               >
                 <span className={`forward-target-avatar${chat.type === "channel" ? " is-channel" : ""}`}>
                   {chat.avatarUrl
-                    ? <img src={chat.avatarUrl} alt="" />
+                    ? <AuthenticatedImage src={chat.avatarUrl} alt="" />
                     : chat.type === "saved"
                       ? <svg className="saved-bookmark-icon" viewBox="0 0 24 24"><path d="M6 3.75h12v17l-6-4-6 4z" /></svg>
                       : chat.type === "channel" ? "#" : initials(chat.name || "")}
@@ -2547,7 +2808,7 @@ function ChatInfoDialogContent() {
       <section className="chat-info-identity" aria-label={language === "ru" ? "Информация о чате" : "Chat information"}>
         <span className={`chat-info-avatar${snapshot?.chatType === "channel" ? " is-channel" : ""}`} aria-hidden="true">
           {snapshot?.avatarUrl
-            ? <img src={snapshot.avatarUrl} alt="" />
+            ? <AuthenticatedImage src={snapshot.avatarUrl} alt="" />
             : snapshot?.chatType === "saved"
               ? <svg className="saved-bookmark-icon" viewBox="0 0 24 24"><path d="M6 3.75h12v17l-6-4-6 4z" /></svg>
               : snapshot?.chatType === "channel" ? "#" : initials(snapshot?.chatName || "")}
@@ -2604,14 +2865,14 @@ function ChatInfoDialogContent() {
                 {response.items.map((item) => (
                   <div className="media-tile" key={item.id}>
                     {item.mimeType.startsWith("image/")
-                      ? <img
+                      ? <AuthenticatedImage
                         src={item.thumbnailUrl || `/api/attachments/${encodeURIComponent(item.id)}`}
                         alt={item.name}
                         loading="lazy"
                         title={item.name}
                         onClick={() => act("open-media", { attachmentId: item.id, canView: snapshot.canView })}
                       />
-                      : <video src={`/api/attachments/${encodeURIComponent(item.id)}`} controls preload="metadata" />}
+                      : <AuthenticatedVideo src={`/api/attachments/${encodeURIComponent(item.id)}`} controls preload="metadata" />}
                     {item.messageId && snapshot.canView && (
                       <button className="text-button" type="button" onClick={() => act("open-message", { messageId: item.messageId })}>
                         {snapshot.labels.openMessage}
@@ -2624,7 +2885,7 @@ function ChatInfoDialogContent() {
                 {response.items.map((item) => tab === "members"
                   ? <article className="info-item info-member" key={item.id}>
                     <span className="info-member-avatar" aria-hidden="true">
-                      {item.avatarUrl ? <img src={item.avatarUrl} alt="" loading="lazy" /> : initials(item.fullName)}
+                      {item.avatarUrl ? <AuthenticatedImage src={item.avatarUrl} alt="" loading="lazy" /> : initials(item.fullName)}
                     </span>
                     <div className="info-member-identity">
                       <button
@@ -3363,7 +3624,7 @@ function ChatManagementContent() {
   );
 }
 
-function Composer() {
+function Composer({ user, accountKey }) {
   const language = useCurrentLanguage();
   const [text, setText] = useState("");
   const [enabled, setEnabled] = useState(false);
@@ -3722,9 +3983,18 @@ function Composer() {
       for (const item of newAttachments) {
         const uploadStartedAt = performance.now();
         setUpload({ active: true, text: `0% · ${item.file.name}` });
-        item.uploaded = await uploadAttachment(conversationId, item.file, controller.signal, (percent) => {
-          setUpload({ active: true, text: `${percent}% · ${item.file.name}` });
+        const encrypted = await encryptAttachment(item.file);
+        item.encryptionMetadata = encrypted.metadata;
+        const encryptedFile = new File([encrypted.blob], "encrypted.bin", {
+          type: "application/octet-stream"
         });
+        item.uploaded = await uploadAttachment(
+          conversationId,
+          encryptedFile,
+          controller.signal,
+          (percent) => setUpload({ active: true, text: `${percent}% · ${item.file.name}` }),
+          { encrypted: true }
+        );
         logClientDiagnostic("composer.upload.file-succeeded", {
           conversationId,
           size: item.file.size,
@@ -3732,30 +4002,6 @@ function Composer() {
           durationMs: Math.round(performance.now() - uploadStartedAt)
         });
         replaceAttachments([...attachmentsRef.current]);
-        if (item.file.type.startsWith("image/")) {
-          try {
-            const thumbnail = await createImageThumbnail(item.file);
-            if (thumbnail) {
-              setUpload({ active: true, text: `${language === "ru" ? "Миниатюра" : "Preview"} · ${item.file.name}` });
-              const result = await uploadAttachmentThumbnail(
-                conversationId,
-                item.uploaded.id,
-                thumbnail,
-                controller.signal,
-                (percent) => setUpload({
-                  active: true,
-                  text: `${language === "ru" ? "Миниатюра" : "Preview"} ${percent}% · ${item.file.name}`
-                })
-              );
-              item.uploaded.thumbnailUrl = result.thumbnailUrl;
-            }
-          } catch (cause) {
-            if (cause.name === "AbortError") throw cause;
-            document.dispatchEvent(new CustomEvent("polus:notify", {
-              detail: `${item.file.name}: ${labels.thumbnailFailed}`
-            }));
-          }
-        }
       }
       uploadSucceeded = true;
     } catch (cause) {
@@ -3813,18 +4059,35 @@ function Composer() {
     setSubmitting(true);
     submittingRef.current = true;
     try {
+      const recipients = submittedConversation.pending
+        ? [
+          await getOwnEncryptionPublicKey(accountKey),
+          await getEncryptionPublicKey(submittedConversation.username, accountKey)
+        ]
+        : await getConversationEncryptionKeys(submittedConversation.id, accountKey);
+      const cryptographicConversationId = submittedConversation.pending
+        ? `dm_${[user.id, recipients.find((item) => item.id !== user.id)?.id].sort().join("_")}`
+        : submittedConversation.id;
+      const encryptedText = await encryptMessagePayload(user.id, recipients, cryptographicConversationId, {
+        text: messageText,
+        mediaType: recordedMessageTypeRef.current || null,
+        attachments: attachments.map((item) => ({
+          id: item.uploaded.id,
+          ...item.encryptionMetadata
+        }))
+      });
       const payload = submittedConversation.pending
         ? {
           recipientUsername: submittedConversation.username,
-          text: messageText,
+          text: encryptedText,
+          encrypted: true,
           attachmentIds: attachments.map((item) => item.uploaded.id),
-          ...(recordedMessageTypeRef.current ? { mediaType: recordedMessageTypeRef.current } : {})
         }
         : {
           conversationId: submittedConversation.id,
-          text: messageText,
+          text: encryptedText,
+          encrypted: true,
           attachmentIds: attachments.map((item) => item.uploaded.id),
-          ...(recordedMessageTypeRef.current ? { mediaType: recordedMessageTypeRef.current } : {}),
           ...(replyTarget?.conversationId === submittedConversation.id
             ? { replyToId: replyTarget.message.id }
             : {})
@@ -3860,8 +4123,11 @@ function Composer() {
         status: cause.status || null,
         error: cause.message
       }, "error");
+      const notice = cause.code === "ENCRYPTION_KEY_CHANGED"
+        ? await getEncryptionKeyChangeNotice(cause, language)
+        : localizeComposerError(cause.message, language);
       document.dispatchEvent(new CustomEvent("polus:notify", {
-        detail: localizeComposerError(cause.message, language)
+        detail: notice
       }));
     } finally {
       submittingRef.current = false;
@@ -4097,7 +4363,11 @@ function SidebarMenu({
       >
         <span id="profile-avatar" className="profile-avatar">
           {user?.avatarUrl
+<<<<<<< Updated upstream
             ? <img src={accountApiUrl(user.avatarUrl, activeAccountKey)} alt="" />
+=======
+            ? <AuthenticatedImage src={user.avatarUrl} accountKey={activeAccountKey} alt="" />
+>>>>>>> Stashed changes
             : initials(user?.fullName || (language === "ru" ? "Пользователь" : "User"))}
         </span>
         <span className="profile-copy">
@@ -4122,7 +4392,11 @@ function SidebarMenu({
           >
             <span className="account-switcher-avatar">
               {account.user.avatarUrl
+<<<<<<< Updated upstream
                 ? <img src={accountApiUrl(account.user.avatarUrl, account.key)} alt="" />
+=======
+                ? <AuthenticatedImage src={account.user.avatarUrl} accountKey={account.key} alt="" />
+>>>>>>> Stashed changes
                 : initials(account.user.fullName || account.user.username)}
             </span>
             <span className="profile-copy">
@@ -4339,7 +4613,7 @@ function ProfileAvatarEditor({ inputRef }) {
       <div id="profile-avatar-preview" className="profile-avatar-preview" aria-hidden="true">
         {snapshot.previewUrl
           ? <img src={snapshot.previewUrl} alt="" />
-          : user?.avatarUrl ? <img src={user.avatarUrl} alt="" /> : initials(user?.fullName || "")}
+          : user?.avatarUrl ? <AuthenticatedImage src={user.avatarUrl} alt="" /> : initials(user?.fullName || "")}
       </div>
       <div className="profile-avatar-picker-copy">
         <strong>{avatarTitle}</strong>
@@ -4371,9 +4645,22 @@ function ProfileAccountForm({ initialUser }) {
     fullName: initialUser?.fullName || "", about: initialUser?.about || "",
     showOnlineStatus: initialUser?.showOnlineStatus !== false,
     hideNotificationContent: initialUser?.hideNotificationContent === true,
-    currentPassword: "", newPassword: ""
+    currentPassword: "", newPassword: "", keyUnlockPassword: ""
   });
+  const [sessions, setSessions] = useState([]);
+  const [sessionsError, setSessionsError] = useState("");
+  const [revokingSessions, setRevokingSessions] = useState(false);
   const request = useFormRequest("polus:save-profile", "profile-error");
+
+  useEffect(() => {
+    let active = true;
+    requestJson("/api/account/sessions").then(({ sessions: activeSessions }) => {
+      if (active) setSessions(activeSessions);
+    }).catch((cause) => {
+      if (active) setSessionsError(cause.message);
+    });
+    return () => { active = false; };
+  }, []);
 
   useLayoutEffect(() => {
     const onUser = (event) => {
@@ -4386,7 +4673,8 @@ function ProfileAccountForm({ initialUser }) {
           showOnlineStatus: current.showOnlineStatus !== false,
           hideNotificationContent: current.hideNotificationContent === true,
           currentPassword: "",
-          newPassword: ""
+          newPassword: "",
+          keyUnlockPassword: "",
         });
       }
     };
@@ -4398,7 +4686,8 @@ function ProfileAccountForm({ initialUser }) {
         showOnlineStatus: user.showOnlineStatus !== false,
         hideNotificationContent: user.hideNotificationContent === true,
         currentPassword: "",
-        newPassword: ""
+        newPassword: "",
+        keyUnlockPassword: "",
       });
       document.dispatchEvent(new CustomEvent("polus:profile-avatar-preview-changed", {
         detail: { user, previewUrl: "", fileName: "" }
@@ -4415,7 +4704,8 @@ function ProfileAccountForm({ initialUser }) {
         showOnlineStatus: current.showOnlineStatus !== false,
         hideNotificationContent: current.hideNotificationContent === true,
         currentPassword: "",
-        newPassword: ""
+        newPassword: "",
+        keyUnlockPassword: "",
       });
     };
     document.addEventListener("polus:current-user-changed", onUser);
@@ -4437,6 +4727,33 @@ function ProfileAccountForm({ initialUser }) {
     onChange: update(key),
     disabled: request.submitting
   });
+  const revokeAllSessions = async () => {
+    const russian = language === "ru";
+    if (!values.currentPassword) {
+      setSessionsError(russian ? "Введите текущий пароль для подтверждения." : "Enter your current password to confirm.");
+      return;
+    }
+    if (!window.confirm(russian
+      ? "Отозвать все активные сессии, включая эту? Потребуется войти снова."
+      : "Revoke every active session, including this one? You will need to sign in again.")) return;
+    setSessionsError("");
+    setRevokingSessions(true);
+    try {
+      await requestJson("/api/account/sessions/revoke-all", {
+        method: "POST",
+        body: JSON.stringify({ currentPassword: values.currentPassword })
+      });
+      document.dispatchEvent(new CustomEvent("polus:account-session-invalid", {
+        detail: { accountKey: getActiveAccountKey() }
+      }));
+    } catch (cause) {
+      setSessionsError(cause.message === "Current password is incorrect." && russian
+        ? "Неверный текущий пароль."
+        : cause.message);
+    } finally {
+      setRevokingSessions(false);
+    }
+  };
 
   return (
     <form
@@ -4474,7 +4791,7 @@ function ProfileAccountForm({ initialUser }) {
       </section>
       <section id="profile-security" className="profile-form-section">
         <h3>{language === "ru" ? "Безопасность" : "Security"}</h3>
-        <p>{language === "ru" ? "Оставьте поля пустыми, если не хотите менять пароль." : "Leave these fields empty if you do not want to change your password."}</p>
+        <p>{language === "ru" ? "Ключ шифрования общий для этого сервера и настраивается администратором в .env. Для старого ключа укажите пароль или фразу, которыми он был запечатан." : "The encryption key is shared by this server and configured by the administrator in .env. For an older key, provide the password or phrase that sealed it."}</p>
         <div className="profile-form-fields">
           <div className="profile-form-field">
             <label className="field-label" htmlFor="profile-current-password">
@@ -4488,6 +4805,41 @@ function ProfileAccountForm({ initialUser }) {
             </label>
             <input id="profile-new-password" className="text-field" type="password" minLength={8} maxLength={128} autoComplete="new-password" {...field("newPassword")} />
           </div>
+          <div className="profile-form-field">
+            <label className="field-label" htmlFor="profile-key-unlock-password">
+              {language === "ru" ? "Старый пароль или фраза, которыми запечатан ключ (если отличаются)" : "Previous password or phrase that sealed the key (if different)"}
+            </label>
+            <input id="profile-key-unlock-password" className="text-field" type="password" autoComplete="current-password" {...field("keyUnlockPassword")} />
+          </div>
+        </div>
+        <div className="profile-active-sessions">
+          <h4>{language === "ru" ? "Активные сессии" : "Active sessions"}</h4>
+          {sessions.length
+            ? <ul>
+              {sessions.map((session) => (
+                <li key={session.id}>
+                  <strong>{session.isCurrent
+                    ? (language === "ru" ? "Это устройство" : "This device")
+                    : (language === "ru" ? "Другое устройство" : "Other device")}</strong>
+                  <span>{language === "ru" ? "Вход: " : "Signed in: "}
+                    {new Date(session.createdAt).toLocaleString(language === "ru" ? "ru-RU" : "en-US")}</span>
+                  <span>{language === "ru" ? "Срок действия до: " : "Expires: "}
+                    {new Date(session.expiresAt).toLocaleString(language === "ru" ? "ru-RU" : "en-US")}</span>
+                </li>
+              ))}
+            </ul>
+            : <p>{language === "ru" ? "Нет других активных сессий." : "No active sessions."}</p>}
+          {sessionsError && <div className="form-error" role="alert">{sessionsError}</div>}
+          <button
+            className="secondary-button"
+            type="button"
+            disabled={revokingSessions || sessions.length === 0}
+            onClick={() => void revokeAllSessions()}
+          >
+            {revokingSessions
+              ? "…"
+              : language === "ru" ? "Отозвать все сессии" : "Revoke all sessions"}
+          </button>
         </div>
       </section>
       <FormError id="profile-error" />
@@ -4495,6 +4847,275 @@ function ProfileAccountForm({ initialUser }) {
         {language === "ru" ? "Сохранить" : "Save"}
       </button>
     </form>
+  );
+}
+
+const DEFAULT_PROFILE_DESIGN = {
+  theme: "aurora",
+  accentColor: "#4d83d1",
+  font: "system",
+  motionEnabled: true,
+  gradientStart: "#101927",
+  gradientEnd: "#344f82",
+  gradientDirection: "diagonal",
+  effects: "glow",
+  avatarFrame: "gradient",
+  animation: "subtle",
+  backgroundImageEnabled: false,
+  coverParallax: false
+};
+
+function ProfileDesignEditor({ user }) {
+  const language = useCurrentLanguage();
+  const russian = language === "ru";
+  const [design, setDesign] = useState(() => ({ ...DEFAULT_PROFILE_DESIGN, ...(user.profileDesign || {}) }));
+  const [coverFile, setCoverFile] = useState(null);
+  const [coverPreview, setCoverPreview] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [saved, setSaved] = useState(false);
+  const isVideoCover = coverFile?.type.startsWith("video/");
+
+  const updateDesign = (changes) => {
+    setDesign((current) => ({ ...current, ...changes }));
+    setSaved(false);
+  };
+
+  useEffect(() => {
+    if (!coverFile) {
+      setCoverPreview("");
+      return undefined;
+    }
+    const preview = URL.createObjectURL(coverFile);
+    setCoverPreview(preview);
+    return () => URL.revokeObjectURL(preview);
+  }, [coverFile]);
+
+  const save = async () => {
+    setBusy(true);
+    setError("");
+    setSaved(false);
+    try {
+      if (coverFile) {
+        await requestJson("/api/account/profile-cover", {
+          method: "POST",
+          headers: { "Content-Type": coverFile.type || "application/octet-stream" },
+          body: coverFile
+        });
+      }
+      const { user: updatedUser } = await requestJson("/api/account/profile-design", {
+        method: "PATCH",
+        body: JSON.stringify(design)
+      });
+      setCoverFile(null);
+      setDesign(updatedUser.profileDesign || DEFAULT_PROFILE_DESIGN);
+      document.dispatchEvent(new CustomEvent("polus:profile-saved", { detail: { user: updatedUser } }));
+      setSaved(true);
+    } catch (cause) {
+      setError(cause.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const removeCover = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const { user: updatedUser } = await requestJson("/api/account/profile-cover", { method: "DELETE" });
+      setCoverFile(null);
+      setDesign((current) => ({ ...current, backgroundImageEnabled: false }));
+      document.dispatchEvent(new CustomEvent("polus:profile-saved", { detail: { user: updatedUser } }));
+      setSaved(true);
+    } catch (cause) {
+      setError(cause.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const resetDesign = () => {
+    setDesign({ ...DEFAULT_PROFILE_DESIGN });
+    setCoverFile(null);
+    setSaved(false);
+  };
+  const showError = (cause) => setError(cause.status === 404
+    ? russian
+      ? "Сервер не поддерживает настройки оформления профиля. Обновите приложение на сервере и перезапустите его."
+      : "This server does not support profile design settings yet. Update and restart the server."
+    : cause.message);
+
+  return (
+    <div className="profile-design-editor">
+      <div className="profile-form-fields">
+        <div className="profile-form-field">
+          <label className="field-label" htmlFor="public-profile-theme">{russian ? "Тема страницы" : "Profile theme"}</label>
+          <select
+            id="public-profile-theme"
+            className="text-field"
+            value={design.theme}
+            disabled={busy}
+            onChange={(event) => updateDesign({
+              theme: event.target.value,
+              ...(event.target.value === "ocean" ? { gradientStart: "#dff7f8", gradientEnd: "#b9dbe8" }
+                : event.target.value === "sunset" ? { gradientStart: "#fff0df", gradientEnd: "#e9c2c9" }
+                  : { gradientStart: "#101927", gradientEnd: "#344f82" })
+            })}
+          >
+            <option value="aurora">{russian ? "Северное сияние" : "Northern lights"}</option>
+            <option value="ocean">{russian ? "Океан" : "Ocean"}</option>
+            <option value="sunset">{russian ? "Закат" : "Sunset"}</option>
+          </select>
+        </div>
+        <div className="profile-form-field">
+          <label className="field-label" htmlFor="public-profile-accent">{russian ? "Акцентный цвет" : "Accent color"}</label>
+          <input
+            id="public-profile-accent"
+            className="text-field profile-design-color"
+            type="color"
+            value={design.accentColor}
+            disabled={busy}
+            onChange={(event) => updateDesign({ accentColor: event.target.value })}
+          />
+        </div>
+        <div className="profile-form-field">
+          <label className="field-label" htmlFor="public-profile-font">{russian ? "Шрифт" : "Font"}</label>
+          <select
+            id="public-profile-font"
+            className="text-field"
+            value={design.font}
+            disabled={busy}
+            onChange={(event) => updateDesign({ font: event.target.value })}
+          >
+            <option value="system">{russian ? "Системный" : "System"}</option>
+            <option value="rounded">{russian ? "Округлый" : "Rounded"}</option>
+            <option value="serif">{russian ? "С засечками" : "Serif"}</option>
+          </select>
+        </div>
+      </div>
+      <label className="profile-toggle">
+        <input
+          type="checkbox"
+          checked={design.motionEnabled}
+          disabled={busy}
+          onChange={(event) => updateDesign({ motionEnabled: event.target.checked })}
+        />
+        <span>{russian ? "Ненавязчивые анимации" : "Subtle animations"}</span>
+      </label>
+      <div className="profile-form-fields profile-design-custom-fields">
+        <div className="profile-form-field">
+          <label className="field-label" htmlFor="public-profile-gradient-start">{russian ? "Цвет начала градиента" : "Gradient start"}</label>
+          <input id="public-profile-gradient-start" className="text-field profile-design-color" type="color" value={design.gradientStart} disabled={busy} onChange={(event) => updateDesign({ gradientStart: event.target.value })} />
+        </div>
+        <div className="profile-form-field">
+          <label className="field-label" htmlFor="public-profile-gradient-end">{russian ? "Цвет конца градиента" : "Gradient end"}</label>
+          <input id="public-profile-gradient-end" className="text-field profile-design-color" type="color" value={design.gradientEnd} disabled={busy} onChange={(event) => updateDesign({ gradientEnd: event.target.value })} />
+        </div>
+        <div className="profile-form-field">
+          <label className="field-label" htmlFor="public-profile-gradient-direction">{russian ? "Направление градиента" : "Gradient direction"}</label>
+          <select id="public-profile-gradient-direction" className="text-field" value={design.gradientDirection} disabled={busy} onChange={(event) => updateDesign({ gradientDirection: event.target.value })}>
+            <option value="diagonal">{russian ? "Диагональ" : "Diagonal"}</option>
+            <option value="horizontal">{russian ? "Горизонтально" : "Horizontal"}</option>
+            <option value="vertical">{russian ? "Вертикально" : "Vertical"}</option>
+          </select>
+        </div>
+        <div className="profile-form-field">
+          <label className="field-label" htmlFor="public-profile-effects">{russian ? "Декоративный эффект" : "Decorative effect"}</label>
+          <select id="public-profile-effects" className="text-field" value={design.effects} disabled={busy} onChange={(event) => updateDesign({ effects: event.target.value })}>
+            <option value="none">{russian ? "Без эффектов" : "None"}</option>
+            <option value="glow">{russian ? "Свечение" : "Glow"}</option>
+            <option value="particles">{russian ? "Мягкие частицы" : "Soft particles"}</option>
+          </select>
+        </div>
+        <div className="profile-form-field">
+          <label className="field-label" htmlFor="public-profile-avatar-frame">{russian ? "Рамка аватара" : "Avatar frame"}</label>
+          <select id="public-profile-avatar-frame" className="text-field" value={design.avatarFrame} disabled={busy} onChange={(event) => updateDesign({ avatarFrame: event.target.value })}>
+            <option value="gradient">{russian ? "Градиентная" : "Gradient"}</option>
+            <option value="glow">{russian ? "Сияющая" : "Glow"}</option>
+            <option value="double">{russian ? "Двойная" : "Double"}</option>
+            <option value="none">{russian ? "Без рамки" : "None"}</option>
+          </select>
+        </div>
+        <div className="profile-form-field">
+          <label className="field-label" htmlFor="public-profile-animation">{russian ? "Анимация" : "Animation"}</label>
+          <select id="public-profile-animation" className="text-field" value={design.animation} disabled={busy} onChange={(event) => updateDesign({ animation: event.target.value })}>
+            <option value="subtle">{russian ? "Плавная" : "Subtle"}</option>
+            <option value="float">{russian ? "Парение" : "Float"}</option>
+            <option value="gradient">{russian ? "Живой градиент" : "Animated gradient"}</option>
+            <option value="none">{russian ? "Без анимации" : "None"}</option>
+          </select>
+        </div>
+      </div>
+      <label className="profile-cover-picker">
+        <span>{russian ? "Обложка (изображение, GIF или MP4/WebM, до 8 МБ)" : "Cover (image, GIF or MP4/WebM, up to 8 MB)"}</span>
+        <input
+          type="file"
+          accept="image/png,image/jpeg,image/gif,image/webp,video/mp4,video/webm"
+          disabled={busy}
+          onChange={(event) => {
+            const file = event.currentTarget.files?.[0] || null;
+            if (file && file.size > 8 * 1024 * 1024) {
+              setError(russian ? "Файл обложки должен быть не больше 8 МБ." : "Cover files must not exceed 8 MB.");
+              setCoverFile(null);
+              return;
+            }
+            setError("");
+            setCoverFile(file);
+            if (file?.type.startsWith("video/")) updateDesign({ backgroundImageEnabled: false });
+            setSaved(false);
+          }}
+        />
+      </label>
+      <label className="profile-toggle">
+        <input type="checkbox" checked={design.backgroundImageEnabled} disabled={busy || isVideoCover || (!coverFile && !user.profileCoverUrl) || (!coverFile && user.profileCoverMimeType?.startsWith("video/"))} onChange={(event) => updateDesign({ backgroundImageEnabled: event.target.checked })} />
+        <span>{russian ? "Использовать обложку как фон страницы" : "Use cover as page background"}</span>
+      </label>
+      <label className="profile-toggle">
+        <input type="checkbox" checked={design.coverParallax} disabled={busy || !design.motionEnabled} onChange={(event) => updateDesign({ coverParallax: event.target.checked })} />
+        <span>{russian ? "Параллакс обложки" : "Cover parallax"}</span>
+      </label>
+      <div
+        className={`profile-design-preview profile-theme-${design.theme} profile-font-${design.font} profile-effects-${design.effects} profile-animation-${design.animation}${design.motionEnabled ? "" : " reduce-profile-motion"}`}
+        style={{
+          "--profile-accent": design.accentColor,
+          "--profile-gradient-start": design.gradientStart,
+          "--profile-gradient-end": design.gradientEnd,
+          "--profile-gradient-angle": design.gradientDirection === "horizontal" ? "90deg" : design.gradientDirection === "vertical" ? "180deg" : "145deg"
+        }}
+      >
+        {coverPreview
+          ? isVideoCover
+            ? <video src={coverPreview} muted autoPlay loop playsInline aria-hidden="true" />
+            : <img src={coverPreview} alt="" />
+          : user.profileCoverUrl && (user.profileCoverMimeType?.startsWith("video/")
+            ? <AuthenticatedVideo src={user.profileCoverUrl} muted autoPlay loop playsInline aria-hidden="true" />
+            : <AuthenticatedImage src={user.profileCoverUrl} alt="" />)}
+        <span className={`profile-design-preview-avatar profile-avatar-frame-${design.avatarFrame}`} aria-hidden="true">
+          {user.avatarUrl ? <AuthenticatedImage src={user.avatarUrl} alt="" /> : initials(user.fullName)}
+        </span>
+        {design.effects === "particles" && <span className="profile-design-preview-particles" aria-hidden="true" />}
+        <div className="profile-design-preview-copy">
+          <span>{russian ? "Предпросмотр" : "Preview"}</span>
+          <strong>{user.fullName}</strong>
+          <small>@{user.username}</small>
+        </div>
+      </div>
+      {user.profileCoverUrl && !coverFile && (
+        <button className="text-button profile-cover-remove" type="button" disabled={busy} onClick={() => void removeCover()}>
+          {russian ? "Удалить обложку" : "Remove cover"}
+        </button>
+      )}
+      {error && <div className="form-error" role="alert">{error}</div>}
+      {saved && <p className="profile-design-saved" role="status">{russian ? "Оформление сохранено." : "Profile design saved."}</p>}
+      <div className="profile-design-actions">
+        <button className="secondary-button" type="button" disabled={busy} onClick={resetDesign}>
+          {russian ? "Сбросить оформление" : "Reset design"}
+        </button>
+        <button className="primary-button" type="button" disabled={busy} onClick={() => void save()}>
+          {busy ? "…" : russian ? "Сохранить оформление" : "Save design"}
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -4537,7 +5158,7 @@ function ProfileSettingsPage({ user, onBack, onUserUpdate }) {
         <aside className="profile-page-sidebar">
           <div className="profile-page-user">
             <div className="profile-page-avatar">
-              {profile?.avatarUrl ? <img src={profile.avatarUrl} alt="" /> : initials(profile?.fullName || "")}
+              {profile?.avatarUrl ? <AuthenticatedImage src={profile.avatarUrl} alt="" /> : initials(profile?.fullName || "")}
             </div>
             <div className="profile-page-user-copy">
               <strong>{profile?.fullName || ""}</strong>
@@ -4573,8 +5194,9 @@ function ProfileSettingsPage({ user, onBack, onUserUpdate }) {
           <section id="profile-appearance" className="profile-page-section">
             <div className="profile-page-section-title">
               <h2>{russian ? "Оформление" : "Appearance"}</h2>
-              <p>{russian ? "Язык, цветовая тема и звук сохраняются на этом устройстве." : "Language, theme, and sound settings are saved on this device."}</p>
+              <p>{russian ? "Язык и тема интерфейса сохраняются на этом устройстве. Оформление публичной страницы видно другим пользователям." : "Interface settings are saved on this device. Your public profile design is visible to other users."}</p>
             </div>
+            <ProfileDesignEditor user={profile || user} />
             <label className="settings-row profile-language-row" htmlFor="profile-settings-language">
               <span className="settings-row-copy">
                 <strong>{russian ? "Язык приложения" : "App language"}</strong>
@@ -5030,7 +5652,10 @@ function MediaViewer() {
         onClick={() => navigate(-1)}
       >‹</button>
       {item && (
-        <img src={`/api/attachments/${encodeURIComponent(item.id)}`} alt={item.name || ""} />
+        <AuthenticatedImage
+          src={item.decryptedUrl || `/api/attachments/${encodeURIComponent(item.id)}`}
+          alt={item.name || ""}
+        />
       )}
       <button
         id="media-viewer-next"
@@ -5252,7 +5877,11 @@ function ReactDialogs({ user }) {
     const openDialog = (event) => show(event.detail.id);
     const closeDialog = (event) => close(event.detail.id);
     const ids = [
+<<<<<<< Updated upstream
       "chat-info-dialog", "chat-search-dialog", "forward-message-dialog", "profile-view-dialog",
+=======
+      "chat-info-dialog", "chat-search-dialog", "forward-message-dialog",
+>>>>>>> Stashed changes
       "media-viewer", "channel-dialog", "group-dialog", "settings-dialog",
       "user-picker-dialog", "contact-share-dialog"
     ];
@@ -5292,10 +5921,13 @@ function ReactDialogs({ user }) {
       <ChatSearchDialog />
       <ForwardMessageDialog />
 
+<<<<<<< Updated upstream
       <dialog id="profile-view-dialog" className="dialog profile-view-dialog">
         <UserProfileContent />
       </dialog>
 
+=======
+>>>>>>> Stashed changes
       <MediaViewer />
 
       <dialog id="channel-dialog" className="dialog">
@@ -5378,7 +6010,11 @@ function AccountManagementDialog({ open, onClose, accounts, activeAccountKey, on
             >
               <span className="account-switcher-avatar">
                 {account.user.avatarUrl
+<<<<<<< Updated upstream
                   ? <img src={accountApiUrl(account.user.avatarUrl, account.key)} alt="" />
+=======
+                  ? <AuthenticatedImage src={account.user.avatarUrl} accountKey={account.key} alt="" />
+>>>>>>> Stashed changes
                   : initials(account.user.fullName || account.user.username)}
               </span>
               <span className="profile-copy">
@@ -5440,6 +6076,18 @@ function MessengerShell({
   const [accountsDialogOpen, setAccountsDialogOpen] = useState(false);
   const [profilePage, setProfilePage] = useState(() => window.location.pathname === "/profile");
   const [contactsPage, setContactsPage] = useState(() => window.location.pathname === "/contacts");
+<<<<<<< Updated upstream
+=======
+  const [publicProfileUsername, setPublicProfileUsername] = useState(() => {
+    const match = /^\/users\/([^/]+)$/.exec(window.location.pathname);
+    if (!match) return null;
+    try {
+      return decodeURIComponent(match[1]);
+    } catch {
+      return null;
+    }
+  });
+>>>>>>> Stashed changes
   const [channelProfileId, setChannelProfileId] = useState(() =>
     /^\/channels\/([^/]+)$/.exec(window.location.pathname)?.[1] || null);
   const [channelSettingsId, setChannelSettingsId] = useState(() =>
@@ -5482,6 +6130,7 @@ function MessengerShell({
     const accountKey = getActiveAccountKey();
     let disposeController;
     let eventStream = null;
+    let hasReportedStreamError = false;
     let presenceTimer = null;
     let currentConversation = null;
     let activeChannelSettingsId = /^\/channels\/([^/]+)\/settings$/.exec(window.location.pathname)?.[1] || null;
@@ -5506,6 +6155,10 @@ function MessengerShell({
       }
       setContactsPage(true);
       setProfilePage(false);
+<<<<<<< Updated upstream
+=======
+      setPublicProfileUsername(null);
+>>>>>>> Stashed changes
       setChannelProfileId(null);
       setChannelSettingsId(null);
       setGroupSettingsId(null);
@@ -5538,13 +6191,16 @@ function MessengerShell({
         if (!forceHidden && cause.name !== "AbortError") console.error(cause);
       });
     };
-    const handleOpenProfilePage = () => {
+    const handleOpenProfilePage = (event) => {
       setMenuOpen(false);
-      if (window.location.pathname !== "/profile") {
-        window.history.pushState({ polusPage: true, polusProfilePage: true }, "", "/profile");
+      const section = event.detail?.section;
+      const profilePath = section === "appearance" ? "/profile#profile-appearance" : "/profile";
+      if (`${window.location.pathname}${window.location.hash}` !== profilePath) {
+        window.history.pushState({ polusPage: true, polusProfilePage: true }, "", profilePath);
       }
       setContactsPage(false);
       setProfilePage(true);
+      setPublicProfileUsername(null);
       setChannelProfileId(null);
       setInviteToken(null);
       window.setTimeout(() => void reportChatViewingState(), 0);
@@ -5555,6 +6211,7 @@ function MessengerShell({
       window.history.pushState({ polusPage: true }, "", `/channels/${encodeURIComponent(channelId)}`);
       setContactsPage(false);
       setProfilePage(false);
+      setPublicProfileUsername(null);
       setChannelProfileId(channelId);
       setChannelSettingsId(null);
       setInviteToken(null);
@@ -5570,6 +6227,7 @@ function MessengerShell({
       window.history.pushState({ polusPage: true }, "", `/channels/${encodeURIComponent(channelId)}/settings`);
       setContactsPage(false);
       setProfilePage(false);
+      setPublicProfileUsername(null);
       setChannelProfileId(null);
       setChannelSettingsId(channelId);
       setInviteToken(null);
@@ -5585,6 +6243,10 @@ function MessengerShell({
       window.history.pushState({ polusPage: true }, "", `/groups/${encodeURIComponent(groupId)}/settings`);
       setContactsPage(false);
       setProfilePage(false);
+<<<<<<< Updated upstream
+=======
+      setPublicProfileUsername(null);
+>>>>>>> Stashed changes
       setChannelProfileId(null);
       setChannelSettingsId(null);
       setGroupSettingsId(groupId);
@@ -5596,6 +6258,10 @@ function MessengerShell({
       window.history.replaceState({}, "", "/");
       setContactsPage(false);
       setProfilePage(false);
+<<<<<<< Updated upstream
+=======
+      setPublicProfileUsername(null);
+>>>>>>> Stashed changes
       setChannelProfileId(null);
       setChannelSettingsId(null);
       setGroupSettingsId(null);
@@ -5617,6 +6283,7 @@ function MessengerShell({
         window.history.replaceState({}, "", "/");
         setContactsPage(false);
         setProfilePage(false);
+        setPublicProfileUsername(null);
         setChannelProfileId(null);
         setChannelSettingsId(null);
         setInviteToken(null);
@@ -5652,12 +6319,27 @@ function MessengerShell({
         }
         return;
       }
+<<<<<<< Updated upstream
+=======
+      if (/^\/users\/[^/]+$/.test(window.location.pathname)) {
+        if (window.history.state?.polusPage) {
+          window.history.back();
+        } else {
+          window.history.replaceState({}, "", "/");
+          setPublicProfileUsername(null);
+          setProfilePage(false);
+          setContactsPage(false);
+        }
+        return;
+      }
+>>>>>>> Stashed changes
       if (window.history.state?.polusPage || window.history.state?.polusProfilePage) {
         window.history.back();
       } else {
         window.history.replaceState({}, "", "/");
         setContactsPage(false);
         setProfilePage(false);
+        setPublicProfileUsername(null);
         setChannelProfileId(null);
         setChannelSettingsId(null);
         setGroupSettingsId(null);
@@ -5675,6 +6357,10 @@ function MessengerShell({
         activeGroupSettingsId = null;
         window.history.replaceState({}, "", "/");
         setProfilePage(false);
+<<<<<<< Updated upstream
+=======
+        setPublicProfileUsername(null);
+>>>>>>> Stashed changes
         setChannelProfileId(null);
         setChannelSettingsId(null);
         setGroupSettingsId(null);
@@ -5696,6 +6382,7 @@ function MessengerShell({
       }
       setContactsPage(false);
       setProfilePage(false);
+      setPublicProfileUsername(null);
       setChannelProfileId(null);
       setChannelSettingsId(null);
       setGroupSettingsId(null);
@@ -5715,9 +6402,12 @@ function MessengerShell({
             ? "Это сообщество больше недоступно."
             : "This community is no longer available.");
         }
+<<<<<<< Updated upstream
         document.dispatchEvent(new CustomEvent("polus:close-dialog", {
           detail: { id: "profile-view-dialog" }
         }));
+=======
+>>>>>>> Stashed changes
         document.dispatchEvent(new CustomEvent("polus:page-open-chat", { detail: { conversation } }));
       } catch (cause) {
         document.dispatchEvent(new CustomEvent("polus:notify", { detail: cause.message }));
@@ -5729,6 +6419,15 @@ function MessengerShell({
       const settingsGroupId = activeGroupSettingsId;
       setProfilePage(pathname === "/profile");
       setContactsPage(pathname === "/contacts");
+<<<<<<< Updated upstream
+=======
+      const userProfile = /^\/users\/([^/]+)$/.exec(pathname);
+      try {
+        setPublicProfileUsername(userProfile ? decodeURIComponent(userProfile[1]) : null);
+      } catch {
+        setPublicProfileUsername(null);
+      }
+>>>>>>> Stashed changes
       setChannelProfileId(/^\/channels\/([^/]+)$/.exec(pathname)?.[1] || null);
       setChannelSettingsId(/^\/channels\/([^/]+)\/settings$/.exec(pathname)?.[1] || null);
       setGroupSettingsId(/^\/groups\/([^/]+)\/settings$/.exec(pathname)?.[1] || null);
@@ -5756,6 +6455,7 @@ function MessengerShell({
     };
     const connectRealtime = () => {
       eventStream?.close();
+<<<<<<< Updated upstream
       const source = new EventSource(accountApiUrl("/api/stream", accountKey));
       eventStream = source;
       let hasOpened = false;
@@ -5777,13 +6477,34 @@ function MessengerShell({
       });
       source.addEventListener("error", () => {
         if (eventStream === source && source.readyState === EventSource.CLOSED) {
+=======
+      const source = connectEventStream("/api/stream", {
+        accountKey,
+        onEvent: (event) => {
+          if (event.type === "message") dispatchRealtimeEvent("polus:realtime-message", event);
+          else if (event.type === "chat-updated") dispatchRealtimeEvent("polus:realtime-chat-updated", event);
+          else if (event.type === "message-updated") dispatchRealtimeEvent("polus:realtime-message-updated", event);
+          else if (event.type === "message-deleted") dispatchRealtimeEvent("polus:realtime-message-deleted", event);
+          else if (event.type === "messages-read") dispatchRealtimeEvent("polus:realtime-messages-read", event);
+          else if (event.type === "resync") document.dispatchEvent(new CustomEvent("polus:realtime-resync"));
+        },
+        onOpen: ({ reconnected }) => {
+          hasReportedStreamError = false;
+          if (reconnected) document.dispatchEvent(new CustomEvent("polus:realtime-resync"));
+        },
+        onError: (cause) => {
+          if (hasReportedStreamError) return;
+          hasReportedStreamError = true;
+          console.error("Realtime stream failed:", cause);
+>>>>>>> Stashed changes
           document.dispatchEvent(new CustomEvent("polus:notify", {
             detail: languageRef.current === "ru"
-              ? "Не удалось подключиться к обновлениям. Проверьте соединение."
-              : "Unable to connect to live updates. Check your connection."
+              ? "Не удалось подключиться к обновлениям. Повторная попытка..."
+              : "Unable to connect to live updates. Retrying..."
           }));
         }
       });
+      eventStream = source;
     };
     const handlePresenceConversation = (event) => {
       currentConversation = event.detail.conversation || null;
@@ -5831,6 +6552,10 @@ function MessengerShell({
         window.history.replaceState({}, "", "/");
         setContactsPage(false);
         setProfilePage(false);
+<<<<<<< Updated upstream
+=======
+        setPublicProfileUsername(null);
+>>>>>>> Stashed changes
         setChannelProfileId(null);
         setChannelSettingsId(null);
         setGroupSettingsId(null);
@@ -5879,7 +6604,11 @@ function MessengerShell({
     const handleCreateChannel = (event) => void handleCreateRequest(event);
     const handleCreateGroup = (event) => void handleCreateRequest(event);
     const handleSaveProfile = async (event) => {
-      const { avatarFile, ...profile } = event.detail.values;
+      const {
+        avatarFile,
+        keyUnlockPassword,
+        ...profile
+      } = event.detail.values;
       try {
         if (avatarFile) {
           if (avatarFile.size > 5 * 1024 * 1024) {
@@ -5894,26 +6623,47 @@ function MessengerShell({
             body: avatar
           });
         }
-        const { user: updatedUser } = await requestJson("/api/account", {
+        const encryptionKeyUpdate = profile.newPassword
+          ? await prepareEncryptionKeyPasswordChange(
+            profile.currentPassword,
+            profile.newPassword,
+            getActiveAccountKey(),
+            keyUnlockPassword || profile.currentPassword
+          )
+          : null;
+        const { user: updatedUser, sessionsRevoked } = await requestJson("/api/account", {
           method: "PATCH",
           body: JSON.stringify({
             ...profile,
             fullName: profile.fullName.trim(),
-            about: profile.about.trim()
+            about: profile.about.trim(),
+            ...(encryptionKeyUpdate ? { encryptionKeyUpdate } : {})
           })
         });
         document.dispatchEvent(new CustomEvent("polus:profile-saved", {
           detail: { user: updatedUser }
         }));
         document.dispatchEvent(new CustomEvent("polus:notify", {
-          detail: languageRef.current === "ru" ? "Настройки аккаунта сохранены." : "Account settings saved."
+          detail: sessionsRevoked
+            ? languageRef.current === "ru"
+              ? "Пароль изменён. Войдите снова."
+              : "Password changed. Sign in again."
+            : languageRef.current === "ru" ? "Настройки аккаунта сохранены." : "Account settings saved."
         }));
         event.detail.resolve(updatedUser);
+        if (sessionsRevoked) {
+          document.dispatchEvent(new CustomEvent("polus:account-session-invalid", {
+            detail: { accountKey: getActiveAccountKey() }
+          }));
+        }
       } catch (cause) {
         const currentLanguage = languageRef.current;
-        const message = cause.message === "Current password is incorrect."
-          ? (currentLanguage === "ru" ? "Неверный текущий пароль." : cause.message)
-          : cause.message;
+        const russianErrors = {
+          "Current password is incorrect.": "Неверный текущий пароль.",
+          "Unable to unlock the legacy encryption key. Check the password that sealed it.": "Не удалось открыть старый ключ. Проверьте пароль, которым он был запечатан.",
+          "Unable to unlock the legacy signing key. Check the password that sealed it.": "Не удалось открыть старый ключ подписи. Проверьте пароль, которым он был запечатан."
+        };
+        const message = currentLanguage === "ru" ? (russianErrors[cause.message] || cause.message) : cause.message;
         event.detail.reject(new Error(message));
       }
     };
@@ -5934,15 +6684,39 @@ function MessengerShell({
         message.text
       );
       if (value === null || !value.trim() || value.trim() === message.text) return;
+      if (Array.from(value.trim()).length > 4000) {
+        document.dispatchEvent(new CustomEvent("polus:notify", {
+          detail: currentLanguage === "ru"
+            ? "Сообщение должно содержать от 1 до 4000 символов."
+            : "Message must contain 1–4000 characters."
+        }));
+        return;
+      }
       try {
+        const recipients = await getConversationEncryptionKeys(message.conversationId, activeAccountKey);
+        const encryptedText = await encryptMessagePayload(user.id, recipients, message.conversationId, {
+          text: value,
+          mediaType: message.mediaType || null,
+          attachments: (message.attachments || []).map((attachment) => ({
+            id: attachment.id,
+            name: attachment.name,
+            mimeType: attachment.mimeType,
+            size: attachment.size,
+            encrypted: attachment.encrypted === true,
+            ...(attachment.encryption ? attachment.encryption : {})
+          }))
+        });
         const updated = await requestJson(`/api/messages/${encodeURIComponent(message.id)}`, {
           method: "PATCH",
-          body: JSON.stringify({ text: value })
+          body: JSON.stringify({ text: encryptedText, encrypted: true })
         });
         document.dispatchEvent(new CustomEvent("polus:message-edited", { detail: { message: updated } }));
       } catch (cause) {
+        const notice = cause.code === "ENCRYPTION_KEY_CHANGED"
+          ? await getEncryptionKeyChangeNotice(cause, currentLanguage)
+          : localizeComposerError(cause.message, currentLanguage);
         document.dispatchEvent(new CustomEvent("polus:notify", {
-          detail: localizeComposerError(cause.message, currentLanguage)
+          detail: notice
         }));
       }
     };
@@ -6031,13 +6805,19 @@ function MessengerShell({
 
   useEffect(() => {
     document.documentElement.lang = language;
-    document.title = language === "ru" ? "Полюс — мессенджер" : "Polus — Messenger";
-  }, [language]);
+    document.title = publicProfileUsername
+      ? `${language === "ru" ? "Профиль" : "Profile"} @${publicProfileUsername} — Полюс`
+      : language === "ru" ? "Полюс — мессенджер" : "Polus — Messenger";
+  }, [language, publicProfileUsername]);
 
   return (
     <>
     <main id="messenger-view" className="messenger-shell" hidden={
+<<<<<<< Updated upstream
       hidden || profilePage || contactsPage || Boolean(channelProfileId) || Boolean(channelSettingsId)
+=======
+      hidden || profilePage || contactsPage || Boolean(publicProfileUsername) || Boolean(channelProfileId) || Boolean(channelSettingsId)
+>>>>>>> Stashed changes
       || Boolean(groupSettingsId) || Boolean(inviteToken)
     }>
       <aside id="chat-sidebar" className="sidebar">
@@ -6109,7 +6889,11 @@ function MessengerShell({
         </div>
         <MessageContextMenu />
         <ToastNotice />
+<<<<<<< Updated upstream
         <Composer />
+=======
+        <Composer user={user} accountKey={activeAccountKey} />
+>>>>>>> Stashed changes
         <ChatDeleteDialog />
       </section>
     </main>
@@ -6129,6 +6913,18 @@ function MessengerShell({
         onBack={() => document.dispatchEvent(new CustomEvent("polus:profile-page-back"))}
       />
     )}
+<<<<<<< Updated upstream
+=======
+    {!hidden && publicProfileUsername && (
+      <UserProfileContent
+        key={publicProfileUsername}
+        username={publicProfileUsername}
+        currentUserId={user.id}
+        currentUsername={user.username}
+        onBack={() => document.dispatchEvent(new CustomEvent("polus:profile-page-back"))}
+      />
+    )}
+>>>>>>> Stashed changes
     {!hidden && profilePage && (
       <ProfileSettingsPage
         user={profileUser}
@@ -6214,7 +7010,14 @@ function AuthScreen({ language, onLanguageChange, onAuthenticated, accountKey, o
         body: JSON.stringify(payload),
         accountKey
       });
+<<<<<<< Updated upstream
       onAuthenticated(user, accountKey);
+=======
+      if (registering) {
+        await ensureEncryptionIdentity(user.id, payload.password, "", accountKey);
+      }
+      await onAuthenticated(user, accountKey);
+>>>>>>> Stashed changes
     } catch (cause) {
       setError(cause.message);
     } finally {
@@ -6334,6 +7137,71 @@ function AuthScreen({ language, onLanguageChange, onAuthenticated, accountKey, o
   );
 }
 
+function EncryptionUnlock({ user, accountKey, language, onUnlocked }) {
+  const [accountPassword, setAccountPassword] = useState("");
+  const [legacyEncryptionPassphrase, setLegacyEncryptionPassphrase] = useState("");
+  const [error, setError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const russian = language === "ru";
+
+  async function unlock(event) {
+    event.preventDefault();
+    setError("");
+    setSubmitting(true);
+    try {
+      await ensureEncryptionIdentity(user.id, accountPassword, legacyEncryptionPassphrase, accountKey);
+      setAccountPassword("");
+      setLegacyEncryptionPassphrase("");
+      onUnlocked();
+    } catch (cause) {
+      setError(cause.message);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <main className="auth-view">
+      <form className="auth-card" onSubmit={(event) => void unlock(event)}>
+        <div className="auth-brand"><img src="/logo.svg" alt="" className="auth-logo" /><span>ПОЛЮС</span></div>
+        <h1>{russian ? "Защищённые сообщения" : "Encrypted messages"}</h1>
+        <p>{russian
+          ? "Ключ шифрования автоматически передаётся сервером из его конфигурации. Для старого ключа может понадобиться прежняя фраза один раз, чтобы перенести его на общий ключ."
+          : "The encryption key is supplied by the server configuration. An older key may require its previous phrase once to migrate it to the shared key."}</p>
+        <label className="field-label" htmlFor="encryption-unlock-passphrase">
+          {russian ? "Прежняя фраза (только для старого ключа)" : "Previous phrase (legacy keys only)"}
+        </label>
+        <input
+          id="encryption-unlock-passphrase"
+          className="text-field"
+          type="password"
+          autoComplete="current-password"
+          maxLength={128}
+          value={legacyEncryptionPassphrase}
+          onChange={(event) => setLegacyEncryptionPassphrase(event.target.value)}
+        />
+        <label className="field-label" htmlFor="encryption-unlock-account-password">
+          {russian
+            ? "Пароль аккаунта (только если старый ключ был запечатан им)"
+            : "Account password (only if an older key was sealed with it)"}
+        </label>
+        <input
+          id="encryption-unlock-account-password"
+          className="text-field"
+          type="password"
+          autoComplete="current-password"
+          value={accountPassword}
+          onChange={(event) => setAccountPassword(event.target.value)}
+        />
+        {error && <div className="form-error" role="alert">{error}</div>}
+        <button className="primary-button" type="submit" disabled={submitting}>
+          {submitting ? "…" : (russian ? "Разблокировать" : "Unlock")}
+        </button>
+      </form>
+    </main>
+  );
+}
+
 export default function App() {
   const [language, setLanguage] = useState(() => localStorage.getItem("polus-language") === "en" ? "en" : "ru");
   const [theme, setTheme] = useState(() => {
@@ -6347,6 +7215,8 @@ export default function App() {
   const [pendingAccountKey, setPendingAccountKey] = useState(() => createAccountKey());
   const [addingAccount, setAddingAccount] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [encryptionReady, setEncryptionReady] = useState(false);
+  const [encryptionChecking, setEncryptionChecking] = useState(false);
   const [error, setError] = useState("");
   const accountsRef = useRef(accounts);
   accountsRef.current = accounts;
@@ -6438,9 +7308,17 @@ export default function App() {
               || validAccounts.find((account) => account.key === savedActiveKey)
               || validAccounts[0];
             if (selected) {
+<<<<<<< Updated upstream
               setActiveAccountKey(selected.key);
               setActiveAccountKeyState(selected.key);
               setUser(selected.user);
+=======
+              const identityReady = await hasReadyEncryptionIdentity(selected.user.id, selected.key);
+              setActiveAccountKey(selected.key);
+              setActiveAccountKeyState(selected.key);
+              setUser(selected.user);
+              setEncryptionReady(identityReady);
+>>>>>>> Stashed changes
               if (requestedUserId) {
                 const url = new URL(window.location.href);
                 url.searchParams.delete("accountUserId");
@@ -6465,6 +7343,10 @@ export default function App() {
         setActiveAccountKey(key);
         setActiveAccountKeyState(key);
         setUser(attachedUser);
+<<<<<<< Updated upstream
+=======
+        setEncryptionReady(await hasReadyEncryptionIdentity(attachedUser.id, key));
+>>>>>>> Stashed changes
       } catch (cause) {
         if (active) setError(cause.message);
       } finally {
@@ -6485,6 +7367,22 @@ export default function App() {
     setActiveAccountKey(key);
     setActiveAccountKeyState(key);
     setUser(selected.user);
+<<<<<<< Updated upstream
+=======
+    setEncryptionReady(false);
+    setEncryptionChecking(true);
+    void hasReadyEncryptionIdentity(selected.user.id, key).then((ready) => {
+      if (getActiveAccountKey() === key) {
+        setEncryptionReady(ready);
+        setEncryptionChecking(false);
+      }
+    }).catch((cause) => {
+      if (getActiveAccountKey() === key) {
+        setError(cause.message);
+        setEncryptionChecking(false);
+      }
+    });
+>>>>>>> Stashed changes
     setAddingAccount(false);
     setError("");
     setPendingAccountKey(createAccountKey());
@@ -6498,10 +7396,31 @@ export default function App() {
       setActiveAccountKey(next.key);
       setActiveAccountKeyState(next.key);
       setUser(next.user);
+<<<<<<< Updated upstream
+=======
+      setEncryptionReady(false);
+      setEncryptionChecking(true);
+      void hasReadyEncryptionIdentity(next.user.id, next.key).then((ready) => {
+        if (getActiveAccountKey() === next.key) {
+          setEncryptionReady(ready);
+          setEncryptionChecking(false);
+        }
+      }).catch((cause) => {
+        if (getActiveAccountKey() === next.key) {
+          setError(cause.message);
+          setEncryptionChecking(false);
+        }
+      });
+>>>>>>> Stashed changes
     } else {
       setActiveAccountKey(null);
       setActiveAccountKeyState(null);
       setUser(null);
+<<<<<<< Updated upstream
+=======
+      setEncryptionReady(false);
+      setEncryptionChecking(false);
+>>>>>>> Stashed changes
       setPendingAccountKey(createAccountKey());
     }
     setAddingAccount(false);
@@ -6517,13 +7436,25 @@ export default function App() {
     document.addEventListener("polus:account-session-invalid", invalidateAccount);
     return () => document.removeEventListener("polus:account-session-invalid", invalidateAccount);
   }, [accounts, removeAccount]);
+<<<<<<< Updated upstream
   const handleAuthenticated = useCallback((authenticatedUser, key) => {
     const account = { key: key || createAccountKey(), user: authenticatedUser, unreadCount: 0 };
+=======
+  const handleAuthenticated = useCallback(async (authenticatedUser, key) => {
+    const accountKey = key || createAccountKey();
+    const encryptionReady = await hasReadyEncryptionIdentity(authenticatedUser.id, accountKey);
+    const account = { key: accountKey, user: authenticatedUser, unreadCount: 0 };
+>>>>>>> Stashed changes
     const nextAccounts = [...accounts.filter((item) => item.key !== account.key), account];
     commitAccounts(nextAccounts);
     setActiveAccountKey(account.key);
     setActiveAccountKeyState(account.key);
     setUser(authenticatedUser);
+<<<<<<< Updated upstream
+=======
+    setEncryptionReady(encryptionReady);
+    setEncryptionChecking(false);
+>>>>>>> Stashed changes
     setAddingAccount(false);
     setError("");
     setPendingAccountKey(createAccountKey());
@@ -6555,6 +7486,7 @@ export default function App() {
     const sources = accountsRef.current
       .filter((account) => account.key !== activeAccountKey)
       .map((account) => {
+<<<<<<< Updated upstream
         const source = new EventSource(accountApiUrl("/api/stream", account.key));
         source.addEventListener("message", (event) => {
           let message;
@@ -6588,6 +7520,45 @@ export default function App() {
                 }
               })).catch((cause) => console.error("Unable to show a background account notification:", cause));
           }
+=======
+        const source = connectEventStream("/api/stream", {
+          accountKey: account.key,
+          onEvent: (event) => {
+            if (event.type !== "message") return;
+            let message;
+            try {
+              message = JSON.parse(event.data);
+            } catch (cause) {
+              console.error("Invalid message received for a background account:", cause);
+              return;
+            }
+            if (message.author?.id === account.user.id) return;
+            const nextAccounts = accountsRef.current.map((item) =>
+              item.key === account.key ? { ...item, unreadCount: (item.unreadCount || 0) + 1 } : item);
+            accountsRef.current = nextAccounts;
+            try {
+              saveAccounts(nextAccounts);
+              setAccounts(nextAccounts);
+            } catch (cause) {
+              console.error("Unable to save background account unread state:", cause);
+            }
+            if (typeof Notification !== "undefined" && Notification.permission === "granted"
+              && "serviceWorker" in navigator) {
+              void navigator.serviceWorker.ready.then((registration) =>
+                registration.showNotification(`${message.author?.fullName || message.author?.username || "Полюс"}`, {
+                  body: language === "ru" ? "Новое сообщение" : "New message",
+                  icon: "/logo.svg",
+                  badge: "/logo.svg",
+                  tag: `${account.user.id}:${message.conversationId || ""}`,
+                  data: {
+                    conversationId: message.conversationId || "",
+                    accountUserId: account.user.id
+                  }
+                })).catch((cause) => console.error("Unable to show a background account notification:", cause));
+            }
+          },
+          onError: (cause) => console.error("Background account realtime stream failed:", cause)
+>>>>>>> Stashed changes
         });
         return source;
       });
@@ -6600,7 +7571,20 @@ export default function App() {
         {loading
           ? <main className="auth-view" aria-busy="true">Загрузка Полюса…</main>
           : user
+<<<<<<< Updated upstream
               ? (
+=======
+                ? encryptionChecking
+                  ? <main className="auth-view" aria-busy="true">Загрузка Полюса…</main>
+                  : !encryptionReady
+                  ? <EncryptionUnlock
+                  user={user}
+                  accountKey={activeAccountKey}
+                  language={language}
+                  onUnlocked={() => setEncryptionReady(true)}
+                />
+                : (
+>>>>>>> Stashed changes
                 <>
                   <MessengerShell
                     key={activeAccountKey}

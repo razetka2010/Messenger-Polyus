@@ -1,5 +1,12 @@
-import { requestJson as api } from "./apiClient.mjs";
+import { fetchAccountResource, getActiveAccountKey, requestJson as api } from "./apiClient.mjs";
 import { cropAvatar } from "./avatar.mjs";
+import {
+  decryptMessagePayload,
+  encryptMessagePayload,
+  getConversationEncryptionKeys,
+  getEncryptionPublicKey,
+  getOwnEncryptionPublicKey
+} from "./encryption.mjs";
 
 let polusReady = false;
 (function protectFormsFromNativeSubmit() {
@@ -739,7 +746,9 @@ async function jumpToMessage(messageId) {
     }));
     if (currentConversation?.id !== conversationId) return;
     if (!history.messages.length) break;
-    messages = [...history.messages.reverse(), ...messages];
+    const olderMessages = await Promise.all(history.messages.reverse()
+      .map((message) => decryptMessagePayload(currentUser.id, message)));
+    messages = [...olderMessages, ...messages];
     if (!history.hasMore) olderMessagesCursor = null;
     else olderMessagesCursor = history.nextCursor;
   }
@@ -763,21 +772,39 @@ async function searchChat(queryValue) {
     }));
     return;
   }
-  const search = new URLSearchParams({ q: query });
-  const response = await api(`/api/chats/${encodeURIComponent(currentConversation.id)}/search?${search}`);
+  const normalizedQuery = query.toLocaleLowerCase();
+  const results = messages
+    .filter((message) => !message.deleted && message.text?.toLocaleLowerCase().includes(normalizedQuery))
+    .map((message) => ({
+      id: message.id,
+      author: message.author || { fullName: currentUser.fullName },
+      text: message.text,
+      createdAt: message.createdAt || message.sentAt
+    }));
   if (requestId !== chatSearchRequestId) return;
   document.dispatchEvent(new CustomEvent("polus:chat-search-results", {
-    detail: { results: response.results, message: response.results.length ? "" : t("noResults") }
+    detail: { results, message: results.length ? "" : t("noResults") }
   }));
 }
 
+<<<<<<< Updated upstream
 async function openUserProfile(username) {
   if (username.toLowerCase() === currentUser.username.toLowerCase()) {
     closeDialog("profile-view-dialog");
     document.dispatchEvent(new CustomEvent("polus:open-own-profile"));
     return;
+=======
+async function loadUserProfile(username) {
+  let response;
+  try {
+    response = await api(`/api/users/${encodeURIComponent(username)}/profile`);
+  } catch (error) {
+    document.dispatchEvent(new CustomEvent("polus:user-profile-error", {
+      detail: { username, message: localizeError(error.message) }
+    }));
+    throw error;
+>>>>>>> Stashed changes
   }
-  const response = await api(`/api/users/${encodeURIComponent(username)}/profile`);
   const { user: target, sharedChats, sharedMedia, canMessage } = response;
   const targetDirect = [currentConversation, ...directs].find((chat) =>
     chat && !chat.pending && chat.type === "direct" && chat.memberIds?.includes(target.id));
@@ -816,7 +843,15 @@ async function openUserProfile(username) {
       }
     }
   }));
-  openDialog("profile-view-dialog");
+}
+
+async function openUserProfile(username) {
+  const path = `/users/${encodeURIComponent(username)}`;
+  if (window.location.pathname !== path) {
+    window.history.pushState({ polusPage: true, polusUserProfile: true }, "", path);
+    window.dispatchEvent(new PopStateEvent("popstate"));
+  }
+  await loadUserProfile(username);
 }
 
 async function markConversationRead(conversation) {
@@ -856,7 +891,8 @@ async function openConversation(conversation) {
         conversationId: conversation.id
       }));
       if (currentConversation?.id !== conversation.id) return;
-      messages = history.messages.reverse();
+      messages = await Promise.all(history.messages.reverse()
+        .map((message) => decryptMessagePayload(currentUser.id, message)));
       olderMessagesCursor = history.nextCursor;
       renderMessages();
       if (document.visibilityState === "visible") await markConversationRead(conversation);
@@ -888,7 +924,9 @@ async function loadOlderMessages() {
       olderMessagesCursor = null;
       return;
     }
-    messages = [...history.messages.reverse(), ...messages]
+    const olderMessages = await Promise.all(history.messages.reverse()
+      .map((message) => decryptMessagePayload(currentUser.id, message)));
+    messages = [...olderMessages, ...messages]
       .sort((left, right) => left.id - right.id);
     olderMessagesCursor = history.nextCursor;
   } catch (error) {
@@ -951,8 +989,23 @@ async function loadMessenger(session) {
   const data = await api("/api/bootstrap");
   if (session !== controllerSession) return;
   setUser(data.user);
-  channels = data.channels;
-  directs = data.directs;
+  const [nextChannels, nextDirects] = await Promise.all([
+    Promise.all(data.channels.map(async (conversation) => ({
+      ...conversation,
+      ...(conversation.lastMessage
+        ? { lastMessage: await decryptMessagePayload(data.user.id, conversation.lastMessage) }
+        : {})
+    }))),
+    Promise.all(data.directs.map(async (conversation) => ({
+      ...conversation,
+      ...(conversation.lastMessage
+        ? { lastMessage: await decryptMessagePayload(data.user.id, conversation.lastMessage) }
+        : {})
+    })))
+  ]);
+  if (session !== controllerSession) return;
+  channels = nextChannels;
+  directs = nextDirects;
   pushKey = data.vapidPublicKey;
   renderConversations();
   if ("serviceWorker" in navigator && window.isSecureContext) {
@@ -972,6 +1025,7 @@ async function loadMessenger(session) {
 }
 
 async function receiveMessage(message) {
+  message = await decryptMessagePayload(currentUser.id, message);
   let conversation = getConversation(message.conversationId);
   let fetchedConversation = false;
   if (!conversation) {
@@ -1018,8 +1072,20 @@ async function receiveMessage(message) {
 
 async function refreshMessengerState() {
   const data = await api("/api/bootstrap");
-  channels = data.channels;
-  directs = data.directs;
+  [channels, directs] = await Promise.all([
+    Promise.all(data.channels.map(async (conversation) => ({
+      ...conversation,
+      ...(conversation.lastMessage
+        ? { lastMessage: await decryptMessagePayload(data.user.id, conversation.lastMessage) }
+        : {})
+    }))),
+    Promise.all(data.directs.map(async (conversation) => ({
+      ...conversation,
+      ...(conversation.lastMessage
+        ? { lastMessage: await decryptMessagePayload(data.user.id, conversation.lastMessage) }
+        : {})
+    })))
+  ]);
   const updatedConversation = currentConversation && getConversation(currentConversation.id);
   if (updatedConversation) {
     currentConversation = updatedConversation;
@@ -1053,7 +1119,8 @@ async function resyncRealtimeState() {
     conversationId: conversation.id
   }));
   if (currentConversation?.id !== conversation.id) return;
-  messages = history.messages.reverse();
+  messages = await Promise.all(history.messages.reverse()
+    .map((message) => decryptMessagePayload(currentUser.id, message)));
   olderMessagesCursor = history.nextCursor;
   loadingOlderMessages = false;
   renderMessages();
@@ -1062,9 +1129,11 @@ async function resyncRealtimeState() {
 
 async function applySentMessage({ sent, conversation: submittedConversation } = {}) {
   if (!sent || !submittedConversation) return;
+  sent = await decryptMessagePayload(currentUser.id, sent);
   const isPendingConversation = Boolean(submittedConversation.pending);
   const sentConversation = isPendingConversation ? sent.conversation : null;
   if (sentConversation) {
+    sentConversation.lastMessage = sent;
     const existingIndex = directs.findIndex((conversation) => conversation.id === sentConversation.id);
     if (existingIndex < 0) directs.unshift(sentConversation);
     else directs[existingIndex] = sentConversation;
@@ -1092,7 +1161,26 @@ async function applySentMessage({ sent, conversation: submittedConversation } = 
 
 async function saveMessageToFavorites(message) {
   if (!message || currentConversation?.type === "saved") return;
-  const saved = await api(`/api/messages/${encodeURIComponent(message.id)}/save`, { method: "POST" });
+  const savedConversationId = `saved_${currentUser.id}`;
+  const recipients = await getOwnEncryptionPublicKey();
+  const encryptedText = await encryptMessagePayload(currentUser.id, [recipients], savedConversationId, {
+    text: message.text || "",
+    mediaType: message.mediaType || null,
+    attachments: (message.attachments || []).map((attachment) => ({
+      id: attachment.id,
+      name: attachment.name,
+      mimeType: attachment.mimeType,
+      size: attachment.size,
+      encrypted: attachment.encrypted === true,
+      ...(attachment.encryption || {})
+    }))
+  });
+  const savedResult = await api(`/api/messages/${encodeURIComponent(message.id)}/save`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ encrypted: true, text: encryptedText })
+  });
+  const saved = await decryptMessagePayload(currentUser.id, savedResult);
   let conversation = directs.find((item) => item.id === saved.conversation.id);
   if (!conversation) {
     conversation = saved.conversation;
@@ -1110,12 +1198,15 @@ async function saveMessageToFavorites(message) {
   notify(t("savedMessageSaved"));
 }
 
-function applyMessageMutation(message) {
+async function applyMessageMutation(message) {
   if (!message) return;
+  message = await decryptMessagePayload(currentUser.id, message);
   const index = messages.findIndex((item) => item.id === message.id);
   if (index >= 0) {
+    const wasAtBottom = isMessageListAtBottom();
+    const previousTop = messageList.scrollTop;
     messages = messages.map((item) => item.id === message.id ? message : item);
-    renderMessages();
+    renderMessages(wasAtBottom ? {} : { keepScrollTop: true, previousTop });
   }
   const conversation = getConversation(message.conversationId);
   if (conversation?.lastMessage?.id === message.id) {
@@ -1464,11 +1555,19 @@ function registerControllerListeners() {
       void openUserProfile(event.detail.username).catch((error) => notify(localizeError(error.message)));
     }
   });
+  listen(document, "polus:load-user-profile", (event) => {
+    if (event.detail?.username) {
+      void loadUserProfile(event.detail.username).catch((error) => {
+        document.dispatchEvent(new CustomEvent("polus:user-profile-error", {
+          detail: { username: event.detail.username, message: localizeError(error.message) }
+        }));
+      });
+    }
+  });
   listen(document, "polus:user-profile-action", (event) => {
     const { action, username } = event.detail || {};
     void (async () => {
       if (action === "message") {
-        closeDialog("profile-view-dialog");
         document.dispatchEvent(new CustomEvent("polus:request-direct-message", { detail: { username } }));
         return;
       }
@@ -1478,7 +1577,11 @@ function registerControllerListeners() {
           method: user.isContact ? "DELETE" : "PUT"
         });
         document.dispatchEvent(new CustomEvent("polus:contacts-changed"));
+<<<<<<< Updated upstream
         await openUserProfile(username);
+=======
+        await loadUserProfile(username);
+>>>>>>> Stashed changes
         notify(t(user.isContact ? "contactRemoved" : "contactAdded"));
         return;
       }
@@ -1493,7 +1596,7 @@ function registerControllerListeners() {
         await api(`/api/users/${encodeURIComponent(username)}/block`, {
           method: user.blocked ? "DELETE" : "POST"
         });
-        await openUserProfile(username);
+        await loadUserProfile(username);
         return;
       }
       if (action === "toggle-mute") {
@@ -1502,7 +1605,7 @@ function registerControllerListeners() {
           chat && !chat.pending && chat.type === "direct" && chat.memberIds?.includes(user.id));
         if (!conversation) return;
         await toggleChatMute(!conversation.muted, { conversation, refreshInfo: false });
-        await openUserProfile(username);
+        await loadUserProfile(username);
       }
     })().catch((error) => notify(localizeError(error.message)));
   });
@@ -1515,7 +1618,14 @@ function registerControllerListeners() {
       if (action === "toggle-mute") return toggleChatMute(!currentConversation?.muted);
       if (action === "open-media") {
         if (canView) await openMediaViewer(attachmentId);
-        else window.open(`/api/attachments/${encodeURIComponent(attachmentId)}`, "_blank", "noopener,noreferrer");
+        else {
+          const blob = await fetchAccountResource(
+            `/api/attachments/${encodeURIComponent(attachmentId)}`,
+            getActiveAccountKey()
+          );
+          const objectUrl = URL.createObjectURL(blob);
+          window.open(objectUrl, "_blank", "noopener,noreferrer");
+        }
         return;
       }
       if (action === "open-message") {
@@ -1553,7 +1663,17 @@ function registerControllerListeners() {
   });
   listen(document, "polus:open-media", (event) => {
     if (event.detail?.attachmentId) {
-      void openMediaViewer(event.detail.attachmentId).catch((error) => notify(localizeError(error.message)));
+      if (event.detail.decryptedUrl) {
+        document.dispatchEvent(new CustomEvent("polus:media-viewer-open", {
+          detail: {
+            items: [{ ...event.detail.attachment, decryptedUrl: event.detail.decryptedUrl }],
+            index: 0
+          }
+        }));
+        openDialog("media-viewer");
+      } else {
+        void openMediaViewer(event.detail.attachmentId).catch((error) => notify(localizeError(error.message)));
+      }
     }
   });
   listen(document, "visibilitychange", () => {
@@ -1582,10 +1702,10 @@ function registerControllerListeners() {
     }).catch((error) => notify(localizeError(error.message)));
   });
   listen(document, "polus:realtime-message-updated", (event) => {
-    applyMessageMutation(event.detail);
+    void applyMessageMutation(event.detail).catch((error) => notify(localizeError(error.message)));
   });
   listen(document, "polus:realtime-message-deleted", (event) => {
-    applyMessageMutation(event.detail);
+    void applyMessageMutation(event.detail).catch((error) => notify(localizeError(error.message)));
   });
   listen(document, "polus:realtime-messages-read", (event) => {
     const { conversationId, readerId, lastReadMessageId } = event.detail || {};
@@ -1616,8 +1736,12 @@ function registerControllerListeners() {
     if (typeof resolve !== "function" || typeof reject !== "function") return;
     void refreshMessengerState().then(resolve, reject);
   });
-  listen(document, "polus:message-edited", (event) => applyMessageMutation(event.detail?.message));
-  listen(document, "polus:message-deleted", (event) => applyMessageMutation(event.detail?.message));
+  listen(document, "polus:message-edited", (event) => {
+    void applyMessageMutation(event.detail?.message).catch((error) => notify(localizeError(error.message)));
+  });
+  listen(document, "polus:message-deleted", (event) => {
+    void applyMessageMutation(event.detail?.message).catch((error) => notify(localizeError(error.message)));
+  });
   listen(document, "polus:message-react", (event) => {
     const { messageId, emoji } = event.detail || {};
     if (!messageId || !emoji) return;
@@ -1650,17 +1774,47 @@ function registerControllerListeners() {
     }));
   });
   listen(document, "polus:forward-message-to-chat", (event) => {
-    const { messageId, conversationId, recipientUsername, resolve, reject } = event.detail || {};
+    const { message, messageId, conversationId, recipientUsername, resolve, reject } = event.detail || {};
+    if (!message || !messageId) {
+      reject?.(new Error("The source message could not be loaded."));
+      return;
+    }
     void (async () => {
       try {
+        const targetConversation = conversationId ? getConversation(conversationId) : null;
+        if (conversationId && !targetConversation) throw new Error(t("selectChat"));
+        if (!conversationId && !recipientUsername) throw new Error(t("selectChat"));
+        const recipients = targetConversation
+          ? await getConversationEncryptionKeys(targetConversation.id)
+          : [
+            await getOwnEncryptionPublicKey(),
+            await getEncryptionPublicKey(recipientUsername)
+          ];
+        const targetConversationId = targetConversation
+          ? targetConversation.id
+          : `dm_${recipients.map((item) => item.id).sort().join("_")}`;
+        const text = await encryptMessagePayload(currentUser.id, recipients, targetConversationId, {
+          text: message.text || "",
+          mediaType: message.mediaType || null,
+          attachments: (message.attachments || []).map((attachment) => ({
+            id: attachment.id,
+            name: attachment.name,
+            mimeType: attachment.mimeType,
+            size: attachment.size,
+            encrypted: attachment.encrypted === true,
+            ...(attachment.encryption || {})
+          }))
+        });
         const forwarded = await api(`/api/messages/${encodeURIComponent(messageId)}/forward`,
           jsonOptions("POST", {
             ...(conversationId ? { conversationId } : {}),
-            ...(recipientUsername ? { recipientUsername } : {})
+            ...(recipientUsername ? { recipientUsername } : {}),
+            encrypted: true,
+            text
           }));
         await refreshMessengerState();
-        const destination = getConversation(forwarded.conversationId);
-        await applySentMessage({ sent: forwarded, conversation: destination });
+        const forwardedConversation = getConversation(forwarded.conversationId);
+        await applySentMessage({ sent: forwarded, conversation: forwardedConversation });
         notify(t("messageForwarded"));
         resolve?.();
       } catch (error) {

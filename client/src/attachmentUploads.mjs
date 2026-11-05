@@ -1,4 +1,8 @@
+<<<<<<< Updated upstream
 import { accountApiUrl, getActiveAccountKey } from "./apiClient.mjs";
+=======
+import { getActiveAccountKey } from "./apiClient.mjs";
+>>>>>>> Stashed changes
 
 function upload(url, body, contentType, signal, onProgress, headers = {}) {
   return new Promise((resolve, reject) => {
@@ -8,7 +12,11 @@ function upload(url, body, contentType, signal, onProgress, headers = {}) {
     }
     const request = new XMLHttpRequest();
     const accountKey = getActiveAccountKey();
+<<<<<<< Updated upstream
     request.open("POST", accountApiUrl(url, accountKey));
+=======
+    request.open("POST", url);
+>>>>>>> Stashed changes
     request.setRequestHeader("Content-Type", contentType || "application/octet-stream");
     if (accountKey) request.setRequestHeader("X-Polus-Account", accountKey);
     for (const [name, value] of Object.entries(headers)) request.setRequestHeader(name, value);
@@ -40,16 +48,19 @@ function upload(url, body, contentType, signal, onProgress, headers = {}) {
   });
 }
 
-export function uploadAttachment(chatId, file, signal, onProgress) {
+export function uploadAttachment(chatId, file, signal, onProgress, { encrypted = false } = {}) {
+  const fileName = encrypted ? "encrypted.bin" : file.name;
+  const mimeType = encrypted ? "application/octet-stream" : file.type;
   return upload(
     `/api/chats/${encodeURIComponent(chatId)}/attachments`,
     file,
-    file.type || "application/octet-stream",
+    mimeType || "application/octet-stream",
     signal,
     onProgress,
     {
-      "X-File-Name": encodeURIComponent(file.name),
-      ...(file.type ? { "X-File-Mime-Type": file.type } : {})
+      "X-File-Name": encodeURIComponent(fileName),
+      ...(mimeType ? { "X-File-Mime-Type": mimeType } : {}),
+      ...(encrypted ? { "X-Polus-Encrypted": "true" } : {})
     }
   );
 }

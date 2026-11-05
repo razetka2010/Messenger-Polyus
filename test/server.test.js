@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const fs = require("node:fs/promises");
 const http = require("node:http");
 const os = require("node:os");
@@ -13,15 +14,40 @@ const {
   createSqliteStoreWriter,
   createStoreWriter,
   createMessengerServer,
+  getClientAddress,
   getLanAddresses,
+  validEncryptedMessage,
   closeExpiredSessionStreams,
   PRIVACY_VERSION,
   loadSqliteStore,
   loadStore,
   normalizeStore,
+  secureDataDirectory,
+  secureDataFile,
   sendPushToUser,
   writeStoreAtomically
 } = require("../server");
+
+test("resolves client IPs from the closest trusted proxy and ignores spoofed chains", () => {
+  const trustedProxies = new Set(["127.0.0.1", "10.0.0.2"]);
+  const request = (remoteAddress, forwardedFor) => ({
+    socket: { remoteAddress },
+    headers: { "x-forwarded-for": forwardedFor }
+  });
+  assert.equal(getClientAddress(request("198.51.100.9", "203.0.113.1"), trustedProxies), "198.51.100.9");
+  assert.equal(
+    getClientAddress(request("::ffff:127.0.0.1", "203.0.113.8, 10.0.0.2"), trustedProxies),
+    "203.0.113.8"
+  );
+  assert.equal(
+    getClientAddress(request("127.0.0.1", "203.0.113.1, 192.0.2.9"), trustedProxies),
+    "192.0.2.9"
+  );
+  assert.equal(
+    getClientAddress(request("127.0.0.1", "203.0.113.1, invalid"), trustedProxies),
+    "127.0.0.1"
+  );
+});
 
 test("cleans expired sessions and orphaned attachment files", async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "polus-cleanup-"));
@@ -146,6 +172,10 @@ test("persists account-key hashes for isolated sessions in SQLite", async () => 
       fullName: "Account User",
       passwordHash: "salt:hash"
     });
+<<<<<<< Updated upstream
+=======
+
+>>>>>>> Stashed changes
     loaded.store.sessions.push({
       id: "account-session",
       userId: "account-user",
@@ -167,6 +197,105 @@ test("persists account-key hashes for isolated sessions in SQLite", async () => 
   }
 });
 
+<<<<<<< Updated upstream
+=======
+test("persists session creation times in SQLite", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "polus-session-created-"));
+  let database;
+  try {
+    const databasePath = path.join(directory, "store.sqlite");
+    const legacyPath = path.join(directory, "legacy.json");
+    const loaded = await loadSqliteStore(databasePath, legacyPath);
+    database = loaded.database;
+    const saveStore = createSqliteStoreWriter(database, loaded.store);
+    const createdAt = Date.now() - 1000;
+    loaded.store.sessions.push({
+      id: "created-session",
+      userId: "created-user",
+      tokenHash: "session-hash",
+      createdAt,
+      expiresAt: Date.now() + 60_000
+    });
+    await saveStore(loaded.store);
+    database.close();
+    database = null;
+    const reloaded = await loadSqliteStore(databasePath, legacyPath);
+    database = reloaded.database;
+    assert.equal(reloaded.store.sessions[0].createdAt, createdAt);
+  } finally {
+    database?.close();
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("lists sessions and revokes all sessions after password confirmation", async () => {
+  await withServer({ store: createEmptyStore() }, async (baseUrl) => {
+    const account = await register(baseUrl, "session_review", "Session Review");
+    const secondLogin = await fetch(`${baseUrl}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "session_review", password: "a-secure-test-password" })
+    });
+    const secondCookie = secondLogin.headers.get("set-cookie").split(";")[0];
+    const listed = await fetch(`${baseUrl}/api/account/sessions`, authenticatedRequest(account.cookie));
+    assert.equal(listed.status, 200);
+    const { sessions } = await listed.json();
+    assert.equal(sessions.length, 2);
+    assert.equal(sessions.filter((session) => session.isCurrent).length, 1);
+    assert.ok(sessions.every((session) => Date.parse(session.createdAt) <= Date.parse(session.expiresAt)));
+
+    const rejected = await fetch(`${baseUrl}/api/account/sessions/revoke-all`, authenticatedRequest(account.cookie, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ currentPassword: "wrong-password" })
+    }));
+    assert.equal(rejected.status, 401);
+    assert.equal((await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(secondCookie))).status, 200);
+
+    const revoked = await fetch(`${baseUrl}/api/account/sessions/revoke-all`, authenticatedRequest(account.cookie, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ currentPassword: "a-secure-test-password" })
+    }));
+    assert.equal(revoked.status, 200);
+    assert.match(revoked.headers.get("set-cookie"), /Max-Age=0/);
+    assert.equal((await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(account.cookie))).status, 401);
+    assert.equal((await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(secondCookie))).status, 401);
+  });
+});
+
+test("serves the shared encryption key only to authenticated accounts", async () => {
+  const encryptionKey = "shared-encryption-key-for-tests-0123456789";
+  await withServer({ store: createEmptyStore(), encryptionKey }, async (baseUrl) => {
+    const publicResponse = await fetch(`${baseUrl}/api/account/encryption-config`);
+    assert.equal(publicResponse.status, 401);
+    const account = await register(baseUrl, "shared_key_test", "Shared Key");
+    const configured = await fetch(
+      `${baseUrl}/api/account/encryption-config`,
+      authenticatedRequest(account.cookie)
+    );
+    assert.equal(configured.status, 200);
+    assert.match(configured.headers.get("cache-control"), /no-store/);
+    assert.deepEqual(await configured.json(), { wrappingKey: encryptionKey });
+  });
+  await withServer({ store: createEmptyStore(), encryptionKey: "" }, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/api/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: "missing_key_test",
+        fullName: "Missing Key",
+        password: "a-secure-test-password",
+        confirmPassword: "a-secure-test-password",
+        acceptPrivacy: true,
+        privacyVersion: PRIVACY_VERSION
+      })
+    });
+    assert.equal(response.status, 503);
+  });
+});
+
+>>>>>>> Stashed changes
 test("normalizes exactly one saved chat per user, including legacy single-member records", () => {
   const store = createEmptyStore();
   store.users.push(
@@ -204,7 +333,11 @@ test("normalizes exactly one saved chat per user, including legacy single-member
 });
 
 async function withServer(options, run) {
-  const server = createMessengerServer(options);
+  const server = createMessengerServer({
+    allowLegacyPlaintext: true,
+    encryptionKey: "shared-encryption-key-for-tests-0123456789",
+    ...options
+  });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address();
   try {
@@ -852,8 +985,27 @@ test("retries transient Windows rename errors and keeps a previous store backup"
     assert.equal(attempts, 2);
     assert.equal(await fs.readFile(filePath, "utf8"), '{"revision":2}');
     assert.equal(await fs.readFile(`${filePath}.bak`, "utf8"), '{"revision":1}');
+    if (process.platform !== "win32") {
+      assert.equal((await fs.stat(filePath)).mode & 0o777, 0o600);
+      assert.equal((await fs.stat(`${filePath}.bak`)).mode & 0o777, 0o600);
+    }
   } finally {
     await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("restricts data-directory permissions on POSIX systems", async () => {
+  const directory = path.join(await fs.mkdtemp(path.join(os.tmpdir(), "polus-private-data-")), "data");
+  try {
+    await secureDataDirectory(directory);
+    await fs.writeFile(path.join(directory, "state"), "secret", "utf8");
+    await secureDataFile(path.join(directory, "state"));
+    if (process.platform !== "win32") {
+      assert.equal((await fs.stat(directory)).mode & 0o777, 0o700);
+      assert.equal((await fs.stat(path.join(directory, "state"))).mode & 0o777, 0o600);
+    }
+  } finally {
+    await fs.rm(path.dirname(directory), { recursive: true, force: true });
   }
 });
 
@@ -964,6 +1116,7 @@ test("serves Polus, its logo, privacy page and English/Russian app", async () =>
     assert.equal(page.status, 200);
     assert.equal(page.headers.get("x-powered-by"), null);
     assert.match(page.headers.get("content-security-policy"), /img-src 'self' data: blob:/);
+    assert.match(page.headers.get("content-security-policy"), /media-src 'self' blob:/);
     assert.equal(page.headers.get("strict-transport-security"), null);
     const pageBody = await page.text();
     const builtClient = pageBody.includes('id="root"');
@@ -974,6 +1127,10 @@ test("serves Polus, its logo, privacy page and English/Russian app", async () =>
     assert.equal(profilePage.status, 200);
     assert.equal(profilePage.headers.get("content-type"), "text/html; charset=utf-8");
     assert.match(await profilePage.text(), /id="root"/);
+    const publicUserPage = await fetch(`${baseUrl}/users/profile_user`);
+    assert.equal(publicUserPage.status, 200);
+    assert.equal(publicUserPage.headers.get("content-type"), "text/html; charset=utf-8");
+    assert.match(await publicUserPage.text(), /id="root"/);
 
     const styles = await fetch(`${baseUrl}/styles.css`);
     const stylesBody = await styles.text();
@@ -1005,11 +1162,11 @@ test("serves Polus, its logo, privacy page and English/Russian app", async () =>
     assert.match(reactSource, /polus:profile-saved/);
     assert.doesNotMatch(controllerSource, /async function submitMessage|uploadSelectedFiles|polus:submit-message|polus:upload-selected-files/);
     assert.match(reactSource, /requestJson\("\/api\/messages"/);
-    assert.match(reactSource, /uploadAttachment\(conversationId/);
+    assert.match(reactSource, /uploadAttachment\(\s*conversationId/);
     assert.match(reactSource, /polus:message-sent/);
     assert.doesNotMatch(controllerSource, /async function editMessage|async function deleteMessage|polus:edit-message|polus:delete-message/);
     assert.match(reactSource, /const handleEditMessage = async \(event\)/);
-    assert.match(reactSource, /method: "PATCH",\s*body: JSON\.stringify\(\{ text: value \}\)/);
+    assert.match(reactSource, /body: JSON\.stringify\(\{ text: encryptedText, encrypted: true \}\)/);
     assert.match(reactSource, /const handleDeleteMessage = async \(event\)/);
     assert.match(reactSource, /polus:message-edited/);
     assert.match(reactSource, /polus:message-deleted/);
@@ -1019,8 +1176,14 @@ test("serves Polus, its logo, privacy page and English/Russian app", async () =>
     assert.match(reactSource, /requestJson\(`\/api\/messages\?\$\{query\}`\)/);
     assert.match(reactSource, /requestJson\(\"\/api\/conversations\/read\"/);
     assert.doesNotMatch(controllerSource, /new EventSource|\/api\/stream|\/api\/presence\/chat|reportChatViewingState|viewingHeartbeatTimer/);
+<<<<<<< Updated upstream
     assert.match(reactSource, /new EventSource\(accountApiUrl\(\"\/api\/stream\", accountKey\)\)/);
     assert.match(reactSource, /fetch\(accountApiUrl\(\"\/api\/presence\/chat\", accountKey\)/);
+=======
+    assert.match(reactSource, /connectEventStream\(\"\/api\/stream\", \{/);
+    assert.match(reactSource, /fetch\(\"\/api\/presence\/chat\", \{/);
+    assert.doesNotMatch(reactSource, /new EventSource|accountApiUrl/);
+>>>>>>> Stashed changes
     assert.match(reactSource, /document\.addEventListener\(\"polus:composer-state\", handlePresenceConversation\)/);
     assert.match(reactSource, /polus:realtime-message/);
     assert.match(reactSource, /ПОЛЮС/);
@@ -1373,6 +1536,16 @@ test("isolates account sessions by account key and revokes only the selected acc
     assert.equal((await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(firstCookie, {
       headers: { "X-Polus-Account": secondKey }
     }))).status, 401);
+<<<<<<< Updated upstream
+=======
+    const streamController = new AbortController();
+    const scopedStream = await fetch(`${baseUrl}/api/stream`, {
+      headers: { Cookie: firstCookie, "X-Polus-Account": firstKey },
+      signal: streamController.signal
+    });
+    assert.equal(scopedStream.status, 200);
+    streamController.abort();
+>>>>>>> Stashed changes
     assert.equal((await fetch(`${baseUrl}/api/stream?accountKey=${secondKey}`, {
       headers: { Cookie: firstCookie }
     })).status, 401);
@@ -1389,6 +1562,215 @@ test("isolates account sessions by account key and revokes only the selected acc
   });
 });
 
+<<<<<<< Updated upstream
+=======
+test("migrates legacy encryption-key wrapping without changing the public identity", async () => {
+  await withServer({ store: createEmptyStore() }, async (baseUrl) => {
+    const account = await register(baseUrl, "key_migration", "Key Migration");
+    const url = `${baseUrl}/api/account/encryption-key`;
+    const request = (method, body) => fetch(url, authenticatedRequest(account.cookie, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      ...(body ? { body: JSON.stringify(body) } : {})
+    }));
+    const publicKey = crypto.generateKeyPairSync("rsa", { modulusLength: 3072 })
+      .publicKey.export({ type: "spki", format: "der" }).toString("base64");
+    const otherPublicKey = crypto.generateKeyPairSync("rsa", { modulusLength: 3072 })
+      .publicKey.export({ type: "spki", format: "der" }).toString("base64");
+    const legacySeal = { salt: "AQID", iv: "AQID", ciphertext: "AQID", iterations: 310000 };
+    const newSeal = { ...legacySeal, keyVersion: 2, ciphertext: "BAUG" };
+    const upgradedSeal = {
+      ...legacySeal,
+      keyVersion: 3,
+      iterations: 600000,
+      ciphertext: "CgsM"
+    };
+
+    assert.deepEqual(await (await request("GET")).json(), {
+      userId: account.body.user.id,
+      publicKey: null,
+      sealedPrivateKey: null,
+      signingPublicKey: null,
+      sealedSigningPrivateKey: null
+    });
+    assert.equal((await request("PUT", { publicKey, sealedPrivateKey: legacySeal })).status, 201);
+    assert.equal((await request("PUT", { publicKey, sealedPrivateKey: newSeal })).status, 200);
+    assert.deepEqual(await (await request("GET")).json().then((result) => result.sealedPrivateKey), newSeal);
+    const signingSeal = { ...newSeal, ciphertext: "BwgJ" };
+    const signingPublicKey = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" })
+      .publicKey.export({ type: "spki", format: "der" }).toString("base64");
+    assert.equal((await request("PUT", {
+      publicKey,
+      sealedPrivateKey: newSeal,
+      signingPublicKey,
+      sealedSigningPrivateKey: signingSeal
+    })).status, 200);
+    const updatedIdentity = await (await request("GET")).json();
+    assert.equal(updatedIdentity.signingPublicKey, signingPublicKey);
+    assert.deepEqual(updatedIdentity.sealedSigningPrivateKey, signingSeal);
+    assert.equal((await request("PUT", {
+      publicKey,
+      sealedPrivateKey: newSeal,
+      signingPublicKey,
+      sealedSigningPrivateKey: signingSeal
+    })).status, 200);
+    assert.equal((await request("PUT", {
+      publicKey,
+      sealedPrivateKey: { ...newSeal, ciphertext: "CgsM" },
+      signingPublicKey,
+      sealedSigningPrivateKey: signingSeal
+    })).status, 409);
+    const upgradedSigningSeal = { ...upgradedSeal, ciphertext: "DQ4P" };
+    assert.equal((await request("PUT", {
+      publicKey,
+      sealedPrivateKey: upgradedSeal,
+      signingPublicKey,
+      sealedSigningPrivateKey: upgradedSigningSeal
+    })).status, 200);
+    assert.deepEqual((await (await request("GET")).json()).sealedPrivateKey, upgradedSeal);
+    assert.equal((await request("PUT", {
+      publicKey,
+      sealedPrivateKey: newSeal,
+      signingPublicKey,
+      sealedSigningPrivateKey: signingSeal
+    })).status, 409);
+    assert.equal((await request("PUT", {
+      publicKey: otherPublicKey,
+      sealedPrivateKey: { ...newSeal, ciphertext: "CgsM" },
+      signingPublicKey,
+      sealedSigningPrivateKey: signingSeal
+    })).status, 409);
+  });
+});
+
+test("accepts only signed messages bound to the stored sender and chat context", () => {
+  const { privateKey, publicKey } = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+  const signingPublicKey = publicKey.export({ type: "spki", format: "der" }).toString("base64");
+  const senderPublicKey = "sender-encryption-key";
+  const recipientPublicKey = "recipient-encryption-key";
+  const conversation = { id: "chat-1", memberIds: ["sender", "recipient"] };
+  const store = {
+    users: [
+      { id: "sender", encryptionPublicKey: senderPublicKey, signingPublicKey },
+      { id: "recipient", encryptionPublicKey: recipientPublicKey, signingPublicKey: "recipient-signing-key" }
+    ]
+  };
+  const packet = {
+    version: 2,
+    context: { conversationId: conversation.id, senderId: "sender", counter: 1 },
+    iv: crypto.randomBytes(12).toString("base64"),
+    ciphertext: crypto.randomBytes(32).toString("base64"),
+    envelopes: {
+      sender: crypto.randomBytes(384).toString("base64"),
+      recipient: crypto.randomBytes(384).toString("base64")
+    },
+    senderPublicKey,
+    signingPublicKey
+  };
+  const signedData = JSON.stringify({
+    version: packet.version,
+    context: packet.context,
+    iv: packet.iv,
+    ciphertext: packet.ciphertext,
+    envelopes: packet.envelopes,
+    senderPublicKey: packet.senderPublicKey,
+    signingPublicKey: packet.signingPublicKey
+  });
+  packet.signature = crypto.sign("sha256", Buffer.from(signedData), {
+    key: privateKey,
+    dsaEncoding: "ieee-p1363"
+  }).toString("base64");
+  const serialize = (message) => `polus-e2ee:v2:${JSON.stringify(message)}`;
+
+  assert.equal(validEncryptedMessage(serialize(packet), conversation, store, "sender"), true);
+  assert.equal(validEncryptedMessage(serialize(packet), conversation, store, "recipient"), false);
+  assert.equal(validEncryptedMessage(serialize({
+    ...packet,
+    context: { ...packet.context, conversationId: "other-chat" }
+  }), conversation, store, "sender"), false);
+  assert.equal(validEncryptedMessage(serialize({
+    ...packet,
+    signature: Buffer.alloc(64).toString("base64")
+  }), conversation, store, "sender"), false);
+});
+
+test("rewraps a legacy encryption key atomically with the account password change", async () => {
+  await withServer({ store: createEmptyStore() }, async (baseUrl) => {
+    const account = await register(baseUrl, "legacy_rewrap", "Legacy Rewrap");
+    const publicKey = crypto.generateKeyPairSync("rsa", { modulusLength: 3072 })
+      .publicKey.export({ type: "spki", format: "der" }).toString("base64");
+    const signingPublicKey = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" })
+      .publicKey.export({ type: "spki", format: "der" }).toString("base64");
+    const legacySeal = { salt: "AQID", iv: "BAUG", ciphertext: "BwgJ", iterations: 310000 };
+    const migratedSeal = { ...legacySeal, keyVersion: 3, iterations: 600000, ciphertext: "CgsM" };
+    const migratedSigningSeal = { ...legacySeal, keyVersion: 3, iterations: 600000, ciphertext: "DQ4P" };
+    const encryptionKeyUrl = `${baseUrl}/api/account/encryption-key`;
+    const keyRequest = (method, body, cookie = account.cookie) => fetch(encryptionKeyUrl, authenticatedRequest(cookie, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      ...(body ? { body: JSON.stringify(body) } : {})
+    }));
+    assert.equal((await keyRequest("PUT", {
+      publicKey,
+      sealedPrivateKey: legacySeal,
+      signingPublicKey,
+      sealedSigningPrivateKey: legacySeal
+    })).status, 201);
+
+    const patchAccount = (body) => fetch(`${baseUrl}/api/account`, authenticatedRequest(account.cookie, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fullName: "Legacy Rewrap", about: "", ...body })
+    }));
+    assert.equal((await patchAccount({
+      currentPassword: "a-secure-test-password",
+      newPassword: "a-new-secure-password"
+    })).status, 409);
+
+    const invalidUpdate = await patchAccount({
+      currentPassword: "a-secure-test-password",
+      newPassword: "a-new-secure-password",
+      encryptionKeyUpdate: { sealedPrivateKey: { ...migratedSeal, iterations: 310000 } }
+    });
+    assert.equal(invalidUpdate.status, 409);
+    assert.equal((await fetch(`${baseUrl}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "legacy_rewrap", password: "a-secure-test-password" })
+    })).status, 200);
+
+    const changed = await patchAccount({
+      currentPassword: "a-secure-test-password",
+      newPassword: "a-new-secure-password",
+      encryptionKeyUpdate: {
+        sealedPrivateKey: migratedSeal,
+        sealedSigningPrivateKey: migratedSigningSeal
+      }
+    });
+    assert.equal(changed.status, 200);
+    const newLogin = await fetch(`${baseUrl}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "legacy_rewrap", password: "a-new-secure-password" })
+    });
+    const newCookie = newLogin.headers.get("set-cookie").split(";")[0];
+    const migratedIdentity = await (await keyRequest("GET", undefined, newCookie)).json();
+    assert.deepEqual(migratedIdentity.sealedPrivateKey, migratedSeal);
+    assert.deepEqual(migratedIdentity.sealedSigningPrivateKey, migratedSigningSeal);
+    assert.equal((await fetch(`${baseUrl}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "legacy_rewrap", password: "a-secure-test-password" })
+    })).status, 401);
+    assert.equal((await fetch(`${baseUrl}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "legacy_rewrap", password: "a-new-secure-password" })
+    })).status, 200);
+  });
+});
+
+>>>>>>> Stashed changes
 test("enforces account limits, permits an 8-character password, and edits profile about", async () => {
   await withServer({ store: createEmptyStore() }, async (baseUrl) => {
     const longUsername = "a".repeat(32);
@@ -1476,7 +1858,7 @@ test("enforces account limits, permits an 8-character password, and edits profil
       body: JSON.stringify({ username: longUsername, password: "87654321" })
     });
     assert.equal(newPasswordLogin.status, 200);
-    assert.equal((await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(cookie))).status, 200);
+    assert.equal((await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(cookie))).status, 401);
     assert.equal((await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(anotherDeviceCookie))).status, 401);
   });
 });
@@ -2192,6 +2574,91 @@ test("exposes profile controls, online visibility, blocks and per-chat mute sett
     assert.equal(profileBody.user.username, "profile_bobby");
     assert.equal(profileBody.canMessage, true);
     assert.equal(profileBody.sharedMedia.length, 0);
+    assert.deepEqual(profileBody.user.profileDesign, {
+      theme: "aurora",
+      accentColor: "#4d83d1",
+      font: "system",
+      motionEnabled: true,
+      gradientStart: "#101927",
+      gradientEnd: "#344f82",
+      gradientDirection: "diagonal",
+      effects: "glow",
+      avatarFrame: "gradient",
+      animation: "subtle",
+      backgroundImageEnabled: false,
+      coverParallax: false
+    });
+
+    const invalidDesign = await fetch(`${baseUrl}/api/account/profile-design`, authenticatedRequest(alice.cookie, {
+      method: "PATCH",
+      ...json({ theme: "url(javascript:alert(1))", accentColor: "red", font: "unknown", motionEnabled: true })
+    }));
+    assert.equal(invalidDesign.status, 400);
+    const invalidEffectDesign = await fetch(`${baseUrl}/api/account/profile-design`, authenticatedRequest(alice.cookie, {
+      method: "PATCH",
+      ...json({
+        theme: "aurora",
+        accentColor: "#4d83d1",
+        font: "system",
+        motionEnabled: true,
+        effects: "url(javascript:alert(1))"
+      })
+    }));
+    assert.equal(invalidEffectDesign.status, 400);
+    const ownDesign = await fetch(`${baseUrl}/api/account/profile-design`, authenticatedRequest(alice.cookie, {
+      method: "PATCH",
+      ...json({
+        userId: bob.body.user.id,
+        theme: "ocean",
+        accentColor: "#1188aa",
+        font: "rounded",
+        motionEnabled: false,
+        gradientStart: "#dff7f8",
+        gradientEnd: "#b9dbe8",
+        gradientDirection: "horizontal",
+        effects: "particles",
+        avatarFrame: "double",
+        animation: "gradient",
+        backgroundImageEnabled: true,
+        coverParallax: true
+      })
+    }));
+    assert.equal(ownDesign.status, 200);
+    assert.deepEqual((await ownDesign.json()).user.profileDesign, {
+      theme: "ocean",
+      accentColor: "#1188aa",
+      font: "rounded",
+      motionEnabled: false,
+      gradientStart: "#dff7f8",
+      gradientEnd: "#b9dbe8",
+      gradientDirection: "horizontal",
+      effects: "particles",
+      avatarFrame: "double",
+      animation: "gradient",
+      backgroundImageEnabled: true,
+      coverParallax: true
+    });
+    const legacyDesign = await fetch(`${baseUrl}/api/account/profile-design`, authenticatedRequest(alice.cookie, {
+      method: "PATCH",
+      ...json({ theme: "sunset", accentColor: "#123456", font: "serif", motionEnabled: true })
+    }));
+    assert.equal(legacyDesign.status, 200);
+    assert.equal((await legacyDesign.json()).user.profileDesign.gradientStart, "#fff0df");
+    const bobOwnDesign = await fetch(`${baseUrl}/api/users/profile_bobby/profile`, authenticatedRequest(alice.cookie));
+    assert.deepEqual((await bobOwnDesign.json()).user.profileDesign, {
+      theme: "aurora",
+      accentColor: "#4d83d1",
+      font: "system",
+      motionEnabled: true,
+      gradientStart: "#101927",
+      gradientEnd: "#344f82",
+      gradientDirection: "diagonal",
+      effects: "glow",
+      avatarFrame: "gradient",
+      animation: "subtle",
+      backgroundImageEnabled: false,
+      coverParallax: false
+    });
 
     const blocked = await fetch(`${baseUrl}/api/users/profile_bobby/block`, authenticatedRequest(alice.cookie, {
       method: "POST"
@@ -2224,6 +2691,42 @@ test("exposes profile controls, online visibility, blocks and per-chat mute sett
     const avatarResponse = await fetch(`${baseUrl}${avatarInfo.avatarUrl}`, authenticatedRequest(alice.cookie));
     assert.equal(avatarResponse.status, 200);
     assert.equal(avatarResponse.headers.get("content-type"), "image/png");
+
+    const invalidCover = await fetch(`${baseUrl}/api/account/profile-cover`, authenticatedRequest(bob.cookie, {
+      method: "POST",
+      headers: { "Content-Type": "image/png" },
+      body: Buffer.from("not an image")
+    }));
+    assert.equal(invalidCover.status, 400);
+    const cover = await fetch(`${baseUrl}/api/account/profile-cover`, authenticatedRequest(bob.cookie, {
+      method: "POST",
+      headers: { "Content-Type": "image/png" },
+      body: png
+    }));
+    assert.equal(cover.status, 201);
+    const coverUser = (await cover.json()).user;
+    assert.match(coverUser.profileCoverUrl, /^\/api\/profile-covers\//);
+    const coverResponse = await fetch(`${baseUrl}${coverUser.profileCoverUrl}`, authenticatedRequest(alice.cookie));
+    assert.equal(coverResponse.status, 200);
+    assert.equal(coverResponse.headers.get("content-type"), "image/png");
+    const wrongOwnerDelete = await fetch(`${baseUrl}/api/account/profile-cover`, authenticatedRequest(alice.cookie, {
+      method: "DELETE"
+    }));
+    assert.equal(wrongOwnerDelete.status, 200);
+    const bobCoverStillExists = await fetch(`${baseUrl}${coverUser.profileCoverUrl}`, authenticatedRequest(alice.cookie));
+    assert.equal(bobCoverStillExists.status, 200);
+
+    const webmCover = await fetch(`${baseUrl}/api/account/profile-cover`, authenticatedRequest(bob.cookie, {
+      method: "POST",
+      headers: { "Content-Type": "video/webm" },
+      body: Buffer.from([0x1a, 0x45, 0xdf, 0xa3])
+    }));
+    assert.equal(webmCover.status, 201);
+    const videoCoverUser = (await webmCover.json()).user;
+    assert.equal(videoCoverUser.profileCoverMimeType, "video/webm");
+    const videoCover = await fetch(`${baseUrl}${videoCoverUser.profileCoverUrl}`, authenticatedRequest(alice.cookie));
+    assert.equal(videoCover.status, 200);
+    assert.equal(videoCover.headers.get("content-type"), "video/webm");
 
     const updated = await fetch(`${baseUrl}/api/account`, authenticatedRequest(bob.cookie, {
       method: "PATCH",

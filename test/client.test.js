@@ -5,10 +5,19 @@ const apiClientPromise = import("../client/src/apiClient.mjs");
 const conversationListPromise = import("../client/src/conversationList.mjs");
 
 const originalFetch = globalThis.fetch;
+const originalLocalStorage = globalThis.localStorage;
+const originalIndexedDB = globalThis.indexedDB;
 const diagnosticsPromise = import("../client/src/diagnostics.mjs");
+const encryptionPromise = import("../client/src/encryption.mjs");
+const attachmentUploadsPromise = import("../client/src/attachmentUploads.mjs");
+const attachmentFormattingPromise = import("../client/src/attachmentFormatting.mjs");
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  if (originalLocalStorage === undefined) delete globalThis.localStorage;
+  else globalThis.localStorage = originalLocalStorage;
+  if (originalIndexedDB === undefined) delete globalThis.indexedDB;
+  else globalThis.indexedDB = originalIndexedDB;
 });
 
 test("JSON API client sends same-origin JSON requests", async () => {
@@ -34,7 +43,11 @@ test("JSON API client sends same-origin JSON requests", async () => {
 });
 
 test("JSON API client binds each request and returned API resources to its account", async () => {
+<<<<<<< Updated upstream
   const { accountApiUrl, requestJson } = await apiClientPromise;
+=======
+  const { requestJson } = await apiClientPromise;
+>>>>>>> Stashed changes
   const accountKey = "a".repeat(32);
   let request;
   globalThis.fetch = async (url, options) => {
@@ -46,8 +59,63 @@ test("JSON API client binds each request and returned API resources to its accou
 
   const response = await requestJson("/api/auth/me", { accountKey });
   assert.equal(request.options.headers["X-Polus-Account"], accountKey);
+<<<<<<< Updated upstream
   assert.equal(new URLSearchParams(response.user.avatarUrl.split("?")[1]).get("accountKey"), accountKey);
   assert.equal(accountApiUrl("/api/stream", accountKey), `/api/stream?accountKey=${accountKey}`);
+=======
+  assert.equal(response.user.avatarUrl, "/api/avatars/user-1?v=avatar");
+  assert.equal(request.url, "/api/auth/me");
+  assert.doesNotMatch(request.url, /accountKey/);
+});
+
+test("fetch event streams send account headers and parse server events without URL credentials", async () => {
+  const { connectEventStream } = await apiClientPromise;
+  const accountKey = "b".repeat(32);
+  let request;
+  let stream;
+  let resolveEvent;
+  const eventReceived = new Promise((resolve) => { resolveEvent = resolve; });
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("id: 42\r\nevent: chat-updated\r\ndata: {\"id\":\"chat-1\"}\r\n\r\n"));
+        controller.close();
+      }
+    });
+    return new Response(body, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" }
+    });
+  };
+  stream = connectEventStream("/api/stream", {
+    accountKey,
+    onEvent(event) {
+      resolveEvent(event);
+      stream.close();
+    }
+  });
+  const event = await eventReceived;
+  assert.equal(request.url, "/api/stream");
+  assert.equal(request.options.headers["X-Polus-Account"], accountKey);
+  assert.equal(event.type, "chat-updated");
+  assert.equal(event.lastEventId, "42");
+  assert.deepEqual(JSON.parse(event.data), { id: "chat-1" });
+});
+
+test("authenticated resource fetches select the account through a header", async () => {
+  const { fetchAccountResource } = await apiClientPromise;
+  const accountKey = "c".repeat(32);
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return new Response(new Uint8Array([1, 2, 3]), { status: 200 });
+  };
+  const blob = await fetchAccountResource("/api/attachments/file-1", accountKey);
+  assert.equal(request.url, "/api/attachments/file-1");
+  assert.equal(request.options.headers["X-Polus-Account"], accountKey);
+  assert.deepEqual([...new Uint8Array(await blob.arrayBuffer())], [1, 2, 3]);
+>>>>>>> Stashed changes
 });
 
 test("JSON API client preserves server errors and response status", async () => {
@@ -76,6 +144,126 @@ test("JSON API client reports invalid successful responses", async () => {
   });
 });
 
+<<<<<<< Updated upstream
+=======
+test("encrypted attachment uploads hide the original file name and MIME type", async () => {
+  const { uploadAttachment } = await attachmentUploadsPromise;
+  const originalXhr = globalThis.XMLHttpRequest;
+  let request;
+  class TestXmlHttpRequest extends EventTarget {
+    constructor() {
+      super();
+      this.upload = new EventTarget();
+      this.headers = {};
+      this.status = 201;
+      this.responseText = JSON.stringify({ id: "attachment-1" });
+      request = this;
+    }
+
+    open(method, url) {
+      this.method = method;
+      this.url = url;
+    }
+
+    setRequestHeader(name, value) {
+      this.headers[name] = value;
+    }
+
+    send(body) {
+      this.body = body;
+      queueMicrotask(() => this.dispatchEvent(new Event("load")));
+    }
+  }
+  globalThis.XMLHttpRequest = TestXmlHttpRequest;
+  try {
+    await uploadAttachment(
+      "chat-1",
+      { name: "private-finances.xlsx", type: "application/vnd.ms-excel", size: 32 },
+      new AbortController().signal,
+      () => {},
+      { encrypted: true }
+    );
+    assert.equal(request.headers["X-File-Name"], "encrypted.bin");
+    assert.equal(request.headers["X-File-Mime-Type"], "application/octet-stream");
+    assert.equal(request.headers["X-Polus-Encrypted"], "true");
+    assert.equal(request.headers["X-File-Name"].includes("private-finances"), false);
+  } finally {
+    if (originalXhr === undefined) delete globalThis.XMLHttpRequest;
+    else globalThis.XMLHttpRequest = originalXhr;
+  }
+});
+
+test("formats attachment sizes for message file cards", async () => {
+  const { formatAttachmentSize } = await attachmentFormattingPromise;
+  assert.equal(formatAttachmentSize(0), "0 B");
+  assert.equal(formatAttachmentSize(512), "512 B");
+  assert.equal(formatAttachmentSize(1024), "1.0 KB");
+  assert.equal(formatAttachmentSize(1024 * 1024), "1.0 MB");
+});
+
+test("encrypts attachments in authenticated chunks and decrypts them from a stream", async () => {
+  const { encryptAttachment, decryptAttachment } = await encryptionPromise;
+  const plaintext = new Uint8Array(1024 * 1024 + 73);
+  for (let index = 0; index < plaintext.length; index += 1) plaintext[index] = index % 251;
+  const file = new File([plaintext], "chunked.bin", { type: "application/octet-stream" });
+  const encrypted = await encryptAttachment(file);
+  assert.equal(encrypted.metadata.encryptionVersion, 1);
+  assert.equal(encrypted.metadata.chunkSize, 1024 * 1024);
+  assert.equal(encrypted.blob.size, plaintext.length + 2 * 16);
+
+  const attachment = {
+    id: "attachment-id",
+    encrypted: true,
+    size: plaintext.length,
+    mimeType: file.type,
+    encryption: {
+      key: encrypted.metadata.key,
+      iv: encrypted.metadata.iv,
+      version: encrypted.metadata.encryptionVersion,
+      chunkSize: encrypted.metadata.chunkSize
+    }
+  };
+  globalThis.fetch = async () => new Response(encrypted.blob.stream());
+  const decrypted = await decryptAttachment(attachment, "account-slot");
+  assert.deepEqual(new Uint8Array(await decrypted.arrayBuffer()), plaintext);
+
+  const bytes = new Uint8Array(await encrypted.blob.arrayBuffer());
+  const firstChunkLength = 1024 * 1024 + 16;
+  const reordered = new Blob([
+    bytes.subarray(firstChunkLength),
+    bytes.subarray(0, firstChunkLength)
+  ]);
+  globalThis.fetch = async () => new Response(reordered.stream());
+  await assert.rejects(decryptAttachment(attachment, "account-slot"), {
+    message: "The encrypted attachment could not be verified or decrypted."
+  });
+
+  const legacyPlaintext = new Uint8Array([9, 8, 7, 6, 5]);
+  const legacyKey = await globalThis.crypto.subtle.generateKey(
+    { name: "AES-GCM", length: 256 },
+    true,
+    ["encrypt", "decrypt"]
+  );
+  const legacyIv = globalThis.crypto.getRandomValues(new Uint8Array(12));
+  const legacyCiphertext = await globalThis.crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: legacyIv },
+    legacyKey,
+    legacyPlaintext
+  );
+  const legacyKeyBytes = await globalThis.crypto.subtle.exportKey("raw", legacyKey);
+  globalThis.fetch = async () => new Response(new Blob([legacyCiphertext]).stream());
+  const legacyDecrypted = await decryptAttachment({
+    ...attachment,
+    size: legacyPlaintext.length,
+    encryption: {
+      key: Buffer.from(legacyKeyBytes).toString("base64"),
+      iv: Buffer.from(legacyIv).toString("base64")
+    }
+  }, "account-slot");
+  assert.deepEqual(new Uint8Array(await legacyDecrypted.arrayBuffer()), legacyPlaintext);
+});
+
+>>>>>>> Stashed changes
 test("privacy page exposes bilingual policy sections and in-page navigation", async () => {
   const [page, script, styles] = await Promise.all([
     fs.readFile(require.resolve("../public/privacy.html"), "utf8"),
@@ -112,6 +300,392 @@ test("creates client IDs in browsers without crypto.randomUUID", async () => {
   });
   assert.match(fallbackId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
   assert.match(createClientId({}), /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+});
+
+test("pins recipient encryption keys and blocks changed keys until explicitly trusted", async () => {
+  const { trustChangedEncryptionKey, verifyRecipientEncryptionKeys } = await encryptionPromise;
+  const saved = new Map();
+  globalThis.localStorage = {
+    getItem(key) { return saved.get(key) || null; },
+    setItem(key, value) { saved.set(key, value); }
+  };
+  const ownerId = "owner";
+  const recipientId = "recipient";
+  const originalKey = "AQID";
+  const replacementKey = "BAUG";
+  const originalSigningKey = "AgMEBQ==";
+  const replacementSigningKey = "BwgJCg==";
+
+  await verifyRecipientEncryptionKeys(ownerId, [{
+    id: recipientId,
+    publicKey: originalKey,
+    signingPublicKey: originalSigningKey
+  }]);
+  const priorFingerprint = JSON.parse(saved.get("polus-trusted-encryption-keys:owner"))[recipientId];
+
+  await verifyRecipientEncryptionKeys(ownerId, [{
+    id: recipientId,
+    publicKey: originalKey,
+    signingPublicKey: originalSigningKey
+  }]);
+  await assert.rejects(
+    verifyRecipientEncryptionKeys(ownerId, [{
+      id: recipientId,
+      publicKey: replacementKey,
+      signingPublicKey: replacementSigningKey
+    }]),
+    (error) => {
+      assert.equal(error.code, "ENCRYPTION_KEY_CHANGED");
+      assert.equal(error.userId, ownerId);
+      assert.equal(error.recipientId, recipientId);
+      assert.equal(error.signingPublicKey, replacementSigningKey);
+      assert.equal(error.previousFingerprint, priorFingerprint);
+      assert.match(error.newFingerprint, /^[a-f0-9]{64}$/);
+      return true;
+    }
+  );
+  assert.equal(JSON.parse(saved.get("polus-trusted-encryption-keys:owner"))[recipientId], priorFingerprint);
+
+  await trustChangedEncryptionKey(
+    ownerId,
+    recipientId,
+    replacementKey,
+    replacementSigningKey,
+    priorFingerprint
+  );
+  await verifyRecipientEncryptionKeys(ownerId, [{
+    id: recipientId,
+    publicKey: replacementKey,
+    signingPublicKey: replacementSigningKey
+  }]);
+});
+
+test("detects repeated signed-message counters in the same chat", async () => {
+  const { rememberMessageCounter } = await encryptionPromise;
+  const saved = new Map();
+  globalThis.localStorage = {
+    getItem(key) { return saved.get(key) || null; },
+    setItem(key, value) { saved.set(key, value); }
+  };
+  rememberMessageCounter("owner", "chat-1", "sender", 123, "message-1");
+  rememberMessageCounter("owner", "chat-1", "sender", 123, "message-1");
+  assert.throws(
+    () => rememberMessageCounter("owner", "chat-1", "sender", 123, "replayed-message"),
+    { message: "This signed message counter was already seen. The message may be a replay." }
+  );
+});
+
+test("encrypts and verifies message signatures bound to chat and sender context", async () => {
+  const {
+    decryptMessagePayload,
+    encryptMessagePayload,
+    ensureEncryptionIdentity,
+    hasReadyEncryptionIdentity
+  } = await encryptionPromise;
+  const storage = new Map();
+  globalThis.localStorage = {
+    getItem(key) { return storage.get(key) || null; },
+    setItem(key, value) { storage.set(key, value); },
+    removeItem(key) { storage.delete(key); }
+  };
+  const indexedStores = new Map();
+  const database = {
+    objectStoreNames: { contains(name) { return indexedStores.has(name); } },
+    createObjectStore(name) { indexedStores.set(name, new Map()); },
+    transaction() {
+      const transaction = new EventTarget();
+      transaction.objectStore = (name) => ({
+        get(key) {
+          const request = new EventTarget();
+          queueMicrotask(() => {
+            request.result = indexedStores.get(name).get(key);
+            request.dispatchEvent(new Event("success"));
+          });
+          return request;
+        },
+        put(value, key) {
+          indexedStores.get(name).set(key, value);
+          queueMicrotask(() => transaction.dispatchEvent(new Event("complete")));
+        }
+      });
+      return transaction;
+    },
+    close() {}
+  };
+  globalThis.indexedDB = {
+    open() {
+      const request = new EventTarget();
+      request.result = database;
+      queueMicrotask(() => {
+        request.dispatchEvent(new Event("upgradeneeded"));
+        request.dispatchEvent(new Event("success"));
+      });
+      return request;
+    }
+  };
+  let identity = null;
+  globalThis.fetch = async (url, options) => {
+    if (url === "/api/account/encryption-config") {
+      return new Response(JSON.stringify({ wrappingKey: "shared-encryption-key-for-tests-0123456789" }), { status: 200 });
+    }
+    if (url !== "/api/account/encryption-key") throw new Error(`Unexpected request: ${url}`);
+    if (options.method === "PUT") {
+      identity = JSON.parse(options.body);
+      return new Response(JSON.stringify({ ok: true }), { status: 201 });
+    }
+    return new Response(JSON.stringify({
+      userId: "alice",
+      publicKey: identity?.publicKey || null,
+      sealedPrivateKey: identity?.sealedPrivateKey || null,
+      signingPublicKey: identity?.signingPublicKey || null,
+      sealedSigningPrivateKey: identity?.sealedSigningPrivateKey || null
+    }), { status: 200 });
+  };
+
+  await ensureEncryptionIdentity(
+    "alice",
+    "account-password",
+    "a separate encryption phrase",
+    "account-slot"
+  );
+  assert.equal(identity.sealedPrivateKey.keyVersion, 3);
+  assert.equal(identity.sealedPrivateKey.iterations, 600000);
+  assert.equal(identity.sealedSigningPrivateKey.keyVersion, 3);
+  assert.equal(identity.sealedSigningPrivateKey.iterations, 600000);
+  indexedStores.get("signing-identities").delete("alice");
+  await ensureEncryptionIdentity(
+    "alice",
+    "account-password",
+    "a different encryption phrase",
+    "account-slot"
+  );
+  await ensureEncryptionIdentity(
+    "alice",
+    "account-password",
+    "a separate encryption phrase",
+    "account-slot"
+  );
+  const downgradeForMigrationTest = async (sealed, passphrase) => {
+    const sharedMaterial = await globalThis.crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode("shared-encryption-key-for-tests-0123456789"),
+      "PBKDF2",
+      false,
+      ["deriveKey"]
+    );
+    const oldSalt = Buffer.from(sealed.salt, "base64");
+    const oldWrappingKey = await globalThis.crypto.subtle.deriveKey(
+      { name: "PBKDF2", hash: "SHA-256", salt: oldSalt, iterations: 600000 },
+      sharedMaterial,
+      { name: "AES-GCM", length: 256 },
+      false,
+      ["decrypt"]
+    );
+    const plaintext = await globalThis.crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: Buffer.from(sealed.iv, "base64") },
+      oldWrappingKey,
+      Buffer.from(sealed.ciphertext, "base64")
+    );
+    const salt = globalThis.crypto.getRandomValues(new Uint8Array(16));
+    const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
+    const legacyMaterial = await globalThis.crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(passphrase),
+      "PBKDF2",
+      false,
+      ["deriveKey"]
+    );
+    const wrappingKey = await globalThis.crypto.subtle.deriveKey(
+      { name: "PBKDF2", hash: "SHA-256", salt, iterations: 310000 },
+      legacyMaterial,
+      { name: "AES-GCM", length: 256 },
+      false,
+      ["encrypt"]
+    );
+    const ciphertext = await globalThis.crypto.subtle.encrypt({ name: "AES-GCM", iv }, wrappingKey, plaintext);
+    return {
+      keyVersion: 2,
+      salt: Buffer.from(salt).toString("base64"),
+      iv: Buffer.from(iv).toString("base64"),
+      ciphertext: Buffer.from(ciphertext).toString("base64"),
+      iterations: 310000
+    };
+  };
+  identity.sealedPrivateKey = await downgradeForMigrationTest(identity.sealedPrivateKey, "old legacy phrase");
+  identity.sealedSigningPrivateKey = await downgradeForMigrationTest(identity.sealedSigningPrivateKey, "old legacy phrase");
+  assert.equal(await hasReadyEncryptionIdentity("alice", "account-slot"), false);
+  await assert.rejects(ensureEncryptionIdentity(
+    "alice",
+    "account-password",
+    "",
+    "account-slot"
+  ), { message: "This key uses an older encryption phrase. Enter that phrase once to migrate it." });
+  await ensureEncryptionIdentity(
+    "alice",
+    "account-password",
+    "old legacy phrase",
+    "account-slot"
+  );
+  assert.equal(identity.sealedPrivateKey.keyVersion, 3);
+  assert.equal(identity.sealedSigningPrivateKey.keyVersion, 3);
+  assert.equal(await hasReadyEncryptionIdentity("alice", "account-slot"), true);
+  const conversationId = "direct-chat";
+  const attachmentKey = Buffer.alloc(32, 7).toString("base64");
+  const attachmentIv = Buffer.alloc(12, 8).toString("base64");
+  const text = await encryptMessagePayload("alice", [{
+    id: "alice",
+    publicKey: identity.publicKey,
+    signingPublicKey: identity.signingPublicKey
+  }], conversationId, {
+    text: "authenticated",
+    attachments: [{
+      id: "spoofed-id",
+      url: "/api/attachments/spoofed-id",
+      name: "shared.txt",
+      mimeType: "text/plain",
+      size: 12,
+      encrypted: true,
+      key: attachmentKey,
+      iv: attachmentIv,
+      encryptionVersion: 1,
+      chunkSize: 1024 * 1024
+    }]
+  });
+  const message = {
+    id: 1,
+    encrypted: true,
+    text,
+    authorId: "alice",
+    conversationId,
+    attachments: [{
+      id: "server-attachment-id",
+      url: "/api/attachments/server-attachment-id",
+      name: "server-name.bin",
+      mimeType: "application/octet-stream",
+      size: 28
+    }]
+  };
+  const decrypted = await decryptMessagePayload("alice", message);
+  assert.equal(decrypted.text, "authenticated");
+  assert.equal(decrypted.signatureVerified, true);
+  assert.equal(decrypted.attachments[0].id, "server-attachment-id");
+  assert.equal(decrypted.attachments[0].url, "/api/attachments/server-attachment-id");
+  assert.equal(decrypted.attachments[0].name, "shared.txt");
+  assert.equal(decrypted.attachments[0].mimeType, "text/plain");
+  assert.deepEqual(decrypted.attachments[0].encryption, {
+    key: attachmentKey,
+    iv: attachmentIv,
+    version: 1,
+    chunkSize: 1024 * 1024
+  });
+
+  const packet = JSON.parse(text.slice("polus-e2ee:v2:".length));
+  const tamperedPacket = { ...packet, ciphertext: "AA==" };
+  await assert.rejects(decryptMessagePayload("alice", {
+    ...message,
+    text: `polus-e2ee:v2:${JSON.stringify(tamperedPacket)}`
+  }), { message: "The encrypted message signature is invalid." });
+  packet.context.conversationId = "other-chat";
+  await assert.rejects(decryptMessagePayload("alice", {
+    ...message,
+    text: `polus-e2ee:v2:${JSON.stringify(packet)}`
+  }), { message: "The encrypted message context is invalid." });
+  await assert.rejects(decryptMessagePayload("alice", { ...message, id: 2 }), {
+    message: "This signed message counter was already seen. The message may be a replay."
+  });
+});
+
+test("uses the shared server key and migrates legacy private-key phrases", async () => {
+  const { prepareEncryptionKeyPasswordChange } = await encryptionPromise;
+  const password = "old-account-password";
+  const encryptionPair = await globalThis.crypto.subtle.generateKey(
+    { name: "RSA-OAEP", modulusLength: 3072, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+    true,
+    ["encrypt", "decrypt"]
+  );
+  const privateKeyBytes = await globalThis.crypto.subtle.exportKey("pkcs8", encryptionPair.privateKey);
+  const signingPair = await globalThis.crypto.subtle.generateKey(
+    { name: "ECDSA", namedCurve: "P-256" },
+    true,
+    ["sign", "verify"]
+  );
+  const signingPrivateKeyBytes = await globalThis.crypto.subtle.exportKey("pkcs8", signingPair.privateKey);
+  const salt = globalThis.crypto.getRandomValues(new Uint8Array(16));
+  const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
+  const material = await globalThis.crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(password),
+    "PBKDF2",
+    false,
+    ["deriveKey"]
+  );
+  const wrappingKey = await globalThis.crypto.subtle.deriveKey(
+    { name: "PBKDF2", hash: "SHA-256", salt, iterations: 310000 },
+    material,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt"]
+  );
+  const ciphertext = await globalThis.crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    wrappingKey,
+    privateKeyBytes
+  );
+  const legacySeal = {
+    salt: Buffer.from(salt).toString("base64"),
+    iv: Buffer.from(iv).toString("base64"),
+    ciphertext: Buffer.from(ciphertext).toString("base64"),
+    iterations: 310000
+  };
+  const signingSalt = globalThis.crypto.getRandomValues(new Uint8Array(16));
+  const signingIv = globalThis.crypto.getRandomValues(new Uint8Array(12));
+  const signingWrappingKey = await globalThis.crypto.subtle.deriveKey(
+    { name: "PBKDF2", hash: "SHA-256", salt: signingSalt, iterations: 310000 },
+    material,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt"]
+  );
+  const signingCiphertext = await globalThis.crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: signingIv },
+    signingWrappingKey,
+    signingPrivateKeyBytes
+  );
+  const serverKey = {
+    publicKey: Buffer.from(await globalThis.crypto.subtle.exportKey("spki", encryptionPair.publicKey)).toString("base64"),
+    sealedPrivateKey: legacySeal,
+    signingPublicKey: Buffer.from(await globalThis.crypto.subtle.exportKey("spki", signingPair.publicKey)).toString("base64"),
+    sealedSigningPrivateKey: {
+      salt: Buffer.from(signingSalt).toString("base64"),
+      iv: Buffer.from(signingIv).toString("base64"),
+      ciphertext: Buffer.from(signingCiphertext).toString("base64"),
+      iterations: 310000
+    }
+  };
+  const sharedWrappingKey = "shared-encryption-key-for-tests-0123456789";
+  globalThis.fetch = async (url) => {
+    if (url === "/api/account/encryption-config") {
+      return new Response(JSON.stringify({ wrappingKey: sharedWrappingKey }), { status: 200 });
+    }
+    assert.equal(url, "/api/account/encryption-key");
+    return new Response(JSON.stringify(serverKey), { status: 200 });
+  };
+
+  const rewrapped = await prepareEncryptionKeyPasswordChange(
+    password,
+    "new-account-password",
+    "account-slot"
+  );
+  assert.equal(rewrapped.sealedPrivateKey.keyVersion, 3);
+  assert.equal(rewrapped.sealedPrivateKey.iterations, 600000);
+  assert.notEqual(rewrapped.sealedPrivateKey.ciphertext, legacySeal.ciphertext);
+  assert.equal(rewrapped.sealedSigningPrivateKey.keyVersion, 3);
+  assert.equal(rewrapped.sealedSigningPrivateKey.iterations, 600000);
+  await assert.rejects(prepareEncryptionKeyPasswordChange(
+    "wrong-account-password",
+    "another-new-password",
+    "account-slot"
+  ), { message: "Unable to unlock the legacy encryption key. Check the password that sealed it." });
 });
 
 test("opens joined channel headers in chat info and keeps discover channels on the join page", async () => {
@@ -192,12 +766,17 @@ test("integrates contacts navigation, profiles, and reusable group/channel membe
   assert.match(styles, /@media \(max-width: 760px\) \{\s*\.contacts-page-header/);
 });
 
+<<<<<<< Updated upstream
 test("presents other-user profiles with accessible actions and openable shared communities", async () => {
+=======
+test("presents public user profiles as themed pages with accessible actions and shared communities", async () => {
+>>>>>>> Stashed changes
   const [app, controller, styles] = await Promise.all([
     fs.readFile(require.resolve("../client/src/App.jsx"), "utf8"),
     fs.readFile(require.resolve("../client/src/messengerController.js"), "utf8"),
     fs.readFile(require.resolve("../public/styles.css"), "utf8")
   ]);
+<<<<<<< Updated upstream
   assert.match(app, /function UserProfileContent\(\)[\s\S]*user-profile-dialog-header[\s\S]*profile-message-button/);
   assert.match(app, /profile-secondary-actions[\s\S]*user\.isContact \? labels\.removeContact : labels\.addContact/);
   assert.match(app, /<details className="profile-more-actions">[\s\S]*confirmBlock/);
@@ -210,6 +789,43 @@ test("presents other-user profiles with accessible actions and openable shared c
   assert.match(styles, /\.profile-view-dialog \{[^}]*overflow-x: hidden;/);
   assert.match(styles, /:root\[data-theme="dark"\] \.profile-secondary-actions/);
   assert.match(styles, /@media \(max-width: 520px\) \{\s*\.profile-view-dialog/);
+=======
+  assert.match(app, /function UserProfileContent\(\{ username, currentUserId, currentUsername, onBack \}\)/);
+  assert.match(app, /user\.id === currentUserId[\s\S]*user\.username\?\.toLocaleLowerCase\(\) === currentUsername\?\.toLocaleLowerCase\(\)/);
+  assert.match(app, /className=\{`public-profile-page profile-theme-\$\{design\.theme\} profile-font-\$\{design\.font\}/);
+  assert.match(app, /user\.isContact \? labels\.removeContact : labels\.addContact/);
+  assert.match(app, /<details className="profile-more-actions">[\s\S]*confirmBlock/);
+  assert.match(app, /user\.blocked && \([\s\S]*labels\.unblockUser/);
+  assert.match(app, /user\.about && \([\s\S]*labels\.about/);
+  assert.match(app, /sharedChats\.length > 0 && \([\s\S]*showAllSharedChats/);
+  assert.match(app, /polus:open-profile-community/);
+  assert.match(app, /polus:load-user-profile/);
+  assert.match(app, /const timer = window\.setTimeout\(\(\) => \{\s*document\.dispatchEvent\(new CustomEvent\("polus:load-user-profile"/);
+  assert.match(controller, /\/users\/\$\{encodeURIComponent\(username\)\}/);
+  assert.match(controller, /window\.history\.pushState\(\{ polusPage: true, polusUserProfile: true \}, "", path\)/);
+  assert.match(app, /function ProfileDesignEditor\(\{ user \}\)/);
+  assert.match(app, /Настроить профиль/);
+  assert.match(app, /section: "appearance"/);
+  assert.match(app, /\/api\/account\/profile-design/);
+  assert.match(app, /\/api\/account\/profile-cover/);
+  assert.match(app, /gradientStart: event\.target\.value/);
+  assert.match(app, /video\/mp4,video\/webm/);
+  assert.match(app, /AuthenticatedVideo src=\{user\.profileCoverUrl\}/);
+  assert.match(app, /backgroundImageEnabled/);
+  assert.match(app, /profile-avatar-frame-\$\{design\.avatarFrame\}/);
+  assert.match(app, /This server does not support profile design settings yet/);
+  assert.doesNotMatch(app, /id="profile-view-dialog"|profile-view-dialog/);
+  assert.match(app, /handleOpenProfileCommunity[\s\S]*bootstrap\.channels : bootstrap\.directs/);
+  assert.match(controller, /sharedGroup: t\("sharedGroup"\)[\s\S]*showAll: t\("showAll"\)/);
+  assert.match(styles, /\.public-profile-page \{/);
+  assert.match(styles, /\.public-profile-actions > \.secondary-button \{ color: #edf5ff; background: #263a52;/);
+  assert.match(styles, /\.profile-theme-ocean \.public-profile-actions > \.secondary-button/);
+  assert.match(styles, /\.public-profile-cover/);
+  assert.match(styles, /\.profile-effects-glow/);
+  assert.match(styles, /@keyframes profile-particles-drift/);
+  assert.match(styles, /@media \(max-width: 680px\) \{\s*\.public-profile-content/);
+  assert.match(styles, /@media \(prefers-reduced-motion: reduce\) \{\s*\.public-profile-page/);
+>>>>>>> Stashed changes
 });
 
 test("closes every native modal when the user clicks outside its dialog bounds", async () => {
@@ -242,9 +858,12 @@ test("pins Saved Messages above chats and hides unavailable controls in previews
     push: false
   });
   const appSource = await fs.readFile(require.resolve("../client/src/App.jsx"), "utf8");
+  const messageContentSource = await fs.readFile(require.resolve("../client/src/components/MessageContent.jsx"), "utf8");
   const controllerSource = await fs.readFile(require.resolve("../client/src/messengerController.js"), "utf8");
   const stylesSource = await fs.readFile(require.resolve("../public/styles.css"), "utf8");
   assert.doesNotMatch(appSource, /id="manage-chat"|id="chat-info"/);
+  assert.match(messageContentSource, /className="message-attachment-image"[\s\S]*?src=\{url\}/);
+  assert.match(appSource, /<AuthenticatedImage\s+key=\{attachment\.id\}\s+src=\{attachment\.thumbnailUrl/);
   assert.doesNotMatch(appSource, /id="chat-management-dialog"/);
   assert.match(appSource, /<ChatInfoDialogContent \/>\s*<\/dialog>/);
   assert.match(appSource, /<GroupSettingsPage[\s\S]*groupId=\{groupSettingsId\}/);
@@ -352,23 +971,23 @@ test("pins Saved Messages above chats and hides unavailable controls in previews
   assert.match(appSource, /onClick=\{\(\) => void startRecording\(\)\}/);
   assert.doesNotMatch(appSource, /startRecording\("video_note"\)/);
   assert.doesNotMatch(appSource, /video_note|VideoNotePlayer|recordVideo|recordingVideoLimit/);
-  assert.match(appSource, /<video controls preload="metadata" src=\{url\} \/>/);
+  assert.match(messageContentSource, /<video controls preload="metadata" src=\{url\} \/>/);
   assert.match(appSource, /new MediaRecorder\(stream/);
-  assert.match(appSource, /function VoiceMessagePlayer\(/);
-  assert.match(appSource, /preload="auto"/);
-  assert.match(appSource, /onPlaying=\{\(event\)/);
-  assert.match(appSource, /audio\.canPlayType\(attachment\.mimeType\) === ""/);
+  assert.match(messageContentSource, /function VoiceMessagePlayer\(/);
+  assert.match(messageContentSource, /preload="auto"/);
+  assert.match(messageContentSource, /onPlaying=\{\(event\)/);
+  assert.match(messageContentSource, /audio\.canPlayType\(attachment\.mimeType\) === ""/);
   assert.match(appSource, /if \(!navigator\.mediaDevices\?\.getUserMedia \|\| typeof MediaRecorder === "undefined"\) \{\s*voiceFileInput\.current\?\.click\(\)/);
   assert.match(appSource, /await navigator\.mediaDevices\.getUserMedia\(\{ audio: true \}\)/);
   assert.match(appSource, /if \(!window\.isSecureContext\) voiceFileInput\.current\?\.click\(\)/);
   assert.match(appSource, /recordVoiceHttp: "Записать голосовое сообщение/);
   assert.match(appSource, /recordVoiceHttp: "Record voice message/);
-  assert.match(appSource, /let activeVoiceMessageAudio = null/);
-  assert.match(appSource, /if \(activeVoiceMessageAudio && activeVoiceMessageAudio !== audio\)\s*\{\s*activeVoiceMessageAudio\.pause\(\)/);
-  assert.match(appSource, /if \(activeVoiceMessageAudio === audio\) activeVoiceMessageAudio = null/);
-  assert.match(appSource, /if \(activeVoiceMessageAudio === event\.currentTarget\) activeVoiceMessageAudio = null/);
-  assert.match(appSource, /const current = event\.currentTarget\.currentTime;\s*setPlayback\(\(playback\) => \(\{ \.\.\.playback, current \}\)\)/);
-  assert.match(appSource, /const duration = event\.currentTarget\.duration;\s*setPlayback\(\(current\) => \(\{ \.\.\.current, duration \}\)\)/);
+  assert.match(messageContentSource, /let activeVoiceMessageAudio = null/);
+  assert.match(messageContentSource, /if \(activeVoiceMessageAudio && activeVoiceMessageAudio !== audio\)\s*\{\s*activeVoiceMessageAudio\.pause\(\)/);
+  assert.match(messageContentSource, /if \(activeVoiceMessageAudio === audio\) activeVoiceMessageAudio = null/);
+  assert.match(messageContentSource, /if \(activeVoiceMessageAudio === event\.currentTarget\) activeVoiceMessageAudio = null/);
+  assert.match(messageContentSource, /const current = event\.currentTarget\.currentTime;\s*setPlayback\(\(playback\) => \(\{ \.\.\.playback, current \}\)\)/);
+  assert.match(messageContentSource, /const duration = event\.currentTarget\.duration;\s*setPlayback\(\(current\) => \(\{ \.\.\.current, duration \}\)\)/);
   assert.match(appSource, /setPendingRecording\(\{ file, duration \}\)/);
   assert.match(appSource, /recordingCancelledRef\.current = true;\s*setPendingRecording\(null\)/);
   assert.match(appSource, /function sendPendingRecording\(/);
@@ -429,6 +1048,9 @@ test("provides reaction, reply, and searchable message-forwarding controls", asy
     "utf8"
   );
   const stylesSource = await fs.readFile(require.resolve("../public/styles.css"), "utf8");
+  assert.match(controllerSource, /async function applyMessageMutation\(message\)[\s\S]*?const wasAtBottom = isMessageListAtBottom\(\);[\s\S]*?renderMessages\(wasAtBottom \? \{\} : \{ keepScrollTop: true, previousTop \}\);/);
+  assert.match(controllerSource, /async function openConversation\(conversation\)[\s\S]*?messages = await Promise\.all\(history\.messages\.reverse\(\)[\s\S]*?renderMessages\(\);/);
+  assert.doesNotMatch(stylesSource, /\.message-list\s*\{[^}]*scroll-behavior:\s*smooth/s);
   assert.match(appSource, /function ForwardMessageDialog\(\)/);
   assert.match(appSource, /id="forward-message-dialog"/);
   assert.match(appSource, /id="forward-user-search"/);
