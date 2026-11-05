@@ -787,13 +787,6 @@ async function searchChat(queryValue) {
   }));
 }
 
-<<<<<<< Updated upstream
-async function openUserProfile(username) {
-  if (username.toLowerCase() === currentUser.username.toLowerCase()) {
-    closeDialog("profile-view-dialog");
-    document.dispatchEvent(new CustomEvent("polus:open-own-profile"));
-    return;
-=======
 async function loadUserProfile(username) {
   let response;
   try {
@@ -803,7 +796,6 @@ async function loadUserProfile(username) {
       detail: { username, message: localizeError(error.message) }
     }));
     throw error;
->>>>>>> Stashed changes
   }
   const { user: target, sharedChats, sharedMedia, canMessage } = response;
   const targetDirect = [currentConversation, ...directs].find((chat) =>
@@ -1577,11 +1569,7 @@ function registerControllerListeners() {
           method: user.isContact ? "DELETE" : "PUT"
         });
         document.dispatchEvent(new CustomEvent("polus:contacts-changed"));
-<<<<<<< Updated upstream
-        await openUserProfile(username);
-=======
         await loadUserProfile(username);
->>>>>>> Stashed changes
         notify(t(user.isContact ? "contactRemoved" : "contactAdded"));
         return;
       }

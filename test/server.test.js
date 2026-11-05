@@ -172,10 +172,7 @@ test("persists account-key hashes for isolated sessions in SQLite", async () => 
       fullName: "Account User",
       passwordHash: "salt:hash"
     });
-<<<<<<< Updated upstream
-=======
 
->>>>>>> Stashed changes
     loaded.store.sessions.push({
       id: "account-session",
       userId: "account-user",
@@ -197,8 +194,6 @@ test("persists account-key hashes for isolated sessions in SQLite", async () => 
   }
 });
 
-<<<<<<< Updated upstream
-=======
 test("persists session creation times in SQLite", async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "polus-session-created-"));
   let database;
@@ -295,7 +290,6 @@ test("serves the shared encryption key only to authenticated accounts", async ()
   });
 });
 
->>>>>>> Stashed changes
 test("normalizes exactly one saved chat per user, including legacy single-member records", () => {
   const store = createEmptyStore();
   store.users.push(
@@ -1176,14 +1170,9 @@ test("serves Polus, its logo, privacy page and English/Russian app", async () =>
     assert.match(reactSource, /requestJson\(`\/api\/messages\?\$\{query\}`\)/);
     assert.match(reactSource, /requestJson\(\"\/api\/conversations\/read\"/);
     assert.doesNotMatch(controllerSource, /new EventSource|\/api\/stream|\/api\/presence\/chat|reportChatViewingState|viewingHeartbeatTimer/);
-<<<<<<< Updated upstream
-    assert.match(reactSource, /new EventSource\(accountApiUrl\(\"\/api\/stream\", accountKey\)\)/);
-    assert.match(reactSource, /fetch\(accountApiUrl\(\"\/api\/presence\/chat\", accountKey\)/);
-=======
     assert.match(reactSource, /connectEventStream\(\"\/api\/stream\", \{/);
     assert.match(reactSource, /fetch\(\"\/api\/presence\/chat\", \{/);
     assert.doesNotMatch(reactSource, /new EventSource|accountApiUrl/);
->>>>>>> Stashed changes
     assert.match(reactSource, /document\.addEventListener\(\"polus:composer-state\", handlePresenceConversation\)/);
     assert.match(reactSource, /polus:realtime-message/);
     assert.match(reactSource, /ПОЛЮС/);
@@ -1536,8 +1525,6 @@ test("isolates account sessions by account key and revokes only the selected acc
     assert.equal((await fetch(`${baseUrl}/api/bootstrap`, authenticatedRequest(firstCookie, {
       headers: { "X-Polus-Account": secondKey }
     }))).status, 401);
-<<<<<<< Updated upstream
-=======
     const streamController = new AbortController();
     const scopedStream = await fetch(`${baseUrl}/api/stream`, {
       headers: { Cookie: firstCookie, "X-Polus-Account": firstKey },
@@ -1545,7 +1532,6 @@ test("isolates account sessions by account key and revokes only the selected acc
     });
     assert.equal(scopedStream.status, 200);
     streamController.abort();
->>>>>>> Stashed changes
     assert.equal((await fetch(`${baseUrl}/api/stream?accountKey=${secondKey}`, {
       headers: { Cookie: firstCookie }
     })).status, 401);
@@ -1562,8 +1548,6 @@ test("isolates account sessions by account key and revokes only the selected acc
   });
 });
 
-<<<<<<< Updated upstream
-=======
 test("migrates legacy encryption-key wrapping without changing the public identity", async () => {
   await withServer({ store: createEmptyStore() }, async (baseUrl) => {
     const account = await register(baseUrl, "key_migration", "Key Migration");
@@ -1770,7 +1754,6 @@ test("rewraps a legacy encryption key atomically with the account password chang
   });
 });
 
->>>>>>> Stashed changes
 test("enforces account limits, permits an 8-character password, and edits profile about", async () => {
   await withServer({ store: createEmptyStore() }, async (baseUrl) => {
     const longUsername = "a".repeat(32);

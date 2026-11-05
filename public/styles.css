@@ -2326,8 +2326,6 @@ button { color: inherit; }
 }
 @media (prefers-reduced-motion: reduce) {
   .profile-shared-chat { transition: none; }
-<<<<<<< Updated upstream
-=======
 }
 
 .public-profile-page {
@@ -2540,5 +2538,4 @@ button { color: inherit; }
   .reduce-profile-motion *,
   .reduce-profile-motion *::before,
   .reduce-profile-motion *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
->>>>>>> Stashed changes
 }

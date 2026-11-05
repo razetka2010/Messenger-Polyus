@@ -1,17 +1,11 @@
 import { createRoot } from "react-dom/client";
 import { Component, createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-<<<<<<< Updated upstream
-import { accountApiUrl, getActiveAccountKey, requestJson, setActiveAccountKey } from "./apiClient.mjs";
-import { createAccountKey, getRequestedAccountUserId, getStoredAccounts, saveAccounts } from "./accounts.mjs";
-import { createImageThumbnail, uploadAttachment, uploadAttachmentThumbnail } from "./attachmentUploads.mjs";
-=======
 import { connectEventStream, getActiveAccountKey, requestJson, setActiveAccountKey } from "./apiClient.mjs";
 import { createAccountKey, getRequestedAccountUserId, getStoredAccounts, saveAccounts } from "./accounts.mjs";
 import { uploadAttachment } from "./attachmentUploads.mjs";
 import { formatAttachmentSize } from "./attachmentFormatting.mjs";
 import { MessageAttachment, MessageText } from "./components/MessageContent.jsx";
 import AuthenticatedImage, { AuthenticatedVideo } from "./components/AuthenticatedImage.jsx";
->>>>>>> Stashed changes
 import { cropAvatar } from "./avatar.mjs";
 import { getConversationHeaderControls, orderConversations } from "./conversationList.mjs";
 import { clearClientDiagnostics, createClientId, getClientDiagnostics, logClientDiagnostic } from "./diagnostics.mjs";
@@ -493,11 +487,7 @@ function SidebarSearch() {
   const [query, setQuery] = useState("");
   const searchRef = useRef(null);
   const language = useCurrentLanguage();
-<<<<<<< Updated upstream
-  useLayoutEffect(() => {
-=======
   useEffect(() => {
->>>>>>> Stashed changes
     const clear = () => {
       setQuery("");
       document.dispatchEvent(new CustomEvent("polus:sidebar-search", { detail: { query: "" } }));
@@ -1449,11 +1439,7 @@ function ContactsPage({ onBack }) {
     try {
       setContacts(await requestJson("/api/contacts"));
     } catch (cause) {
-<<<<<<< Updated upstream
-      setError(cause.message);
-=======
       showError(cause);
->>>>>>> Stashed changes
     } finally {
       setLoading(false);
     }
@@ -1480,11 +1466,7 @@ function ContactsPage({ onBack }) {
         detail: russian ? "Контакт удалён." : "Contact removed."
       }));
     } catch (cause) {
-<<<<<<< Updated upstream
-      setError(cause.message);
-=======
       showError(cause);
->>>>>>> Stashed changes
     }
   };
   const activity = (contact) => {
@@ -1553,11 +1535,7 @@ function ContactsPage({ onBack }) {
                   document.dispatchEvent(new CustomEvent("polus:open-profile", { detail: { username: contact.username } }))}>
                   <span className={`contact-avatar avatar-tone-${avatarTone(contact.id)}`}>
                     {contact.avatarUrl
-<<<<<<< Updated upstream
-                      ? <img src={accountApiUrl(contact.avatarUrl, getActiveAccountKey())} alt="" />
-=======
                       ? <AuthenticatedImage src={contact.avatarUrl} alt="" />
->>>>>>> Stashed changes
                       : initials(contact.fullName)}
                     {contact.online && <i className="contact-online-dot" aria-label={russian ? "В сети" : "Online"} />}
                   </span>
@@ -1801,11 +1779,7 @@ function UserPicker() {
                     aria-label={`${user.fullName} @${user.username}`}
                     onChange={() => setSelectedIds([user.id])} />
                   <span className={`result-avatar avatar-tone-${avatarTone(user.id)}`}>
-<<<<<<< Updated upstream
-                    {user.avatarUrl ? <img src={accountApiUrl(user.avatarUrl, getActiveAccountKey())} alt="" /> : initials(user.fullName)}
-=======
                     {user.avatarUrl ? <AuthenticatedImage src={user.avatarUrl} alt="" /> : initials(user.fullName)}
->>>>>>> Stashed changes
                   </span>
                   <span className="result-copy"><strong>{user.fullName}</strong><small>@{user.username}</small></span>
                   {user.isContact && <small>{russian ? "Уже в контактах" : "Already a contact"}</small>}
@@ -1836,11 +1810,7 @@ function UserPicker() {
               <label className="user-picker-row" key={contact.id}>
                 <input type="checkbox" checked={selectedIds.includes(contact.id)} onChange={() => toggle(contact.id)} />
                 <span className={`result-avatar avatar-tone-${avatarTone(contact.id)}`}>
-<<<<<<< Updated upstream
-                  {contact.avatarUrl ? <img src={accountApiUrl(contact.avatarUrl, getActiveAccountKey())} alt="" /> : initials(contact.fullName)}
-=======
                   {contact.avatarUrl ? <AuthenticatedImage src={contact.avatarUrl} alt="" /> : initials(contact.fullName)}
->>>>>>> Stashed changes
                 </span>
                 <span className="result-copy"><strong>{contact.fullName}</strong><small>@{contact.username}</small></span>
               </label>
@@ -1861,7 +1831,6 @@ function UserPicker() {
                 : (russian ? "Добавить в группу" : "Add to group")}
         </button>
       </div>
-<<<<<<< Updated upstream
     </dialog>
   );
 }
@@ -1906,166 +1875,6 @@ function ContactShareDialog() {
       } catch (cause) {
         if (requestIdRef.current === requestId) setError(cause.message);
       }
-    };
-    const close = () => {
-      requestIdRef.current += 1;
-      dialogRef.current?.close();
-    };
-    document.addEventListener("polus:open-contact-share", open);
-    document.addEventListener("polus:close-contact-share", close);
-    return () => {
-      requestIdRef.current += 1;
-      document.removeEventListener("polus:open-contact-share", open);
-      document.removeEventListener("polus:close-contact-share", close);
-    };
-  }, [language, russian]);
-
-  const close = () => {
-    requestIdRef.current += 1;
-    dialogRef.current?.close();
-    document.dispatchEvent(new CustomEvent("polus:dialog-open-state", { detail: { id: "contact-share-dialog", open: false } }));
-  };
-  const confirm = async () => {
-    const chat = chats.find((item) => item.id === selectedId);
-    if (!chat || !target) return;
-    setBusy(true);
-    setError("");
-    try {
-      if (target.type === "channel" && !chat.isPrivate) {
-        const result = await requestJson(`/api/chats/${encodeURIComponent(chat.id)}/invite`, { method: "POST" });
-        const url = `${window.location.origin}${result.inviteUrl}`;
-        setInviteUrl(url);
-        try {
-          await navigator.clipboard.writeText(url);
-          document.dispatchEvent(new CustomEvent("polus:notify", {
-            detail: russian ? "Ссылка скопирована. Отправьте её контакту." : "Invite link copied. Share it with the contact."
-          }));
-          close();
-        } catch {
-          setError(russian ? "Скопируйте ссылку и отправьте её контакту." : "Copy this link and share it with the contact.");
-        }
-      } else {
-        await requestJson(`/api/chats/${encodeURIComponent(chat.id)}/members`, {
-          method: "POST",
-          body: JSON.stringify({ usernames: [target.username] })
-        });
-        document.dispatchEvent(new CustomEvent("polus:notify", {
-          detail: target.type === "group"
-            ? (russian ? "Контакт добавлен в группу." : "Contact added to the group.")
-            : (russian ? "Контакт приглашён в канал." : "Contact invited to the channel.")
-        }));
-        close();
-      }
-    } catch (cause) {
-      setError(cause.message);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <dialog id="contact-share-dialog" className="dialog user-picker-dialog" ref={dialogRef}
-      onClose={() => {
-        requestIdRef.current += 1;
-        document.dispatchEvent(new CustomEvent("polus:dialog-open-state", {
-          detail: { id: "contact-share-dialog", open: false }
-        }));
-      }}>
-      <div className="dialog-top">
-        <div><div className="eyebrow">{russian ? "КОНТАКТЫ" : "CONTACTS"}</div>
-          <h2>{target?.type === "group" ? (russian ? "Добавить в группу" : "Add to group") : (russian ? "Пригласить в канал" : "Invite to channel")}</h2>
-          {target && <p className="user-picker-hint">{target.username}</p>}
-        </div>
-        <button className="icon-button dialog-close" type="button" aria-label={russian ? "Закрыть" : "Close"} onClick={close}>×</button>
-      </div>
-      {inviteUrl && <input className="text-field" readOnly value={inviteUrl} onFocus={(event) => event.currentTarget.select()} />}
-      <div className="user-picker-list">
-        {chats.length === 0
-          ? <p className="contacts-empty">{error || (russian ? "Нет доступных чатов для этого действия." : "No chats are available for this action.")}</p>
-          : chats.map((chat) => (
-            <label className="user-picker-row" key={chat.id}>
-              <input type="radio" name="contact-share-chat" checked={selectedId === chat.id}
-                onChange={() => setSelectedId(chat.id)} />
-              <span className="discovery-avatar avatar-tone-5">{initials(chat.name)}</span>
-              <span className="result-copy"><strong>{chat.name}</strong>
-                <small>{chat.type === "channel" && !chat.isPrivate
-                  ? (russian ? "Публичный канал · приглашение по ссылке" : "Public channel · invite by link")
-                  : chat.type === "channel" ? (russian ? "Канал" : "Channel") : (russian ? "Группа" : "Group")}</small>
-              </span>
-            </label>
-          ))}
-      </div>
-      {error && chats.length > 0 && <div className="form-error" role="alert">{error}</div>}
-      <div className="user-picker-footer">
-        <button className="primary-button" type="button" disabled={busy || !selectedId} onClick={() => void confirm()}>
-          {busy ? "…" : russian ? "Продолжить" : "Continue"}
-        </button>
-      </div>
-=======
->>>>>>> Stashed changes
-    </dialog>
-  );
-}
-
-<<<<<<< Updated upstream
-function UserProfileContent() {
-  const [profile, setProfile] = useState(null);
-  const [showAllSharedChats, setShowAllSharedChats] = useState(false);
-  const [showAllSharedMedia, setShowAllSharedMedia] = useState(false);
-  const language = useCurrentLanguage();
-  const russian = language === "ru";
-
-  useLayoutEffect(() => {
-    const onProfile = (event) => {
-      setProfile(event.detail);
-      setShowAllSharedChats(false);
-      setShowAllSharedMedia(false);
-    };
-    document.addEventListener("polus:user-profile-changed", onProfile);
-    return () => {
-      document.removeEventListener("polus:user-profile-changed", onProfile);
-=======
-function ContactShareDialog() {
-  const dialogRef = useRef(null);
-  const requestIdRef = useRef(0);
-  const [target, setTarget] = useState(null);
-  const [chats, setChats] = useState([]);
-  const [selectedId, setSelectedId] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  const [inviteUrl, setInviteUrl] = useState("");
-  const language = useCurrentLanguage();
-  const russian = language === "ru";
-
-  useEffect(() => {
-    const open = async (event) => {
-      const next = event.detail || {};
-      const requestId = ++requestIdRef.current;
-      setTarget(next);
-      setSelectedId("");
-      setError("");
-      setInviteUrl("");
-      if (!dialogRef.current?.open) dialogRef.current?.showModal();
-      document.dispatchEvent(new CustomEvent("polus:dialog-open-state", { detail: { id: "contact-share-dialog", open: true } }));
-      try {
-        const [profile, bootstrap] = await Promise.all([
-          requestJson(`/api/users/${encodeURIComponent(next.username)}/profile`),
-          requestJson("/api/bootstrap")
-        ]);
-        if (requestIdRef.current !== requestId) return;
-        if (profile.user.blocked || !profile.canMessage) {
-          setError(russian ? "Это действие недоступно для этого пользователя." : "This action is unavailable for this user.");
-          setChats([]);
-          return;
-        }
-        const source = next.type === "group" ? bootstrap.directs : bootstrap.channels;
-        setChats(source.filter((chat) => (next.type === "group" ? chat.type === "group" : chat.type === "channel")
-          && chat.joined !== false && ["owner", "admin"].includes(chat.role)
-          && !chat.memberIds.includes(profile.user.id)));
-      } catch (cause) {
-        if (requestIdRef.current === requestId) setError(cause.message);
-      }
->>>>>>> Stashed changes
     };
     const close = () => {
       requestIdRef.current += 1;
@@ -2236,19 +2045,14 @@ function UserProfileContent({ username, currentUserId, currentUsername, onBack }
     );
   }
   const { user, sharedChats, sharedMedia, canMessage, labels, status, registered, muted } = profile;
-<<<<<<< Updated upstream
-=======
   const design = { ...DEFAULT_PROFILE_DESIGN, ...(user.profileDesign || {}) };
   const ownProfile = user.id === currentUserId
     || user.username?.toLocaleLowerCase() === currentUsername?.toLocaleLowerCase();
->>>>>>> Stashed changes
   const visibleSharedChats = showAllSharedChats ? sharedChats : sharedChats.slice(0, 4);
   const visibleSharedMedia = showAllSharedMedia ? sharedMedia : sharedMedia.slice(0, 8);
   const trigger = (action) => document.dispatchEvent(new CustomEvent("polus:user-profile-action", {
     detail: { action, username: user.username }
   }));
-<<<<<<< Updated upstream
-=======
   const shareProfile = async () => {
     const url = window.location.href;
     try {
@@ -2267,7 +2071,6 @@ function UserProfileContent({ username, currentUserId, currentUsername, onBack }
       }
     }
   };
->>>>>>> Stashed changes
   const confirmBlock = () => {
     if (window.confirm(russian
       ? `Заблокировать пользователя @${user.username}?`
@@ -2276,137 +2079,6 @@ function UserProfileContent({ username, currentUserId, currentUsername, onBack }
     }
   };
   return (
-<<<<<<< Updated upstream
-    <div id="profile-view-content">
-      <header className="user-profile-dialog-header">
-        <span>{russian ? "ПРОФИЛЬ" : "PROFILE"}</span>
-        <button
-          className="icon-button dialog-close"
-          type="button"
-          aria-label={russian ? "Закрыть профиль" : "Close profile"}
-          onClick={() => document.dispatchEvent(new CustomEvent("polus:close-dialog", {
-            detail: { id: "profile-view-dialog" }
-          }))}
-        >×</button>
-      </header>
-      <section className="user-profile-hero">
-        <div className="user-profile-avatar">
-          {user.avatarUrl ? <img src={user.avatarUrl} alt="" /> : initials(user.fullName)}
-        </div>
-        <div className="user-profile-identity">
-          <h3>{user.fullName}</h3>
-          <span className="user-profile-handle">@{user.username}</span>
-          {status && <span className={`user-profile-status${user.online ? " is-online" : ""}`}>{status}</span>}
-          {registered && <span className="user-profile-joined">{labels.registered}: {registered}</span>}
-        </div>
-      </section>
-      {user.blocked && (
-        <div className="user-profile-blocked" role="status">
-          <span>{labels.blockedInfo}</span>
-          <button className="text-button" type="button" onClick={() => trigger("toggle-block")}>
-            {labels.unblockUser}
-          </button>
-        </div>
-      )}
-      <div className="profile-actions">
-        {canMessage && (
-          <button className="primary-button profile-message-button" type="button" onClick={() => trigger("message")}>
-            {labels.writeToUser}
-          </button>
-        )}
-        {canMessage && (
-          <div className="profile-secondary-actions">
-            <button className="text-button" type="button" onClick={() => trigger("toggle-contact")}>
-              {user.isContact ? labels.removeContact : labels.addContact}
-            </button>
-            <button className="text-button" type="button" onClick={() => trigger("share-to-group")}>
-              {labels.addToGroup}
-            </button>
-            <button className="text-button" type="button" onClick={() => trigger("share-to-channel")}>
-              {labels.inviteToChannel}
-            </button>
-            {muted !== null && (
-              <button className="text-button" type="button" onClick={() => trigger("toggle-mute")}>
-                {muted ? labels.unmuteChat : labels.muteChat}
-              </button>
-            )}
-          </div>
-        )}
-        {!user.blocked && (
-          <details className="profile-more-actions">
-            <summary>{russian ? "Дополнительно" : "More"}</summary>
-            <div className="profile-more-menu">
-              <button className="danger-button" type="button" onClick={confirmBlock}>
-                {labels.blockUser}
-              </button>
-            </div>
-          </details>
-        )}
-      </div>
-      {user.about ? (
-        <section className="profile-detail-section">
-          <h3>{labels.about}</h3>
-          <p className="profile-about-copy">{user.about}</p>
-        </section>
-      ) : (
-        <p className="profile-no-about">{labels.noAbout}</p>
-      )}
-      {sharedChats.length > 0 && (
-        <section className="profile-shared-section">
-          <div className="profile-shared-heading">
-            <h3>{labels.sharedChats}</h3>
-            {sharedChats.length > 4 && (
-              <button className="text-button" type="button" onClick={() => setShowAllSharedChats((value) => !value)}>
-                {showAllSharedChats ? labels.showLess : `${labels.showAll} (${sharedChats.length})`}
-              </button>
-            )}
-          </div>
-          <div className="profile-shared-chats">
-            {visibleSharedChats.map((chat) => (
-              <button
-                className="profile-shared-chat"
-                key={chat.id}
-                type="button"
-                onClick={() => document.dispatchEvent(new CustomEvent("polus:open-profile-community", {
-                  detail: { id: chat.id, type: chat.type }
-                }))}
-              >
-                <span className={`profile-shared-chat-icon${chat.type === "channel" ? " is-channel" : ""}`}>
-                  {chat.type === "channel" ? "#" : initials(chat.name)}
-                </span>
-                <span className="profile-shared-chat-copy">
-                  <strong>{chat.name}</strong>
-                  <small>{chat.type === "channel" ? labels.sharedChannel : labels.sharedGroup}</small>
-                </span>
-                <span className="profile-shared-chat-arrow" aria-hidden="true">›</span>
-              </button>
-            ))}
-          </div>
-        </section>
-      )}
-      {sharedMedia.length > 0 && (
-        <section className="profile-shared-section">
-          <div className="profile-shared-heading">
-            <h3>{labels.sharedMedia}</h3>
-            {sharedMedia.length > 8 && (
-              <button className="text-button" type="button" onClick={() => setShowAllSharedMedia((value) => !value)}>
-                {showAllSharedMedia ? labels.showLess : `${labels.showAll} (${sharedMedia.length})`}
-              </button>
-            )}
-          </div>
-          <div className="media-grid profile-media-grid">
-            {visibleSharedMedia.map((attachment) => (
-              <img
-                key={attachment.id}
-                src={attachment.thumbnailUrl || `/api/attachments/${encodeURIComponent(attachment.id)}`}
-                alt={attachment.name}
-              />
-            ))}
-          </div>
-        </section>
-      )}
-    </div>
-=======
     <main
       ref={profilePageRef}
       className={`public-profile-page profile-theme-${design.theme} profile-font-${design.font} profile-effects-${design.effects} profile-animation-${design.animation}${design.motionEnabled ? "" : " reduce-profile-motion"}`}
@@ -2540,7 +2212,6 @@ function UserProfileContent({ username, currentUserId, currentUsername, onBack }
         </section>
       </div>
     </main>
->>>>>>> Stashed changes
   );
 }
 
@@ -4363,11 +4034,7 @@ function SidebarMenu({
       >
         <span id="profile-avatar" className="profile-avatar">
           {user?.avatarUrl
-<<<<<<< Updated upstream
-            ? <img src={accountApiUrl(user.avatarUrl, activeAccountKey)} alt="" />
-=======
             ? <AuthenticatedImage src={user.avatarUrl} accountKey={activeAccountKey} alt="" />
->>>>>>> Stashed changes
             : initials(user?.fullName || (language === "ru" ? "Пользователь" : "User"))}
         </span>
         <span className="profile-copy">
@@ -4392,11 +4059,7 @@ function SidebarMenu({
           >
             <span className="account-switcher-avatar">
               {account.user.avatarUrl
-<<<<<<< Updated upstream
-                ? <img src={accountApiUrl(account.user.avatarUrl, account.key)} alt="" />
-=======
                 ? <AuthenticatedImage src={account.user.avatarUrl} accountKey={account.key} alt="" />
->>>>>>> Stashed changes
                 : initials(account.user.fullName || account.user.username)}
             </span>
             <span className="profile-copy">
@@ -5877,11 +5540,7 @@ function ReactDialogs({ user }) {
     const openDialog = (event) => show(event.detail.id);
     const closeDialog = (event) => close(event.detail.id);
     const ids = [
-<<<<<<< Updated upstream
-      "chat-info-dialog", "chat-search-dialog", "forward-message-dialog", "profile-view-dialog",
-=======
       "chat-info-dialog", "chat-search-dialog", "forward-message-dialog",
->>>>>>> Stashed changes
       "media-viewer", "channel-dialog", "group-dialog", "settings-dialog",
       "user-picker-dialog", "contact-share-dialog"
     ];
@@ -5921,13 +5580,6 @@ function ReactDialogs({ user }) {
       <ChatSearchDialog />
       <ForwardMessageDialog />
 
-<<<<<<< Updated upstream
-      <dialog id="profile-view-dialog" className="dialog profile-view-dialog">
-        <UserProfileContent />
-      </dialog>
-
-=======
->>>>>>> Stashed changes
       <MediaViewer />
 
       <dialog id="channel-dialog" className="dialog">
@@ -6010,11 +5662,7 @@ function AccountManagementDialog({ open, onClose, accounts, activeAccountKey, on
             >
               <span className="account-switcher-avatar">
                 {account.user.avatarUrl
-<<<<<<< Updated upstream
-                  ? <img src={accountApiUrl(account.user.avatarUrl, account.key)} alt="" />
-=======
                   ? <AuthenticatedImage src={account.user.avatarUrl} accountKey={account.key} alt="" />
->>>>>>> Stashed changes
                   : initials(account.user.fullName || account.user.username)}
               </span>
               <span className="profile-copy">
@@ -6076,8 +5724,6 @@ function MessengerShell({
   const [accountsDialogOpen, setAccountsDialogOpen] = useState(false);
   const [profilePage, setProfilePage] = useState(() => window.location.pathname === "/profile");
   const [contactsPage, setContactsPage] = useState(() => window.location.pathname === "/contacts");
-<<<<<<< Updated upstream
-=======
   const [publicProfileUsername, setPublicProfileUsername] = useState(() => {
     const match = /^\/users\/([^/]+)$/.exec(window.location.pathname);
     if (!match) return null;
@@ -6087,7 +5733,6 @@ function MessengerShell({
       return null;
     }
   });
->>>>>>> Stashed changes
   const [channelProfileId, setChannelProfileId] = useState(() =>
     /^\/channels\/([^/]+)$/.exec(window.location.pathname)?.[1] || null);
   const [channelSettingsId, setChannelSettingsId] = useState(() =>
@@ -6155,10 +5800,7 @@ function MessengerShell({
       }
       setContactsPage(true);
       setProfilePage(false);
-<<<<<<< Updated upstream
-=======
       setPublicProfileUsername(null);
->>>>>>> Stashed changes
       setChannelProfileId(null);
       setChannelSettingsId(null);
       setGroupSettingsId(null);
@@ -6170,7 +5812,7 @@ function MessengerShell({
       const visible = !forceHidden && Boolean(messengerView?.isConnected && !messengerView.hidden)
         && document.visibilityState === "visible"
         && Boolean(currentConversation && !currentConversation.pending);
-      return fetch(accountApiUrl("/api/presence/chat", accountKey), {
+      return fetch("/api/presence/chat", {
         method: "POST",
         credentials: "same-origin",
         keepalive: forceHidden,
@@ -6243,10 +5885,7 @@ function MessengerShell({
       window.history.pushState({ polusPage: true }, "", `/groups/${encodeURIComponent(groupId)}/settings`);
       setContactsPage(false);
       setProfilePage(false);
-<<<<<<< Updated upstream
-=======
       setPublicProfileUsername(null);
->>>>>>> Stashed changes
       setChannelProfileId(null);
       setChannelSettingsId(null);
       setGroupSettingsId(groupId);
@@ -6258,10 +5897,7 @@ function MessengerShell({
       window.history.replaceState({}, "", "/");
       setContactsPage(false);
       setProfilePage(false);
-<<<<<<< Updated upstream
-=======
       setPublicProfileUsername(null);
->>>>>>> Stashed changes
       setChannelProfileId(null);
       setChannelSettingsId(null);
       setGroupSettingsId(null);
@@ -6319,8 +5955,6 @@ function MessengerShell({
         }
         return;
       }
-<<<<<<< Updated upstream
-=======
       if (/^\/users\/[^/]+$/.test(window.location.pathname)) {
         if (window.history.state?.polusPage) {
           window.history.back();
@@ -6332,7 +5966,6 @@ function MessengerShell({
         }
         return;
       }
->>>>>>> Stashed changes
       if (window.history.state?.polusPage || window.history.state?.polusProfilePage) {
         window.history.back();
       } else {
@@ -6357,10 +5990,7 @@ function MessengerShell({
         activeGroupSettingsId = null;
         window.history.replaceState({}, "", "/");
         setProfilePage(false);
-<<<<<<< Updated upstream
-=======
         setPublicProfileUsername(null);
->>>>>>> Stashed changes
         setChannelProfileId(null);
         setChannelSettingsId(null);
         setGroupSettingsId(null);
@@ -6402,12 +6032,6 @@ function MessengerShell({
             ? "Это сообщество больше недоступно."
             : "This community is no longer available.");
         }
-<<<<<<< Updated upstream
-        document.dispatchEvent(new CustomEvent("polus:close-dialog", {
-          detail: { id: "profile-view-dialog" }
-        }));
-=======
->>>>>>> Stashed changes
         document.dispatchEvent(new CustomEvent("polus:page-open-chat", { detail: { conversation } }));
       } catch (cause) {
         document.dispatchEvent(new CustomEvent("polus:notify", { detail: cause.message }));
@@ -6419,15 +6043,12 @@ function MessengerShell({
       const settingsGroupId = activeGroupSettingsId;
       setProfilePage(pathname === "/profile");
       setContactsPage(pathname === "/contacts");
-<<<<<<< Updated upstream
-=======
       const userProfile = /^\/users\/([^/]+)$/.exec(pathname);
       try {
         setPublicProfileUsername(userProfile ? decodeURIComponent(userProfile[1]) : null);
       } catch {
         setPublicProfileUsername(null);
       }
->>>>>>> Stashed changes
       setChannelProfileId(/^\/channels\/([^/]+)$/.exec(pathname)?.[1] || null);
       setChannelSettingsId(/^\/channels\/([^/]+)\/settings$/.exec(pathname)?.[1] || null);
       setGroupSettingsId(/^\/groups\/([^/]+)\/settings$/.exec(pathname)?.[1] || null);
@@ -6455,29 +6076,6 @@ function MessengerShell({
     };
     const connectRealtime = () => {
       eventStream?.close();
-<<<<<<< Updated upstream
-      const source = new EventSource(accountApiUrl("/api/stream", accountKey));
-      eventStream = source;
-      let hasOpened = false;
-      source.addEventListener("open", () => {
-        if (hasOpened) document.dispatchEvent(new CustomEvent("polus:realtime-resync"));
-        hasOpened = true;
-      });
-      source.addEventListener("message", (event) => dispatchRealtimeEvent("polus:realtime-message", event));
-      source.addEventListener("chat-updated", (event) =>
-        dispatchRealtimeEvent("polus:realtime-chat-updated", event));
-      source.addEventListener("message-updated", (event) =>
-        dispatchRealtimeEvent("polus:realtime-message-updated", event));
-      source.addEventListener("message-deleted", (event) =>
-        dispatchRealtimeEvent("polus:realtime-message-deleted", event));
-      source.addEventListener("messages-read", (event) =>
-        dispatchRealtimeEvent("polus:realtime-messages-read", event));
-      source.addEventListener("resync", () => {
-        document.dispatchEvent(new CustomEvent("polus:realtime-resync"));
-      });
-      source.addEventListener("error", () => {
-        if (eventStream === source && source.readyState === EventSource.CLOSED) {
-=======
       const source = connectEventStream("/api/stream", {
         accountKey,
         onEvent: (event) => {
@@ -6496,7 +6094,6 @@ function MessengerShell({
           if (hasReportedStreamError) return;
           hasReportedStreamError = true;
           console.error("Realtime stream failed:", cause);
->>>>>>> Stashed changes
           document.dispatchEvent(new CustomEvent("polus:notify", {
             detail: languageRef.current === "ru"
               ? "Не удалось подключиться к обновлениям. Повторная попытка..."
@@ -6552,10 +6149,7 @@ function MessengerShell({
         window.history.replaceState({}, "", "/");
         setContactsPage(false);
         setProfilePage(false);
-<<<<<<< Updated upstream
-=======
         setPublicProfileUsername(null);
->>>>>>> Stashed changes
         setChannelProfileId(null);
         setChannelSettingsId(null);
         setGroupSettingsId(null);
@@ -6813,11 +6407,7 @@ function MessengerShell({
   return (
     <>
     <main id="messenger-view" className="messenger-shell" hidden={
-<<<<<<< Updated upstream
-      hidden || profilePage || contactsPage || Boolean(channelProfileId) || Boolean(channelSettingsId)
-=======
       hidden || profilePage || contactsPage || Boolean(publicProfileUsername) || Boolean(channelProfileId) || Boolean(channelSettingsId)
->>>>>>> Stashed changes
       || Boolean(groupSettingsId) || Boolean(inviteToken)
     }>
       <aside id="chat-sidebar" className="sidebar">
@@ -6889,11 +6479,7 @@ function MessengerShell({
         </div>
         <MessageContextMenu />
         <ToastNotice />
-<<<<<<< Updated upstream
-        <Composer />
-=======
         <Composer user={user} accountKey={activeAccountKey} />
->>>>>>> Stashed changes
         <ChatDeleteDialog />
       </section>
     </main>
@@ -6913,8 +6499,6 @@ function MessengerShell({
         onBack={() => document.dispatchEvent(new CustomEvent("polus:profile-page-back"))}
       />
     )}
-<<<<<<< Updated upstream
-=======
     {!hidden && publicProfileUsername && (
       <UserProfileContent
         key={publicProfileUsername}
@@ -6924,7 +6508,6 @@ function MessengerShell({
         onBack={() => document.dispatchEvent(new CustomEvent("polus:profile-page-back"))}
       />
     )}
->>>>>>> Stashed changes
     {!hidden && profilePage && (
       <ProfileSettingsPage
         user={profileUser}
@@ -7010,14 +6593,10 @@ function AuthScreen({ language, onLanguageChange, onAuthenticated, accountKey, o
         body: JSON.stringify(payload),
         accountKey
       });
-<<<<<<< Updated upstream
-      onAuthenticated(user, accountKey);
-=======
       if (registering) {
         await ensureEncryptionIdentity(user.id, payload.password, "", accountKey);
       }
       await onAuthenticated(user, accountKey);
->>>>>>> Stashed changes
     } catch (cause) {
       setError(cause.message);
     } finally {
@@ -7308,17 +6887,11 @@ export default function App() {
               || validAccounts.find((account) => account.key === savedActiveKey)
               || validAccounts[0];
             if (selected) {
-<<<<<<< Updated upstream
-              setActiveAccountKey(selected.key);
-              setActiveAccountKeyState(selected.key);
-              setUser(selected.user);
-=======
               const identityReady = await hasReadyEncryptionIdentity(selected.user.id, selected.key);
               setActiveAccountKey(selected.key);
               setActiveAccountKeyState(selected.key);
               setUser(selected.user);
               setEncryptionReady(identityReady);
->>>>>>> Stashed changes
               if (requestedUserId) {
                 const url = new URL(window.location.href);
                 url.searchParams.delete("accountUserId");
@@ -7343,10 +6916,7 @@ export default function App() {
         setActiveAccountKey(key);
         setActiveAccountKeyState(key);
         setUser(attachedUser);
-<<<<<<< Updated upstream
-=======
         setEncryptionReady(await hasReadyEncryptionIdentity(attachedUser.id, key));
->>>>>>> Stashed changes
       } catch (cause) {
         if (active) setError(cause.message);
       } finally {
@@ -7367,8 +6937,6 @@ export default function App() {
     setActiveAccountKey(key);
     setActiveAccountKeyState(key);
     setUser(selected.user);
-<<<<<<< Updated upstream
-=======
     setEncryptionReady(false);
     setEncryptionChecking(true);
     void hasReadyEncryptionIdentity(selected.user.id, key).then((ready) => {
@@ -7382,7 +6950,6 @@ export default function App() {
         setEncryptionChecking(false);
       }
     });
->>>>>>> Stashed changes
     setAddingAccount(false);
     setError("");
     setPendingAccountKey(createAccountKey());
@@ -7396,8 +6963,6 @@ export default function App() {
       setActiveAccountKey(next.key);
       setActiveAccountKeyState(next.key);
       setUser(next.user);
-<<<<<<< Updated upstream
-=======
       setEncryptionReady(false);
       setEncryptionChecking(true);
       void hasReadyEncryptionIdentity(next.user.id, next.key).then((ready) => {
@@ -7411,16 +6976,12 @@ export default function App() {
           setEncryptionChecking(false);
         }
       });
->>>>>>> Stashed changes
     } else {
       setActiveAccountKey(null);
       setActiveAccountKeyState(null);
       setUser(null);
-<<<<<<< Updated upstream
-=======
       setEncryptionReady(false);
       setEncryptionChecking(false);
->>>>>>> Stashed changes
       setPendingAccountKey(createAccountKey());
     }
     setAddingAccount(false);
@@ -7436,25 +6997,17 @@ export default function App() {
     document.addEventListener("polus:account-session-invalid", invalidateAccount);
     return () => document.removeEventListener("polus:account-session-invalid", invalidateAccount);
   }, [accounts, removeAccount]);
-<<<<<<< Updated upstream
-  const handleAuthenticated = useCallback((authenticatedUser, key) => {
-    const account = { key: key || createAccountKey(), user: authenticatedUser, unreadCount: 0 };
-=======
   const handleAuthenticated = useCallback(async (authenticatedUser, key) => {
     const accountKey = key || createAccountKey();
     const encryptionReady = await hasReadyEncryptionIdentity(authenticatedUser.id, accountKey);
     const account = { key: accountKey, user: authenticatedUser, unreadCount: 0 };
->>>>>>> Stashed changes
     const nextAccounts = [...accounts.filter((item) => item.key !== account.key), account];
     commitAccounts(nextAccounts);
     setActiveAccountKey(account.key);
     setActiveAccountKeyState(account.key);
     setUser(authenticatedUser);
-<<<<<<< Updated upstream
-=======
     setEncryptionReady(encryptionReady);
     setEncryptionChecking(false);
->>>>>>> Stashed changes
     setAddingAccount(false);
     setError("");
     setPendingAccountKey(createAccountKey());
@@ -7486,41 +7039,6 @@ export default function App() {
     const sources = accountsRef.current
       .filter((account) => account.key !== activeAccountKey)
       .map((account) => {
-<<<<<<< Updated upstream
-        const source = new EventSource(accountApiUrl("/api/stream", account.key));
-        source.addEventListener("message", (event) => {
-          let message;
-          try {
-            message = JSON.parse(event.data);
-          } catch (cause) {
-            console.error("Invalid message received for a background account:", cause);
-            return;
-          }
-          if (message.author?.id === account.user.id) return;
-          const nextAccounts = accountsRef.current.map((item) =>
-            item.key === account.key ? { ...item, unreadCount: (item.unreadCount || 0) + 1 } : item);
-          accountsRef.current = nextAccounts;
-          try {
-            saveAccounts(nextAccounts);
-            setAccounts(nextAccounts);
-          } catch (cause) {
-            console.error("Unable to save background account unread state:", cause);
-          }
-          if (typeof Notification !== "undefined" && Notification.permission === "granted"
-            && "serviceWorker" in navigator) {
-            void navigator.serviceWorker.ready.then((registration) =>
-              registration.showNotification(`${message.author?.fullName || message.author?.username || "Полюс"}`, {
-                body: language === "ru" ? "Новое сообщение" : "New message",
-                icon: "/logo.svg",
-                badge: "/logo.svg",
-                tag: `${account.user.id}:${message.conversationId || ""}`,
-                data: {
-                  conversationId: message.conversationId || "",
-                  accountUserId: account.user.id
-                }
-              })).catch((cause) => console.error("Unable to show a background account notification:", cause));
-          }
-=======
         const source = connectEventStream("/api/stream", {
           accountKey: account.key,
           onEvent: (event) => {
@@ -7558,7 +7076,6 @@ export default function App() {
             }
           },
           onError: (cause) => console.error("Background account realtime stream failed:", cause)
->>>>>>> Stashed changes
         });
         return source;
       });
@@ -7571,9 +7088,6 @@ export default function App() {
         {loading
           ? <main className="auth-view" aria-busy="true">Загрузка Полюса…</main>
           : user
-<<<<<<< Updated upstream
-              ? (
-=======
                 ? encryptionChecking
                   ? <main className="auth-view" aria-busy="true">Загрузка Полюса…</main>
                   : !encryptionReady
@@ -7584,7 +7098,6 @@ export default function App() {
                   onUnlocked={() => setEncryptionReady(true)}
                 />
                 : (
->>>>>>> Stashed changes
                 <>
                   <MessengerShell
                     key={activeAccountKey}

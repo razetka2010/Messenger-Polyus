@@ -43,11 +43,7 @@ test("JSON API client sends same-origin JSON requests", async () => {
 });
 
 test("JSON API client binds each request and returned API resources to its account", async () => {
-<<<<<<< Updated upstream
-  const { accountApiUrl, requestJson } = await apiClientPromise;
-=======
   const { requestJson } = await apiClientPromise;
->>>>>>> Stashed changes
   const accountKey = "a".repeat(32);
   let request;
   globalThis.fetch = async (url, options) => {
@@ -59,10 +55,6 @@ test("JSON API client binds each request and returned API resources to its accou
 
   const response = await requestJson("/api/auth/me", { accountKey });
   assert.equal(request.options.headers["X-Polus-Account"], accountKey);
-<<<<<<< Updated upstream
-  assert.equal(new URLSearchParams(response.user.avatarUrl.split("?")[1]).get("accountKey"), accountKey);
-  assert.equal(accountApiUrl("/api/stream", accountKey), `/api/stream?accountKey=${accountKey}`);
-=======
   assert.equal(response.user.avatarUrl, "/api/avatars/user-1?v=avatar");
   assert.equal(request.url, "/api/auth/me");
   assert.doesNotMatch(request.url, /accountKey/);
@@ -115,7 +107,6 @@ test("authenticated resource fetches select the account through a header", async
   assert.equal(request.url, "/api/attachments/file-1");
   assert.equal(request.options.headers["X-Polus-Account"], accountKey);
   assert.deepEqual([...new Uint8Array(await blob.arrayBuffer())], [1, 2, 3]);
->>>>>>> Stashed changes
 });
 
 test("JSON API client preserves server errors and response status", async () => {
@@ -144,8 +135,6 @@ test("JSON API client reports invalid successful responses", async () => {
   });
 });
 
-<<<<<<< Updated upstream
-=======
 test("encrypted attachment uploads hide the original file name and MIME type", async () => {
   const { uploadAttachment } = await attachmentUploadsPromise;
   const originalXhr = globalThis.XMLHttpRequest;
@@ -263,7 +252,6 @@ test("encrypts attachments in authenticated chunks and decrypts them from a stre
   assert.deepEqual(new Uint8Array(await legacyDecrypted.arrayBuffer()), legacyPlaintext);
 });
 
->>>>>>> Stashed changes
 test("privacy page exposes bilingual policy sections and in-page navigation", async () => {
   const [page, script, styles] = await Promise.all([
     fs.readFile(require.resolve("../public/privacy.html"), "utf8"),
@@ -766,30 +754,12 @@ test("integrates contacts navigation, profiles, and reusable group/channel membe
   assert.match(styles, /@media \(max-width: 760px\) \{\s*\.contacts-page-header/);
 });
 
-<<<<<<< Updated upstream
-test("presents other-user profiles with accessible actions and openable shared communities", async () => {
-=======
 test("presents public user profiles as themed pages with accessible actions and shared communities", async () => {
->>>>>>> Stashed changes
   const [app, controller, styles] = await Promise.all([
     fs.readFile(require.resolve("../client/src/App.jsx"), "utf8"),
     fs.readFile(require.resolve("../client/src/messengerController.js"), "utf8"),
     fs.readFile(require.resolve("../public/styles.css"), "utf8")
   ]);
-<<<<<<< Updated upstream
-  assert.match(app, /function UserProfileContent\(\)[\s\S]*user-profile-dialog-header[\s\S]*profile-message-button/);
-  assert.match(app, /profile-secondary-actions[\s\S]*user\.isContact \? labels\.removeContact : labels\.addContact/);
-  assert.match(app, /<details className="profile-more-actions">[\s\S]*confirmBlock/);
-  assert.match(app, /user\.blocked && \([\s\S]*labels\.unblockUser/);
-  assert.match(app, /user\.about \? \([\s\S]*labels\.noAbout/);
-  assert.match(app, /sharedChats\.length > 0 && \([\s\S]*showAllSharedChats/);
-  assert.match(app, /polus:open-profile-community/);
-  assert.match(app, /handleOpenProfileCommunity[\s\S]*bootstrap\.channels : bootstrap\.directs/);
-  assert.match(controller, /sharedGroup: t\("sharedGroup"\)[\s\S]*showAll: t\("showAll"\)/);
-  assert.match(styles, /\.profile-view-dialog \{[^}]*overflow-x: hidden;/);
-  assert.match(styles, /:root\[data-theme="dark"\] \.profile-secondary-actions/);
-  assert.match(styles, /@media \(max-width: 520px\) \{\s*\.profile-view-dialog/);
-=======
   assert.match(app, /function UserProfileContent\(\{ username, currentUserId, currentUsername, onBack \}\)/);
   assert.match(app, /user\.id === currentUserId[\s\S]*user\.username\?\.toLocaleLowerCase\(\) === currentUsername\?\.toLocaleLowerCase\(\)/);
   assert.match(app, /className=\{`public-profile-page profile-theme-\$\{design\.theme\} profile-font-\$\{design\.font\}/);
@@ -825,7 +795,6 @@ test("presents public user profiles as themed pages with accessible actions and 
   assert.match(styles, /@keyframes profile-particles-drift/);
   assert.match(styles, /@media \(max-width: 680px\) \{\s*\.public-profile-content/);
   assert.match(styles, /@media \(prefers-reduced-motion: reduce\) \{\s*\.public-profile-page/);
->>>>>>> Stashed changes
 });
 
 test("closes every native modal when the user clicks outside its dialog bounds", async () => {
